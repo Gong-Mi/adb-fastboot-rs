@@ -1,0 +1,11 @@
+[package]
+name = "fastboot-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pure Rust Fastboot protocol framing, status response parser, and sparse image header decoder"
+
+[dependencies]
+thiserror = "1.0"
+byteorder = "1.5"

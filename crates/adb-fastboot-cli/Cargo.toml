@@ -1,0 +1,21 @@
+[package]
+name = "adb-fastboot-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Fast, pure Rust unified adb and fastboot tool suite"
+
+[[bin]]
+name = "adb-rs"
+path = "src/main_adb.rs"
+
+[[bin]]
+name = "fastboot-rs"
+path = "src/main_fastboot.rs"
+
+[dependencies]
+adb-protocol = { path = "../adb-protocol" }
+fastboot-protocol = { path = "../fastboot-protocol" }
+clap = { version = "4.4", features = ["derive"] }
+thiserror = "1.0"

@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/adb-protocol",
+    "crates/fastboot-protocol",
+    "crates/adb-fastboot-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Gong-Mi <Gong-Mi@users.noreply.github.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Gong-Mi/adb-fastboot-rs"

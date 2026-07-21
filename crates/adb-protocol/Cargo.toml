@@ -1,0 +1,11 @@
+[package]
+name = "adb-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pure Rust ADB (Android Debug Bridge) protocol packet framing, parser, and auth encoder"
+
+[dependencies]
+thiserror = "1.0"
+byteorder = "1.5"
