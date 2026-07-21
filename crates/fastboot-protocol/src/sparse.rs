@@ -125,4 +125,24 @@ mod tests {
         assert_eq!(hdr.total_blks, 1024);
         assert_eq!(hdr.total_chunks, 5);
     }
+
+    #[test]
+    fn test_sparse_chunk_header_decode() {
+        let mut buf = [0u8; 12];
+        LittleEndian::write_u16(&mut buf[0..2], CHUNK_TYPE_RAW);
+        LittleEndian::write_u16(&mut buf[2..4], 0);
+        LittleEndian::write_u32(&mut buf[4..8], 10); // 10 blocks
+        LittleEndian::write_u32(&mut buf[8..12], 12 + 40960); // header + payload
+
+        let chunk = SparseChunkHeader::decode(&buf).unwrap();
+        assert_eq!(chunk.chunk_type, CHUNK_TYPE_RAW);
+        assert_eq!(chunk.chunk_sz, 10);
+        assert_eq!(chunk.total_sz, 40972);
+    }
+
+    #[test]
+    fn test_sparse_header_invalid_magic() {
+        let buf = [0u8; 28];
+        assert!(matches!(SparseHeader::decode(&buf), Err(SparseError::InvalidMagic(0))));
+    }
 }

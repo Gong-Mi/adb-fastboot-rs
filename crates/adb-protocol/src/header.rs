@@ -131,4 +131,22 @@ mod tests {
             Err(HeaderError::MagicMismatch { .. })
         ));
     }
+
+    #[test]
+    fn test_header_checksum_mismatch() {
+        let payload = b"correct payload";
+        let header = AdbMessageHeader::new(A_CNXN, 0, 0, payload);
+        let corrupt_payload = b"corrupt payload"; // same length (15 bytes), different bytes
+
+        assert!(matches!(
+            header.verify_payload(corrupt_payload),
+            Err(HeaderError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_header_buffer_too_short() {
+        let buf = [0u8; 10];
+        assert_eq!(AdbMessageHeader::decode(&buf), Err(HeaderError::BufferTooShort(10)));
+    }
 }

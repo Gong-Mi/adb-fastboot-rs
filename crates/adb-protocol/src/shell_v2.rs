@@ -132,4 +132,37 @@ mod tests {
         let (parsed, _) = ShellV2Packet::parse(&encoded).unwrap();
         assert_eq!(parsed, ShellV2Packet::ExitCode(0));
     }
+
+    #[test]
+    fn test_shell_v2_stderr_and_stdin() {
+        let stderr_pkt = ShellV2Packet::Stderr(b"permission denied");
+        let mut enc = Vec::new();
+        stderr_pkt.encode(&mut enc);
+
+        let (parsed, _) = ShellV2Packet::parse(&enc).unwrap();
+        assert_eq!(parsed, ShellV2Packet::Stderr(b"permission denied"));
+
+        let stdin_pkt = ShellV2Packet::Stdin(b"echo hello");
+        let mut enc_in = Vec::new();
+        stdin_pkt.encode(&mut enc_in);
+
+        let (parsed_in, _) = ShellV2Packet::parse(&enc_in).unwrap();
+        assert_eq!(parsed_in, ShellV2Packet::Stdin(b"echo hello"));
+    }
+
+    #[test]
+    fn test_shell_v2_window_size_change() {
+        let winsz = ShellV2Packet::WindowSizeChange { rows: 24, cols: 80 };
+        let mut enc = Vec::new();
+        winsz.encode(&mut enc);
+
+        let (parsed, _) = ShellV2Packet::parse(&enc).unwrap();
+        assert_eq!(parsed, ShellV2Packet::WindowSizeChange { rows: 24, cols: 80 });
+    }
+
+    #[test]
+    fn test_shell_v2_errors() {
+        assert_eq!(ShellV2Packet::parse(&[1, 2]), Err(ShellV2Error::HeaderTooShort));
+        assert_eq!(ShellV2Packet::parse(&[99, 0, 0, 0, 0]), Err(ShellV2Error::UnknownStreamId(99)));
+    }
 }
