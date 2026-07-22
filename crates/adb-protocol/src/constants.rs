@@ -28,6 +28,12 @@ pub const SYNC_DATA: u32 = 0x41544144; // "DATA"
 pub const SYNC_FAIL: u32 = 0x4C494146; // "FAIL"
 pub const SYNC_OKAY: u32 = 0x59414B4F; // "OKAY"
 
+/// ADB Sync Protocol v2 Command Identifiers
+pub const SYNC_STA2: u32 = 0x32415453; // "STA2" (STAT_V2)
+pub const SYNC_LST2: u32 = 0x3254534C; // "LST2" (LSTAT_V2)
+pub const SYNC_STAT_V2: u32 = SYNC_STA2;
+pub const SYNC_LSTAT_V2: u32 = SYNC_LST2;
+
 /// Shell v2 Stream Identifiers
 pub const SHELL_ID_STDIN: u8 = 0;
 pub const SHELL_ID_STDOUT: u8 = 1;

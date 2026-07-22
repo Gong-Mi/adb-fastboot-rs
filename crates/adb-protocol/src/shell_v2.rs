@@ -23,6 +23,20 @@ pub enum ShellV2Packet<'a> {
     WindowSizeChange { rows: u16, cols: u16 },
 }
 
+fn parse_window_size(payload: &[u8]) -> (u16, u16) {
+    if let Ok(s) = std::str::from_utf8(payload) {
+        let s = s.trim_matches('\0').trim();
+        // AOSP format: "rowsxcols,xpixelsxypixels" e.g. "24x80,0x0"
+        let main_part = s.split(',').next().unwrap_or("");
+        let mut parts = main_part.split('x');
+        let rows = parts.next().and_then(|r| r.parse::<u16>().ok()).unwrap_or(0);
+        let cols = parts.next().and_then(|c| c.parse::<u16>().ok()).unwrap_or(0);
+        (rows, cols)
+    } else {
+        (0, 0)
+    }
+}
+
 impl<'a> ShellV2Packet<'a> {
     pub fn parse(buf: &'a [u8]) -> Result<(Self, usize), ShellV2Error> {
         if buf.len() < 5 {
@@ -52,16 +66,7 @@ impl<'a> ShellV2Packet<'a> {
             }
             SHELL_ID_CLOSE_STDIN => ShellV2Packet::CloseStdin,
             SHELL_ID_WINDOW_SIZE_CHANGE => {
-                let rows = if payload.len() >= 2 {
-                    LittleEndian::read_u16(&payload[0..2])
-                } else {
-                    0
-                };
-                let cols = if payload.len() >= 4 {
-                    LittleEndian::read_u16(&payload[2..4])
-                } else {
-                    0
-                };
+                let (rows, cols) = parse_window_size(payload);
                 ShellV2Packet::WindowSizeChange { rows, cols }
             }
             _ => return Err(ShellV2Error::UnknownStreamId(id)),
@@ -98,9 +103,10 @@ impl<'a> ShellV2Packet<'a> {
             }
             ShellV2Packet::WindowSizeChange { rows, cols } => {
                 out.push(SHELL_ID_WINDOW_SIZE_CHANGE);
-                out.extend_from_slice(&4u32.to_le_bytes());
-                out.extend_from_slice(&rows.to_le_bytes());
-                out.extend_from_slice(&cols.to_le_bytes());
+                let payload = format!("{rows}x{cols},0x0\0");
+                let data = payload.as_bytes();
+                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                out.extend_from_slice(data);
             }
         }
     }
@@ -158,6 +164,15 @@ mod tests {
 
         let (parsed, _) = ShellV2Packet::parse(&enc).unwrap();
         assert_eq!(parsed, ShellV2Packet::WindowSizeChange { rows: 24, cols: 80 });
+
+        // Test parsing raw ASCII string as sent by AOSP client ("24x80,0x0\0")
+        let mut raw_aosp = vec![SHELL_ID_WINDOW_SIZE_CHANGE];
+        let str_bytes = b"24x80,0x0\0";
+        raw_aosp.extend_from_slice(&(str_bytes.len() as u32).to_le_bytes());
+        raw_aosp.extend_from_slice(str_bytes);
+
+        let (parsed_aosp, _) = ShellV2Packet::parse(&raw_aosp).unwrap();
+        assert_eq!(parsed_aosp, ShellV2Packet::WindowSizeChange { rows: 24, cols: 80 });
     }
 
     #[test]

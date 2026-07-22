@@ -1,6 +1,8 @@
 use byteorder::{ByteOrder, LittleEndian};
 use thiserror::Error;
 
+use crate::constants::*;
+
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum HeaderError {
     #[error("Buffer too short: expected 24 bytes, got {0}")]
@@ -11,6 +13,64 @@ pub enum HeaderError {
 
     #[error("Checksum mismatch: expected {expected:#x}, got {got:#x}")]
     ChecksumMismatch { expected: u32, got: u32 },
+}
+
+/// ADB AUTH Sub-type Enum (TOKEN=1, SIGNATURE=2, RSAKEY=3)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthType {
+    Token,
+    Signature,
+    RsaKey,
+    Unknown(u32),
+}
+
+impl AuthType {
+    pub fn from_u32(val: u32) -> Self {
+        match val {
+            A_AUTH_TOKEN => AuthType::Token,
+            A_AUTH_SIGNATURE => AuthType::Signature,
+            A_AUTH_RSAKEY => AuthType::RsaKey,
+            other => AuthType::Unknown(other),
+        }
+    }
+
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            AuthType::Token => A_AUTH_TOKEN,
+            AuthType::Signature => A_AUTH_SIGNATURE,
+            AuthType::RsaKey => A_AUTH_RSAKEY,
+            AuthType::Unknown(val) => *val,
+        }
+    }
+}
+
+/// ADB Auth Message helper structure for creating/handling AUTH packets
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthMessage<'a> {
+    pub auth_type: AuthType,
+    pub data: &'a [u8],
+}
+
+impl<'a> AuthMessage<'a> {
+    pub fn new(auth_type: AuthType, data: &'a [u8]) -> Self {
+        Self { auth_type, data }
+    }
+
+    pub fn token(data: &'a [u8]) -> Self {
+        Self::new(AuthType::Token, data)
+    }
+
+    pub fn signature(data: &'a [u8]) -> Self {
+        Self::new(AuthType::Signature, data)
+    }
+
+    pub fn rsakey(data: &'a [u8]) -> Self {
+        Self::new(AuthType::RsaKey, data)
+    }
+
+    pub fn to_header(&self) -> AdbMessageHeader {
+        AdbMessageHeader::new_auth(self.auth_type.to_u32(), self.data)
+    }
 }
 
 /// ADB 24-byte packet header
@@ -39,6 +99,23 @@ impl AdbMessageHeader {
             data_length,
             data_check,
             magic,
+        }
+    }
+
+    /// Create an A_AUTH header with specified auth sub-type and payload
+    pub fn new_auth(auth_type: u32, payload: &[u8]) -> Self {
+        Self::new(A_AUTH, auth_type, 0, payload)
+    }
+
+    pub fn is_auth(&self) -> bool {
+        self.command == A_AUTH
+    }
+
+    pub fn auth_type(&self) -> Option<AuthType> {
+        if self.is_auth() {
+            Some(AuthType::from_u32(self.arg0))
+        } else {
+            None
         }
     }
 
@@ -88,6 +165,10 @@ impl AdbMessageHeader {
     pub fn verify_payload(&self, payload: &[u8]) -> Result<(), HeaderError> {
         if payload.len() != self.data_length as usize {
             return Err(HeaderError::BufferTooShort(payload.len()));
+        }
+        // AOSP 0x01000001+ (skip checksum): data_check is 0 on modern adbd
+        if self.data_check == 0 {
+            return Ok(());
         }
         let calc = Self::calculate_checksum(payload);
         if calc != self.data_check {
@@ -145,8 +226,41 @@ mod tests {
     }
 
     #[test]
+    fn test_header_skip_checksum_v1_compat() {
+        let payload = b"modern adbd payload";
+        let mut header = AdbMessageHeader::new(A_CNXN, 0, 0, payload);
+        header.data_check = 0; // AOSP 0x01000001+
+
+        assert!(header.verify_payload(payload).is_ok());
+    }
+
+    #[test]
     fn test_header_buffer_too_short() {
         let buf = [0u8; 10];
         assert_eq!(AdbMessageHeader::decode(&buf), Err(HeaderError::BufferTooShort(10)));
+    }
+
+    #[test]
+    fn test_auth_message_and_header() {
+        let token_data = b"random_20_bytes_token_data!!";
+        let auth_msg = AuthMessage::token(token_data);
+        assert_eq!(auth_msg.auth_type, AuthType::Token);
+
+        let header = auth_msg.to_header();
+        assert_eq!(header.command, A_AUTH);
+        assert_eq!(header.arg0, A_AUTH_TOKEN);
+        assert_eq!(header.arg1, 0);
+        assert_eq!(header.data_length, token_data.len() as u32);
+
+        assert!(header.is_auth());
+        assert_eq!(header.auth_type(), Some(AuthType::Token));
+
+        let sig_msg = AuthMessage::signature(b"rsa_signature_bytes");
+        let sig_header = sig_msg.to_header();
+        assert_eq!(sig_header.auth_type(), Some(AuthType::Signature));
+
+        let key_msg = AuthMessage::rsakey(b"rsa_public_key_bytes");
+        let key_header = key_msg.to_header();
+        assert_eq!(key_header.auth_type(), Some(AuthType::RsaKey));
     }
 }

@@ -16,6 +16,10 @@ pub enum SparseError {
     InvalidMagic(u32),
     #[error("Unsupported version: {major}.{minor}")]
     UnsupportedVersion { major: u16, minor: u16 },
+    #[error("Invalid file header size: expected >= 28, got {0}")]
+    InvalidFileHeaderSize(u16),
+    #[error("Invalid chunk header size: expected >= 12, got {0}")]
+    InvalidChunkHeaderSize(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +58,15 @@ impl SparseHeader {
         }
 
         let file_hdr_sz = LittleEndian::read_u16(&buf[8..10]);
+        if file_hdr_sz < Self::SIZE as u16 {
+            return Err(SparseError::InvalidFileHeaderSize(file_hdr_sz));
+        }
+
         let chunk_hdr_sz = LittleEndian::read_u16(&buf[10..12]);
+        if chunk_hdr_sz < SparseChunkHeader::SIZE as u16 {
+            return Err(SparseError::InvalidChunkHeaderSize(chunk_hdr_sz));
+        }
+
         let blk_sz = LittleEndian::read_u32(&buf[12..16]);
         let total_blks = LittleEndian::read_u32(&buf[16..20]);
         let total_chunks = LittleEndian::read_u32(&buf[20..24]);
@@ -144,5 +156,29 @@ mod tests {
     fn test_sparse_header_invalid_magic() {
         let buf = [0u8; 28];
         assert!(matches!(SparseHeader::decode(&buf), Err(SparseError::InvalidMagic(0))));
+    }
+
+    #[test]
+    fn test_sparse_header_invalid_header_sizes() {
+        let mut buf = [0u8; 28];
+        LittleEndian::write_u32(&mut buf[0..4], SPARSE_HEADER_MAGIC);
+        LittleEndian::write_u16(&mut buf[4..6], 1); // major
+        LittleEndian::write_u16(&mut buf[6..8], 0); // minor
+
+        // Test invalid file_hdr_sz (< 28)
+        LittleEndian::write_u16(&mut buf[8..10], 20);
+        LittleEndian::write_u16(&mut buf[10..12], 12);
+        assert_eq!(
+            SparseHeader::decode(&buf),
+            Err(SparseError::InvalidFileHeaderSize(20))
+        );
+
+        // Test invalid chunk_hdr_sz (< 12)
+        LittleEndian::write_u16(&mut buf[8..10], 28);
+        LittleEndian::write_u16(&mut buf[10..12], 8);
+        assert_eq!(
+            SparseHeader::decode(&buf),
+            Err(SparseError::InvalidChunkHeaderSize(8))
+        );
     }
 }

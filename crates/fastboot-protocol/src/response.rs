@@ -17,6 +17,7 @@ pub enum FastbootResponse {
     Fail(String),
     Data(u32),
     Info(String),
+    Text(String),
 }
 
 impl FastbootResponse {
@@ -30,14 +31,27 @@ impl FastbootResponse {
             Err(_) => return Err(FastbootResponseError::UnknownPrefix(format!("{:?}", &buf[0..4]))),
         };
 
-        let message = String::from_utf8_lossy(&buf[4..]).trim().to_string();
+        let payload = &buf[4..];
 
         match prefix {
-            "OKAY" => Ok(FastbootResponse::Okay(message)),
-            "FAIL" => Ok(FastbootResponse::Fail(message)),
-            "INFO" => Ok(FastbootResponse::Info(message)),
+            "OKAY" => Ok(FastbootResponse::Okay(String::from_utf8_lossy(payload).to_string())),
+            "FAIL" => Ok(FastbootResponse::Fail(String::from_utf8_lossy(payload).to_string())),
+            "INFO" => Ok(FastbootResponse::Info(String::from_utf8_lossy(payload).to_string())),
+            "TEXT" => Ok(FastbootResponse::Text(String::from_utf8_lossy(payload).to_string())),
             "DATA" => {
-                let hex_str = message.trim();
+                if payload.len() != 8 {
+                    return Err(FastbootResponseError::InvalidDataSize(
+                        String::from_utf8_lossy(payload).to_string(),
+                    ));
+                }
+                let hex_str = match std::str::from_utf8(payload) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Err(FastbootResponseError::InvalidDataSize(
+                            String::from_utf8_lossy(payload).to_string(),
+                        ))
+                    }
+                };
                 let size = u32::from_str_radix(hex_str, 16).map_err(|_| {
                     FastbootResponseError::InvalidDataSize(hex_str.to_string())
                 })?;
@@ -74,6 +88,26 @@ mod tests {
     fn test_fastboot_response_info() {
         let resp = FastbootResponse::parse(b"INFOerasing 'boot'...").unwrap();
         assert_eq!(resp, FastbootResponse::Info("erasing 'boot'...".to_string()));
+    }
+
+    #[test]
+    fn test_fastboot_response_text() {
+        let resp = FastbootResponse::parse(b"TEXTconsole message").unwrap();
+        assert_eq!(resp, FastbootResponse::Text("console message".to_string()));
+    }
+
+    #[test]
+    fn test_fastboot_response_invalid_data() {
+        // Invalid length for DATA payload
+        assert_eq!(
+            FastbootResponse::parse(b"DATA123"),
+            Err(FastbootResponseError::InvalidDataSize("123".to_string()))
+        );
+        // Non-hex character for DATA payload
+        assert_eq!(
+            FastbootResponse::parse(b"DATA0010000G"),
+            Err(FastbootResponseError::InvalidDataSize("0010000G".to_string()))
+        );
     }
 
     #[test]
