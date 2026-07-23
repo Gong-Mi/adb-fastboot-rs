@@ -736,7 +736,9 @@ fn bridge_to_device(
         reg.find_by_serial(&serial).map(|d| d.origin)
     };
 
-    match origin {
+    let is_tcp = matches!(origin, Some(DeviceOrigin::Tcp { .. }));
+
+    let result = match origin {
         Some(DeviceOrigin::Tcp { addr }) => {
             bridge_tcp_to_tcp(client, addr)
         }
@@ -755,7 +757,21 @@ fn bridge_to_device(
             drop(client);
             Err(format!("device '{serial}' not found"))
         }
+    };
+
+    // After TCP bridge threads finish (device disconnected), remove the
+    // TCP device from the registry automatically. USB devices are handled
+    // by the inotify watcher / polling refresh_usb_devices instead.
+    if is_tcp && result.is_ok() {
+        let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+        if reg.remove_device(&serial) {
+            eprintln!(
+                "[adb-server] TCP device '{serial}' disconnected — removed from registry"
+            );
+        }
     }
+
+    result
 }
 
 /// Bridge TCP client -> TCP device (adbd). Simple byte-level proxy.
