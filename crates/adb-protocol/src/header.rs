@@ -89,7 +89,7 @@ impl AdbMessageHeader {
 
     pub fn new(command: u32, arg0: u32, arg1: u32, payload: &[u8]) -> Self {
         let data_length = payload.len() as u32;
-        let data_check = Self::calculate_checksum(payload);
+        let data_check = 0; // ADB_VERSION 0x01000001+: skip checksum
         let magic = command ^ 0xFFFFFFFF;
 
         Self {
@@ -100,6 +100,19 @@ impl AdbMessageHeader {
             data_check,
             magic,
         }
+    }
+
+    /// Create an AdbMessageHeader with legacy V1 checksum calculated from payload
+    pub fn new_v1_legacy(command: u32, arg0: u32, arg1: u32, payload: &[u8]) -> Self {
+        let mut header = Self::new(command, arg0, arg1, payload);
+        header.data_check = Self::calculate_checksum(payload);
+        header
+    }
+
+    /// Set data_check to the calculated checksum of payload (for legacy ADB checksum support)
+    pub fn with_checksum(mut self, payload: &[u8]) -> Self {
+        self.data_check = Self::calculate_checksum(payload);
+        self
     }
 
     /// Create an A_AUTH header with specified auth sub-type and payload
@@ -216,7 +229,10 @@ mod tests {
     #[test]
     fn test_header_checksum_mismatch() {
         let payload = b"correct payload";
-        let header = AdbMessageHeader::new(A_CNXN, 0, 0, payload);
+        let mut header = AdbMessageHeader::new(A_CNXN, 0, 0, payload);
+        // Manually set a non-zero checksum to test mismatch detection
+        // (new() now sets data_check=0 for ADB_VERSION 0x01000001+)
+        header.data_check = header.data_check.wrapping_add(42);
         let corrupt_payload = b"corrupt payload"; // same length (15 bytes), different bytes
 
         assert!(matches!(
@@ -232,6 +248,27 @@ mod tests {
         header.data_check = 0; // AOSP 0x01000001+
 
         assert!(header.verify_payload(payload).is_ok());
+    }
+
+    #[test]
+    fn test_header_legacy_v1_checksum_helpers() {
+        let payload = b"legacy adbd payload";
+        let expected_checksum = AdbMessageHeader::calculate_checksum(payload);
+        assert_ne!(expected_checksum, 0);
+
+        let legacy_hdr = AdbMessageHeader::new_v1_legacy(A_CNXN, 0, 0, payload);
+        assert_eq!(legacy_hdr.data_check, expected_checksum);
+        assert!(legacy_hdr.verify_payload(payload).is_ok());
+
+        let corrupt_payload = b"legacy adbd payloae"; // same length
+        assert!(matches!(
+            legacy_hdr.verify_payload(corrupt_payload),
+            Err(HeaderError::ChecksumMismatch { .. })
+        ));
+
+        let builder_hdr = AdbMessageHeader::new(A_CNXN, 0, 0, payload).with_checksum(payload);
+        assert_eq!(builder_hdr.data_check, expected_checksum);
+        assert!(builder_hdr.verify_payload(payload).is_ok());
     }
 
     #[test]

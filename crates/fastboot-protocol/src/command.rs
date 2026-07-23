@@ -42,10 +42,44 @@ pub fn reboot(target: Option<&str>) -> String {
 
 /// Formats a `download` command for Fastboot.
 ///
-/// The size is formatted as an 8-digit hexadecimal string.
 /// Example: `download(0x100000)` returns `"download:00100000"`.
 pub fn download(size: u32) -> String {
     format!("download:{:08x}", size)
+}
+
+/// Formats a `create-logical-partition` command for Fastboot.
+///
+
+pub fn create_logical_partition(partition: &str, size: u64) -> String {
+    format!("create-logical-partition:{}:{}", partition, size)
+}
+
+/// Formats a `delete-logical-partition` command for Fastboot.
+///
+
+pub fn delete_logical_partition(partition: &str) -> String {
+    format!("delete-logical-partition:{}", partition)
+}
+
+/// Formats a `resize-logical-partition` command for Fastboot.
+///
+
+pub fn resize_logical_partition(partition: &str, size: u64) -> String {
+    format!("resize-logical-partition:{}:{}", partition, size)
+}
+
+/// Formats a `boot` command for Fastboot.
+///
+
+pub fn boot() -> String {
+    "boot".to_string()
+}
+
+/// Formats a `fetch` command for Fastboot.
+///
+
+pub fn fetch(partition: &str, offset: u64, size: u64) -> String {
+    format!("fetch:{}:0x{:x}:0x{:x}", partition, offset, size)
 }
 
 #[cfg(test)]
@@ -83,5 +117,46 @@ mod tests {
         assert_eq!(download(0x100000), "download:00100000");
         assert_eq!(download(0), "download:00000000");
         assert_eq!(download(0xFFFFFFFF), "download:ffffffff");
+    }
+
+    #[test]
+    fn test_create_logical_partition() {
+        assert_eq!(
+            create_logical_partition("system_a", 1048576),
+            "create-logical-partition:system_a:1048576"
+        );
+    }
+
+    #[test]
+    fn test_delete_logical_partition() {
+        assert_eq!(
+            delete_logical_partition("system_a"),
+            "delete-logical-partition:system_a"
+        );
+    }
+
+    #[test]
+    fn test_resize_logical_partition() {
+        assert_eq!(
+            resize_logical_partition("system_a", 2097152),
+            "resize-logical-partition:system_a:2097152"
+        );
+    }
+
+    #[test]
+    fn test_boot() {
+        assert_eq!(boot(), "boot");
+    }
+
+    #[test]
+    fn test_fetch() {
+        assert_eq!(
+            fetch("boot", 0, 4096),
+            "fetch:boot:0x0:0x1000"
+        );
+        assert_eq!(
+            fetch("system", 0x10000, 0x80000),
+            "fetch:system:0x10000:0x80000"
+        );
     }
 }

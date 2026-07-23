@@ -6,6 +6,23 @@ authors.workspace = true
 license.workspace = true
 description = "Pure Rust ADB (Android Debug Bridge) protocol packet framing, parser, and auth encoder"
 
+[features]
+default = []
+tls = ["dep:rcgen", "dep:rustls"]
+usb = []
+usb-rusb = ["usb", "dep:rusb"]
+usb-android = []
+
 [dependencies]
+libc = "0.2"
 thiserror = "1.0"
 byteorder = "1.5"
+rsa = { version = "0.9", features = ["sha1", "pem"] }
+sha1 = "0.10"
+base64 = "0.22"
+brotli = "7"
+lz4_flex = "0.11"
+zstd = { version = "0.13", features = ["zdict_builder"] }
+rusb = { version = "0.9.4", optional = true }
+rcgen = { version = "0.13", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }

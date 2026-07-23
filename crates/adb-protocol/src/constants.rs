@@ -6,11 +6,12 @@ pub const A_OKAY: u32 = 0x59414B4F; // "OKAY"
 pub const A_CLSE: u32 = 0x45534C43; // "CLSE"
 pub const A_WRTE: u32 = 0x45545257; // "WRTE"
 pub const A_AUTH: u32 = 0x48545541; // "AUTH"
+pub const A_STLS: u32 = 0x534C5453; // "STLS"
 
 /// ADB Version & Max Payload
-pub const ADB_VERSION: u32 = 0x01000000;
+pub const ADB_VERSION: u32 = 0x01000001;
 pub const MAX_PAYLOAD_V1: u32 = 4096;
-pub const MAX_PAYLOAD_V2: u32 = 256 * 1024; // 256KB
+pub const MAX_PAYLOAD_V2: u32 = 1024 * 1024; // 1MB
 
 /// AUTH Sub-types
 pub const A_AUTH_TOKEN: u32 = 1;
@@ -33,6 +34,17 @@ pub const SYNC_STA2: u32 = 0x32415453; // "STA2" (STAT_V2)
 pub const SYNC_LST2: u32 = 0x3254534C; // "LST2" (LSTAT_V2)
 pub const SYNC_STAT_V2: u32 = SYNC_STA2;
 pub const SYNC_LSTAT_V2: u32 = SYNC_LST2;
+
+/// sendrecv_v2 protocol
+pub const SYNC_SEND_V2: u32 = 0x32444E53; // "SND2"
+pub const SYNC_RECV_V2: u32 = 0x32505643; // "RCV2"
+pub const SYNC_QUIT: u32 = 0x54495551;    // "QUIT"
+pub const SYNC_FLAG_NONE: u32 = 0;
+pub const SYNC_FLAG_BROTLI: u32 = 1;
+pub const SYNC_FLAG_LZ4: u32 = 2;
+pub const SYNC_FLAG_ZSTD: u32 = 4;
+pub const SYNC_FLAG_DRY_RUN: u32 = 0x8000_0000;
+pub const SYNC_DATA_MAX: usize = 64 * 1024;
 
 /// Shell v2 Stream Identifiers
 pub const SHELL_ID_STDIN: u8 = 0;

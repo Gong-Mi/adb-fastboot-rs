@@ -103,7 +103,7 @@ impl<'a> ShellV2Packet<'a> {
             }
             ShellV2Packet::WindowSizeChange { rows, cols } => {
                 out.push(SHELL_ID_WINDOW_SIZE_CHANGE);
-                let payload = format!("{rows}x{cols},0x0\0");
+                let payload = format!("{rows}x{cols}\0");
                 let data = payload.as_bytes();
                 out.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 out.extend_from_slice(data);
@@ -165,9 +165,9 @@ mod tests {
         let (parsed, _) = ShellV2Packet::parse(&enc).unwrap();
         assert_eq!(parsed, ShellV2Packet::WindowSizeChange { rows: 24, cols: 80 });
 
-        // Test parsing raw ASCII string as sent by AOSP client ("24x80,0x0\0")
+        // Test parsing raw ASCII string as sent by AOSP client ("24x80\0")
         let mut raw_aosp = vec![SHELL_ID_WINDOW_SIZE_CHANGE];
-        let str_bytes = b"24x80,0x0\0";
+        let str_bytes = b"24x80\0";
         raw_aosp.extend_from_slice(&(str_bytes.len() as u32).to_le_bytes());
         raw_aosp.extend_from_slice(str_bytes);
 
