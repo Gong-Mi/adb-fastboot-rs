@@ -9,6 +9,8 @@ use adb_protocol::{
     SYNC_FAIL, SYNC_OKAY,
 };
 
+mod server;
+
 const ADBD_PORT: u16 = 5555;
 const ADB_SERVER_PORT: u16 = 5037;
 
@@ -88,6 +90,8 @@ enum Commands {
     },
     /// List JDWP PIDs (uses ADB server on port 5037)
     Jdwp,
+    /// Start the ADB server (listens on 127.0.0.1:5037)
+    Serve,
 }
 
 fn resolve_target_addr(serial: Option<&str>, default_port: u16) -> String {
@@ -465,9 +469,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "host:forward:remove-all".to_string()
             } else if let (Some(loc), Some(rem)) = (local, remote) {
                 if *no_rebind {
-                    format!("host:forward:norebind:{loc}:{rem}")
+                    format!("host:forward:norebind:{loc};{rem}")
                 } else {
-                    format!("host:forward:{loc}:{rem}")
+                    format!("host:forward:{loc};{rem}")
                 }
             } else {
                 eprintln!("error: specify --list, --remove, --remove-all, or LOCAL REMOTE");
@@ -666,6 +670,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        Commands::Serve => {
+            println!("[adb-rs] Starting ADB server on 127.0.0.1:5037 ...");
+            server::run_server();
         }
     }
 

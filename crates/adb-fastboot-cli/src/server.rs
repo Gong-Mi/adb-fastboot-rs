@@ -1,0 +1,800 @@
+//! ADB Server — pure Rust implementation.
+//!
+//! Listens on `127.0.0.1:5037`, handles ADB host services, manages a transport
+//! registry (USB + TCP devices), and bridges client connections to devices.
+//!
+//! ## Protocol (AOSP compatible)
+//!
+//! 1. Client connects to `127.0.0.1:5037`
+//! 2. Sends `{:04x}<command>` (4-byte hex ASCII length + payload)
+//! 3. Server responds:
+//!    - **OKAY** + `{:04x}<payload>` — success with data
+//!    - **FAIL** + `{:04x}<error>` — failure
+//!    - **OKAY** (no payload) — command acknowledged (e.g. `host:kill`)
+//! 4. After `host:transport:serial` succeeds, the connection switches to
+//!    binary ADB protocol mode (24-byte header + payload frames).
+
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use adb_protocol::{
+    AdbMessageHeader, ADB_VERSION, A_CNXN, MAX_PAYLOAD_V2,
+};
+#[cfg(feature = "usb")]
+use adb_protocol::{Transport, TransportError};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const ADB_SERVER_PORT: u16 = 5037;
+const SERVER_VERSION: u32 = 0x01000001;
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// Device model
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceState {
+    Offline,
+    Device,
+    Recovery,
+    Sideload,
+    Bootloader,
+    Authorizing,
+    Connecting,
+    NoPerm,
+    Unknown,
+}
+
+impl DeviceState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            DeviceState::Offline => "offline",
+            DeviceState::Device => "device",
+            DeviceState::Recovery => "recovery",
+            DeviceState::Sideload => "sideload",
+            DeviceState::Bootloader => "bootloader",
+            DeviceState::Authorizing => "authorizing",
+            DeviceState::Connecting => "connecting",
+            DeviceState::NoPerm => "no permissions",
+            DeviceState::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceOrigin {
+    Usb,
+    Tcp { addr: SocketAddr },
+}
+
+#[derive(Debug, Clone)]
+struct DeviceEntry {
+    serial: String,
+    state: DeviceState,
+    origin: DeviceOrigin,
+    product: Option<String>,
+    model: Option<String>,
+    device_name: Option<String>,
+    transport_features: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Transport Registry
+// ---------------------------------------------------------------------------
+
+struct TransportRegistry {
+    devices: Vec<DeviceEntry>,
+    forwards: Vec<ForwardRule>,
+}
+
+#[derive(Debug, Clone)]
+struct ForwardRule {
+    local: String,
+    remote: String,
+}
+
+impl TransportRegistry {
+    fn new() -> Self {
+        let mut reg = Self { devices: Vec::new(), forwards: Vec::new() };
+        reg.refresh_usb_devices();
+        reg
+    }
+
+    fn refresh_usb_devices(&mut self) {
+        #[cfg(feature = "usb")]
+        match adb_protocol::usb_android::UsbfsAdbDevice::enumerate() {
+            Ok(candidates) => {
+                for cand in &candidates {
+                    let serial = cand
+                        .serial
+                        .clone()
+                        .unwrap_or_else(|| format!("{:03}{:03}", cand.bus_number, cand.address));
+                    if !self.devices.iter().any(|d| d.serial == serial) {
+                        self.devices.push(DeviceEntry {
+                            serial: serial.clone(),
+                            state: DeviceState::Device,
+                            origin: DeviceOrigin::Usb,
+                            product: None,
+                            model: None,
+                            device_name: None,
+                            transport_features: None,
+                        });
+                    }
+                }
+                let known: std::collections::HashSet<String> = candidates
+                    .into_iter()
+                    .map(|c| c.serial.unwrap_or_else(|| format!("{:03}{:03}", c.bus_number, c.address)))
+                    .collect();
+                self.devices.retain(|d| {
+                    if matches!(d.origin, DeviceOrigin::Usb) {
+                        known.contains(&d.serial)
+                    } else {
+                        true
+                    }
+                });
+            }
+            Err(e) => eprintln!("[adb-server] USB enumeration: {e}"),
+        }
+    }
+
+    fn list_devices(&self, verbose: bool) -> String {
+        if self.devices.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        for dev in &self.devices {
+            let state = dev.state.as_str();
+            if verbose {
+                let product = dev.product.as_deref().unwrap_or("unknown");
+                let model = dev.model.as_deref().unwrap_or("unknown");
+                let dname = dev.device_name.as_deref().unwrap_or("unknown");
+                out.push_str(&format!(
+                    "{}\t{} product:{} model:{} device:{}\n",
+                    dev.serial, state, product, model, dname,
+                ));
+            } else {
+                out.push_str(&format!("{}\t{}\n", dev.serial, state));
+            }
+        }
+        out
+    }
+
+    fn find_by_serial(&self, serial: &str) -> Option<&DeviceEntry> {
+        self.devices.iter().find(|d| d.serial == serial)
+    }
+
+    fn find_any_device(&self) -> Option<&DeviceEntry> {
+        self.devices.iter().find(|d| d.state == DeviceState::Device)
+    }
+
+    fn upsert_tcp_device(&mut self, addr: SocketAddr, serial: String) {
+        if let Some(existing) = self.devices.iter_mut().find(|d| d.serial == serial) {
+            existing.state = DeviceState::Device;
+        } else {
+            self.devices.push(DeviceEntry {
+                serial,
+                state: DeviceState::Device,
+                origin: DeviceOrigin::Tcp { addr },
+                product: None,
+                model: None,
+                device_name: None,
+                transport_features: None,
+            });
+        }
+    }
+
+    fn remove_device(&mut self, serial: &str) -> bool {
+        let before = self.devices.len();
+        self.devices.retain(|d| d.serial != serial);
+        before != self.devices.len()
+    }
+
+    fn remove_all_tcp_devices(&mut self) {
+        self.devices.retain(|d| matches!(d.origin, DeviceOrigin::Usb));
+    }
+
+    // -- Forwards -----------------------------------------------------------
+
+    fn list_forwards(&self) -> String {
+        if self.forwards.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        for (i, fw) in self.forwards.iter().enumerate() {
+            out.push_str(&format!("{} {} {}\n", i, fw.local, fw.remote));
+        }
+        out
+    }
+
+    fn add_forward(&mut self, local: &str, remote: &str, no_rebind: bool) -> Result<(), String> {
+        if no_rebind && self.forwards.iter().any(|f| f.local == local) {
+            return Err(format!("forward already exists for {local}"));
+        }
+        self.forwards.retain(|f| f.local != local);
+        self.forwards.push(ForwardRule {
+            local: local.to_string(),
+            remote: remote.to_string(),
+        });
+        Ok(())
+    }
+
+    fn remove_forward(&mut self, local: &str) -> bool {
+        let before = self.forwards.len();
+        self.forwards.retain(|f| f.local != local);
+        before != self.forwards.len()
+    }
+
+    fn remove_all_forwards(&mut self) {
+        self.forwards.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADB Server — public entry point
+// ---------------------------------------------------------------------------
+
+pub fn run_server() -> ! {
+    let running = Arc::new(AtomicBool::new(true));
+    let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+
+    let listener = match TcpListener::bind(format!("127.0.0.1:{ADB_SERVER_PORT}")) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[adb-server] Cannot bind to 127.0.0.1:{ADB_SERVER_PORT}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!(
+        "[adb-server] Listening on 127.0.0.1:{ADB_SERVER_PORT} (version {:08x})",
+        SERVER_VERSION
+    );
+
+    // Background poll thread for USB enumeration
+    let reg_for_poll = Arc::clone(&registry);
+    let running_poll = Arc::clone(&running);
+    thread::spawn(move || {
+        while running_poll.load(Ordering::Relaxed) {
+            thread::sleep(POLL_INTERVAL);
+            if let Ok(mut reg) = reg_for_poll.lock() {
+                reg.refresh_usb_devices();
+            }
+        }
+    });
+
+    // Accept loop
+    listener.set_nonblocking(false).ok();
+    for stream in listener.incoming() {
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        match stream {
+            Ok(client) => {
+                let reg = Arc::clone(&registry);
+                let running_flag = Arc::clone(&running);
+                thread::spawn(move || {
+                    if let Err(e) = handle_client(client, &reg, &running_flag) {
+                        eprintln!("[adb-server] Client error: {e}");
+                    }
+                });
+            }
+            Err(e) => eprintln!("[adb-server] Accept error: {e}"),
+        }
+    }
+
+    eprintln!("[adb-server] Shut down.");
+    std::process::exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Client handler
+// ---------------------------------------------------------------------------
+
+fn handle_client(
+    mut client: TcpStream,
+    registry: &Arc<Mutex<TransportRegistry>>,
+    running: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let _ = client.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = client.set_nodelay(true);
+
+    loop {
+        let mut len_buf = [0u8; 4];
+        if client.read_exact(&mut len_buf).is_err() {
+            return Ok(());
+        }
+        let len_str =
+            std::str::from_utf8(&len_buf).map_err(|_| "Invalid UTF-8 in length prefix".to_string())?;
+        let cmd_len = usize::from_str_radix(len_str, 16)
+            .map_err(|_| format!("Invalid hex length: {len_str}"))?;
+
+        if cmd_len == 0 || cmd_len > 4096 {
+            return Err(format!("Invalid command length: {cmd_len}"));
+        }
+
+        let mut cmd_buf = vec![0u8; cmd_len];
+        client
+            .read_exact(&mut cmd_buf)
+            .map_err(|e| format!("Failed to read command: {e}"))?;
+        let cmd = String::from_utf8(cmd_buf)
+            .map_err(|_| "Command is not valid UTF-8".to_string())?;
+
+        let is_transport_cmd = cmd.starts_with("host:transport:");
+
+        dispatch_host_service(&mut client, &cmd, registry, running)?;
+
+        if is_transport_cmd {
+            // dispatch_host_service already sent OKAY — now enter bridge mode.
+            // Move client into the bridge (this function is the last use).
+            let serial = cmd["host:transport:".len()..].to_string();
+            let _ = bridge_to_device(client, serial, registry)?;
+            // bridge always returns at this point, but in case of false…
+            return Ok(());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host Service Dispatch
+// ---------------------------------------------------------------------------
+
+fn dispatch_host_service(
+    client: &mut TcpStream,
+    cmd: &str,
+    registry: &Arc<Mutex<TransportRegistry>>,
+    running: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    // ----- Helper closures -----
+
+    let ok = |sock: &mut TcpStream, data: &[u8]| -> Result<(), String> {
+        let len_hdr = format!("{:04x}", data.len());
+        sock.write_all(b"OKAY")
+            .and_then(|_| sock.write_all(len_hdr.as_bytes()))
+            .and_then(|_| sock.write_all(data))
+            .and_then(|_| sock.flush())
+            .map_err(|e| format!("write failed: {e}"))
+    };
+
+    let ok_empty = |sock: &mut TcpStream| -> Result<(), String> {
+        sock.write_all(b"OKAY")
+            .and_then(|_| sock.flush())
+            .map_err(|e| format!("write failed: {e}"))
+    };
+
+    let ok_str = |sock: &mut TcpStream, s: &str| -> Result<(), String> {
+        ok(sock, s.as_bytes())
+    };
+
+    let fail = |sock: &mut TcpStream, msg: &str| -> Result<(), String> {
+        let err_bytes = msg.as_bytes();
+        let len_hdr = format!("{:04x}", err_bytes.len());
+        sock.write_all(b"FAIL")
+            .and_then(|_| sock.write_all(len_hdr.as_bytes()))
+            .and_then(|_| sock.write_all(err_bytes))
+            .and_then(|_| sock.flush())
+            .map_err(|e| format!("write failed: {e}"))
+    };
+
+    // ----- Dispatch -----
+
+    match cmd {
+        // -- host:version ---------------------------------------------------
+        "host:version" => {
+            let ver_str = format!("{:04x}", SERVER_VERSION);
+            ok_str(client, &ver_str)
+        }
+
+        // -- host:kill ------------------------------------------------------
+        "host:kill" => {
+            ok_empty(client)?;
+            eprintln!("[adb-server] Received host:kill — shutting down.");
+            running.store(false, Ordering::Relaxed);
+            Ok(())
+        }
+
+        // -- host:devices / host:devices-l ----------------------------------
+        "host:devices" | "host:devices-l" => {
+            let verbose = cmd.ends_with("-l");
+            let list = {
+                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                reg.list_devices(verbose)
+            };
+            ok_str(client, &list)
+        }
+
+        // -- host:get-state / host:get-serialno / host:get-devpath ----------
+        c if c == "host:get-state" || c == "host:get-serialno" || c == "host:get-devpath" => {
+            let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+            let device = reg.find_any_device();
+            match (c, device) {
+                ("host:get-state", Some(dev)) => ok_str(client, dev.state.as_str()),
+                ("host:get-serialno", Some(dev)) => ok_str(client, &dev.serial),
+                ("host:get-devpath", Some(dev)) => {
+                    let path = match dev.origin {
+                        DeviceOrigin::Usb => "usb".to_string(),
+                        DeviceOrigin::Tcp { addr } => format!("{}:{}", addr.ip(), addr.port()),
+                    };
+                    ok_str(client, &path)
+                }
+                _ => fail(client, "device not found"),
+            }
+        }
+
+        // -- host:transport:<serial> ----------------------------------------
+        c if c.starts_with("host:transport:") => {
+            let serial = &c["host:transport:".len()..];
+            let exists = {
+                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                reg.find_by_serial(serial).is_some()
+            };
+            if exists {
+                ok_empty(client)
+            } else {
+                fail(client, &format!("device '{serial}' not found"))
+            }
+        }
+
+        // -- host:transport-any ---------------------------------------------
+        "host:transport-any" => {
+            let exists = {
+                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                reg.find_any_device().is_some()
+            };
+            if exists {
+                ok_empty(client)
+            } else {
+                fail(client, "no devices available")
+            }
+        }
+
+        // -- host:connect <host>:<port> -------------------------------------
+        c if c.starts_with("host:connect:") => {
+            let target = &c["host:connect:".len()..];
+            let (host_str, port_str) = target
+                .rsplit_once(':')
+                .ok_or_else(|| "invalid connect format: use host:port".to_string())?;
+            let port: u16 = port_str
+                .parse()
+                .map_err(|_| format!("invalid port: {port_str}"))?;
+            let host = if host_str.is_empty() { "127.0.0.1" } else { host_str };
+
+            let addr_str = format!("{host}:{port}");
+            let sock_addrs: Vec<SocketAddr> = addr_str
+                .to_socket_addrs()
+                .map_err(|e| format!("resolve failed: {e}"))?
+                .collect();
+            let addr = sock_addrs
+                .first()
+                .ok_or_else(|| "no address resolved".to_string())?
+                .to_owned();
+
+            let mut test_stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+                .map_err(|e| format!("cannot connect to {addr_str}: {e}"))?;
+            let _ = test_stream.set_nodelay(true);
+
+            // Probe with CNXN
+            let probe = b"host::";
+            let cnxn = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, probe);
+            let mut hdr_buf = [0u8; 24];
+            cnxn.encode(&mut hdr_buf);
+
+            let cnxn_sent = test_stream
+                .write_all(&hdr_buf)
+                .and_then(|_| test_stream.write_all(probe))
+                .and_then(|_| test_stream.flush());
+
+            let is_adbd = cnxn_sent.is_ok()
+                && test_stream.read_exact(&mut hdr_buf).is_ok()
+                && AdbMessageHeader::decode(&hdr_buf)
+                    .map(|h| h.command == A_CNXN)
+                    .unwrap_or(false);
+
+            if is_adbd {
+                let serial = format!("{host}:{port}");
+                {
+                    let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                    reg.upsert_tcp_device(addr, serial.clone());
+
+                    // Read CNXN payload for features
+                    let payload_len = cnxn.data_length as usize;
+                    if payload_len > 0 && payload_len < 4096 {
+                        let mut actual_payload = vec![0u8; payload_len];
+                        let _ = test_stream.read_exact(&mut actual_payload);
+                        let cnxn_str = String::from_utf8_lossy(&actual_payload);
+                        if let Some(dev) = reg.devices.iter_mut().find(|d| d.serial == serial) {
+                            dev.transport_features = Some(cnxn_str.to_string());
+                            for part in cnxn_str.trim().split(';') {
+                                if let Some(val) = part.strip_prefix("product=") {
+                                    dev.product = Some(val.to_string());
+                                } else if let Some(val) = part.strip_prefix("model=") {
+                                    dev.model = Some(val.to_string());
+                                } else if let Some(val) = part.strip_prefix("device=") {
+                                    dev.device_name = Some(val.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                ok_str(client, &serial)
+            } else {
+                fail(client, "connection refused: not an ADB device")
+            }
+        }
+
+        // -- host:disconnect / host:disconnect:<serial> --------------------
+        c if c == "host:disconnect" || c.starts_with("host:disconnect:") => {
+            if c == "host:disconnect" {
+                let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                let count =
+                    reg.devices.iter().filter(|d| matches!(d.origin, DeviceOrigin::Tcp { .. })).count();
+                reg.remove_all_tcp_devices();
+                ok_str(client, &format!("disconnected {count} devices"))
+            } else {
+                let serial = &c["host:disconnect:".len()..];
+                let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                if reg.remove_device(serial) {
+                    ok_str(client, &format!("disconnected {serial}"))
+                } else {
+                    fail(client, &format!("device '{serial}' not found"))
+                }
+            }
+        }
+
+        // -- host:forward:* --------------------------------------------------
+        c if c.starts_with("host:forward:") => {
+            let sub = &c["host:forward:".len()..];
+            handle_forward(client, sub, registry)
+        }
+
+        // -- host:host-features ---------------------------------------------
+        "host:host-features" => {
+            let features =
+                "shell_v2,cmd,abb,abb_exec,remount_shell_v2,fixed_push_symlink_target,fixed_push_mkdir";
+            ok_str(client, features)
+        }
+
+        // -- host:jdwp -------------------------------------------------------
+        "host:jdwp" => {
+            ok_str(client, "")
+        }
+
+        // -- Unknown ---------------------------------------------------------
+        other => fail(client, &format!("unknown host service: {other}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// host:forward dispatch
+// ---------------------------------------------------------------------------
+
+fn handle_forward(
+    client: &mut TcpStream,
+    sub: &str,
+    registry: &Arc<Mutex<TransportRegistry>>,
+) -> Result<(), String> {
+    let ok_str = |sock: &mut TcpStream, s: &str| -> Result<(), String> {
+        let len_hdr = format!("{:04x}", s.len());
+        sock.write_all(b"OKAY")
+            .and_then(|_| sock.write_all(len_hdr.as_bytes()))
+            .and_then(|_| sock.write_all(s.as_bytes()))
+            .and_then(|_| sock.flush())
+            .map_err(|e| format!("write failed: {e}"))
+    };
+
+    let fail = |sock: &mut TcpStream, msg: &str| -> Result<(), String> {
+        let err_bytes = msg.as_bytes();
+        let len_hdr = format!("{:04x}", err_bytes.len());
+        sock.write_all(b"FAIL")
+            .and_then(|_| sock.write_all(len_hdr.as_bytes()))
+            .and_then(|_| sock.write_all(err_bytes))
+            .and_then(|_| sock.flush())
+            .map_err(|e| format!("write failed: {e}"))
+    };
+
+    match sub {
+        "list" => {
+            let list = {
+                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                reg.list_forwards()
+            };
+            ok_str(client, &list)
+        }
+        "remove-all" => {
+            let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+            reg.remove_all_forwards();
+            ok_str(client, "")
+        }
+        c if c.starts_with("remove:") => {
+            let local = &c["remove:".len()..];
+            let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+            if reg.remove_forward(local) {
+                ok_str(client, "")
+            } else {
+                fail(client, &format!("forward '{local}' not found"))
+            }
+        }
+        c if c.starts_with("norebind:") => {
+            let rest = &c["norebind:".len()..];
+            match rest.split_once(';') {
+                Some((local, remote)) => {
+                    let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                    match reg.add_forward(local, remote, true) {
+                        Ok(()) => ok_str(client, ""),
+                        Err(msg) => fail(client, &msg),
+                    }
+                }
+                None => fail(client, "invalid forward norebind format: use local;remote"),
+            }
+        }
+        other => {
+            match other.split_once(';') {
+                Some((local, remote)) => {
+                    let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                    match reg.add_forward(local, remote, false) {
+                        Ok(()) => ok_str(client, ""),
+                        Err(msg) => fail(client, &msg),
+                    }
+                }
+                None => fail(client, &format!("invalid forward: {other}")),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transport Bridge
+// ---------------------------------------------------------------------------
+
+fn bridge_to_device(
+    client: TcpStream,
+    serial: String,
+    registry: &Arc<Mutex<TransportRegistry>>,
+) -> Result<bool, String> {
+    let origin = {
+        let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+        reg.find_by_serial(&serial).map(|d| d.origin)
+    };
+
+    match origin {
+        Some(DeviceOrigin::Tcp { addr }) => {
+            bridge_tcp_to_tcp(client, addr)
+        }
+        Some(DeviceOrigin::Usb) => {
+            #[cfg(feature = "usb")]
+            {
+                bridge_tcp_to_usb(client, &serial)
+            }
+            #[cfg(not(feature = "usb"))]
+            {
+                drop(client);
+                Err("USB transport not supported (compile with --features usb)".to_string())
+            }
+        }
+        None => {
+            drop(client);
+            Err(format!("device '{serial}' not found"))
+        }
+    }
+}
+
+/// Bridge TCP client -> TCP device (adbd). Simple byte-level proxy.
+fn bridge_tcp_to_tcp(mut client: TcpStream, addr: SocketAddr) -> Result<bool, String> {
+    let mut device = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("cannot connect to device at {addr}: {e}"))?;
+    let _ = device.set_nodelay(true);
+
+    let mut client_clone = client
+        .try_clone()
+        .map_err(|e| format!("client clone failed: {e}"))?;
+    let mut device_clone = device
+        .try_clone()
+        .map_err(|e| format!("device clone failed: {e}"))?;
+
+    let h1 = thread::spawn(move || -> io::Result<()> {
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = client_clone.read(&mut buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            device_clone.write_all(&buf[..n])?;
+            device_clone.flush()?;
+        }
+    });
+
+    let h2 = thread::spawn(move || -> io::Result<()> {
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = device.read(&mut buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            client.write_all(&buf[..n])?;
+            client.flush()?;
+        }
+    });
+
+    let _ = h1.join();
+    let _ = h2.join();
+    Ok(true)
+}
+
+/// Bridge TCP client <-> USB ADB device via usbfs.
+/// Uses ADB message framing (24-byte header + payload).
+#[cfg(feature = "usb")]
+fn bridge_tcp_to_usb(mut client: TcpStream, serial: &str) -> Result<bool, String> {
+    use adb_protocol::usb::UsbTransportAdapter;
+    use adb_protocol::usb_android::UsbfsAdbDevice;
+
+    let serial = serial.to_string();
+
+    let usb_dev =
+        UsbfsAdbDevice::open_by_serial(&serial).map_err(|e| format!("cannot open USB device: {e}"))?;
+    let transport = UsbTransportAdapter::new(usb_dev);
+
+    let mut client_clone = client
+        .try_clone()
+        .map_err(|e| format!("client clone failed: {e}"))?;
+
+    // Direction: client TCP -> USB device
+    let h1 = thread::spawn(move || -> Result<(), String> {
+        let mut transport = transport;
+        loop {
+            let mut hdr_buf = [0u8; 24];
+            if client_clone.read_exact(&mut hdr_buf).is_err() {
+                return Ok(());
+            }
+            let header = AdbMessageHeader::decode(&hdr_buf)
+                .map_err(|e| format!("bad hdr from client: {e}"))?;
+
+            let mut payload = vec![0u8; header.data_length as usize];
+            if header.data_length > 0 {
+                if client_clone.read_exact(&mut payload).is_err() {
+                    return Ok(());
+                }
+            }
+
+            transport.send_message(&header, &payload).map_err(|e| format!("USB send: {e}"))?;
+        }
+    });
+
+    // Direction: USB device -> client TCP
+    let h2 = thread::spawn(move || -> Result<(), String> {
+        let usb_dev2 = UsbfsAdbDevice::open_by_serial(&serial)
+            .map_err(|e| format!("cannot open USB device for recv: {e}"))?;
+        let mut transport2 = UsbTransportAdapter::new(usb_dev2);
+
+        loop {
+            let (header, payload) = match transport2.recv_message() {
+                Ok(msg) => msg,
+                Err(TransportError::Io(ref e))
+                    if e.kind() == io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(());
+                }
+                Err(e) => return Err(format!("USB recv: {e}")),
+            };
+
+            let mut hdr_buf = [0u8; 24];
+            header.encode(&mut hdr_buf);
+            if client.write_all(&hdr_buf).is_err() {
+                return Ok(());
+            }
+            if !payload.is_empty() && client.write_all(&payload).is_err() {
+                return Ok(());
+            }
+            let _ = client.flush();
+        }
+    });
+
+    let _ = h1.join();
+    let _ = h2.join();
+    Ok(true)
+}

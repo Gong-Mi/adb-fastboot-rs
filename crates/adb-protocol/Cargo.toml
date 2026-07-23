@@ -11,7 +11,7 @@ default = []
 tls = ["dep:rcgen", "dep:rustls"]
 usb = []
 usb-rusb = ["usb", "dep:rusb"]
-usb-android = []
+usb-android = ["usb"]
 
 [dependencies]
 libc = "0.2"

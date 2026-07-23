@@ -11,6 +11,8 @@ pub mod transport;
 pub mod usb;
 #[cfg(feature = "usb-android")]
 pub mod usb_android;
+#[cfg(feature = "usb-android")]
+pub use usb_android::{DeviceCandidate, UsbAndroidError, UsbfsAdbDevice};
 
 pub use auth::*;
 pub use compress::*;
