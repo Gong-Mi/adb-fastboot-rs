@@ -43,6 +43,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum DeviceState {
     Offline,
     Device,

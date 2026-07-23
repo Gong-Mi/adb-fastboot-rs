@@ -434,6 +434,7 @@ fn host_command(
 }
 
 /// Connect to adbd, handshake, run shell, return captured output.
+#[allow(dead_code)]
 fn shell_over_adbd(cmd: &str, addr: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let transport = TcpTransport::connect_timeout(addr, Duration::from_secs(3))
         .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
