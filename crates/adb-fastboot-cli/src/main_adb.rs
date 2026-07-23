@@ -1,10 +1,12 @@
 use std::io::Write;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 use clap::{Parser, Subcommand};
 use adb_protocol::{
-    AdbMessageHeader, AdbServerTransport, ShellV2Packet, TcpTransport, Transport, TransportError,
-    ADB_VERSION, A_AUTH, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_WRTE, MAX_PAYLOAD_V2,
+    AdbAuth, AdbMessageHeader, AdbServerTransport, ShellV2Packet, TcpTransport, Transport,
+    TransportError,
+    ADB_VERSION, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_STLS, A_WRTE, MAX_PAYLOAD_V2,
     build_sync_send_req, build_sync_data_chunk, build_sync_done, SyncMessageHeader,
     SYNC_FAIL, SYNC_OKAY,
 };
@@ -102,15 +104,109 @@ fn resolve_target_addr(serial: Option<&str>, default_port: u16) -> String {
     }
 }
 
-/// Perform ADB CNXN handshake on an already-connected transport.
-fn handshake(transport: &mut dyn Transport, features: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, features);
-    transport.send_message(&cnxn_hdr, features)?;
-    let (resp_hdr, _) = transport.recv_message()?;
-    if resp_hdr.command != A_CNXN && resp_hdr.command != A_AUTH {
-        return Err(format!("Unexpected handshake response (cmd {:#x})", resp_hdr.command).into());
+/// Information about the device received in the CNXN response banner.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub banner: String,
+}
+
+/// Get or create a default ADB auth key (singleton).
+fn default_auth() -> &'static AdbAuth {
+    static AUTH: OnceLock<AdbAuth> = OnceLock::new();
+    AUTH.get_or_init(|| {
+        AdbAuth::generate("adb-rs@localhost").expect("Failed to generate ADB auth key")
+    })
+}
+
+/// Connect to adbd, perform CNXN handshake with A_STLS TLS upgrade support.
+///
+/// If the device responds with A_STLS, the transport is upgraded to TLS
+/// using the auth key, and the CNXN handshake is retried over the encrypted channel.
+#[cfg(feature = "tls")]
+fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
+    transport: T,
+    cnxn_payload: &[u8],
+    auth: &AdbAuth,
+) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
+    use adb_protocol::tls;
+    use adb_protocol::AdbTlsTransport;
+
+    let mut transport: Box<dyn Transport> = Box::new(transport);
+
+    // Send initial CNXN
+    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
+    transport.send_message(&cnxn_hdr, cnxn_payload)?;
+
+    // Read response
+    let (resp_hdr, payload) = transport.recv_message()?;
+
+    if resp_hdr.command == A_CNXN {
+        // Normal path — no TLS required
+        let banner = String::from_utf8_lossy(&payload).to_string();
+        return Ok((DeviceInfo { banner }, transport));
     }
-    Ok(())
+
+    if resp_hdr.command == A_STLS {
+        // TLS upgrade path
+        let rsa_pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key())
+            .map_err(|e| format!("Failed to export RSA key: {e}"))?;
+        let (cert_der, key_der) = tls::generate_self_signed_cert(&rsa_pem)
+            .map_err(|e| format!("Failed to generate self-signed cert: {e}"))?;
+        let config = tls::create_tls_config(cert_der, key_der)
+            .map_err(|e| format!("Failed to create TLS config: {e}"))?;
+
+        let tls_transport = AdbTlsTransport::new(transport, config, "adb")
+            .map_err(|e| format!("TLS upgrade failed: {e}"))?;
+
+        // Re-send CNXN over TLS
+        let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
+        let mut tls_box: Box<dyn Transport> = Box::new(tls_transport);
+        tls_box.send_message(&cnxn_hdr, cnxn_payload)?;
+
+        let (resp_hdr2, payload2) = tls_box.recv_message()?;
+        if resp_hdr2.command != A_CNXN {
+            return Err(format!(
+                "Unexpected handshake response after TLS upgrade: cmd={:#x}",
+                resp_hdr2.command
+            )
+            .into());
+        }
+
+        let banner = String::from_utf8_lossy(&payload2).to_string();
+        return Ok((DeviceInfo { banner }, tls_box));
+    }
+
+    Err(format!(
+        "Unexpected handshake response: cmd={:#x}",
+        resp_hdr.command
+    )
+    .into())
+}
+
+/// Non-TLS fallback — A_STLS will return an error if the device requires TLS.
+#[cfg(not(feature = "tls"))]
+fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
+    transport: T,
+    cnxn_payload: &[u8],
+    _auth: &AdbAuth,
+) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
+    let mut transport: Box<dyn Transport> = Box::new(transport);
+    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
+
+    transport.send_message(&cnxn_hdr, cnxn_payload)?;
+
+    let (resp_hdr, payload) = transport.recv_message()?;
+    if resp_hdr.command == A_STLS {
+        return Err("Device requires TLS (A_STLS) but the `tls` feature is not enabled. \
+                    Rebuild with --features tls"
+            .into());
+    }
+    if resp_hdr.command != A_CNXN {
+        return Err(format!("Unexpected handshake response: cmd={:#x}", resp_hdr.command).into());
+    }
+
+    let banner = String::from_utf8_lossy(&payload).to_string();
+    Ok((DeviceInfo { banner }, transport))
 }
 
 /// Open an adbd service (shell:, sync:, reboot:, etc.) via A_OPEN.
@@ -338,11 +434,11 @@ fn host_command(
 }
 
 /// Connect to adbd, handshake, run shell, return captured output.
-#[allow(dead_code)]
 fn shell_over_adbd(cmd: &str, addr: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut transport = TcpTransport::connect_timeout(addr, Duration::from_secs(3))
+    let transport = TcpTransport::connect_timeout(addr, Duration::from_secs(3))
         .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-    handshake(&mut transport, b"host::features=shell_v2,cmd")?;
+    let (_info, mut transport) =
+        connect_and_handshake_with_tls_upgrade(transport, b"host::features=shell_v2,cmd", default_auth())?;
     let captured = run_shell(&mut transport, cmd, true)?;
     Ok(captured.unwrap_or_default())
 }
@@ -355,23 +451,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Devices => {
             println!("List of devices attached (adb-rs pure rust transport)");
             match TcpTransport::connect_timeout(&addr, Duration::from_secs(2)) {
-                Ok(mut transport) => {
-                    let cnxn_payload = b"host::features=shell_v2,cmd";
-                    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-                    if let Err(e) = transport.send_message(&cnxn_hdr, cnxn_payload) {
-                        eprintln!("Error sending ADB handshake to {}: {}", addr, e);
-                        std::process::exit(1);
-                    }
-                    match transport.recv_message() {
-                        Ok((resp_hdr, payload)) if resp_hdr.command == A_CNXN => {
-                            let sys_info = String::from_utf8_lossy(&payload);
-                            println!("{}\tdevice ({})", addr, sys_info.trim());
-                        }
-                        Ok((resp_hdr, _)) => {
-                            println!("{}\tdevice (cmd={:#x})", addr, resp_hdr.command);
+                Ok(transport) => {
+                    match connect_and_handshake_with_tls_upgrade(
+                        transport,
+                        b"host::features=shell_v2,cmd",
+                        default_auth(),
+                    ) {
+                        Ok((device_info, _transport)) => {
+                            println!("{}\tdevice ({})", addr, device_info.banner.trim());
                         }
                         Err(e) => {
-                            eprintln!("Error receiving handshake response from {}: {}", addr, e);
+                            eprintln!("Error during handshake with {}: {}", addr, e);
                             std::process::exit(1);
                         }
                     }
@@ -383,14 +473,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Shell { command } => {
-            let mut transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
+            let transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
-            handshake(&mut transport, b"host::features=shell_v2,cmd")?;
+            let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+                transport,
+                b"host::features=shell_v2,cmd",
+                default_auth(),
+            )?;
 
             let cmd_str = command.join(" ");
             let dest = if cmd_str.is_empty() {
@@ -403,17 +497,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stream_shell_v2(&mut transport, _lid, remote_id, false)?;
         }
         Commands::Push { local, remote } => {
-            let mut transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
+            let transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
-            let cnxn_payload = b"host::";
-            let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-            transport.send_message(&cnxn_hdr, cnxn_payload)?;
-            let _ = transport.recv_message()?;
+            let (_info, mut transport) =
+                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
 
             let sync_dest = b"sync:";
             let open_hdr = AdbMessageHeader::new(A_OPEN, 1, 0, sync_dest);
@@ -421,17 +513,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[adb-rs] Connected sync transport to {} for push '{}' -> '{}'", addr, local, remote);
         }
         Commands::Pull { remote, local } => {
-            let mut transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
+            let transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
-            let cnxn_payload = b"host::";
-            let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-            transport.send_message(&cnxn_hdr, cnxn_payload)?;
-            let _ = transport.recv_message()?;
+            let (_info, mut transport) =
+                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
 
             let sync_dest = b"sync:";
             let open_hdr = AdbMessageHeader::new(A_OPEN, 1, 0, sync_dest);
@@ -439,17 +529,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[adb-rs] Connected sync transport to {} for pull '{}' -> '{}'", addr, remote, local);
         }
         Commands::Reboot { target } => {
-            let mut transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
+            let transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
-            let cnxn_payload = b"host::";
-            let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-            transport.send_message(&cnxn_hdr, cnxn_payload)?;
-            let _ = transport.recv_message()?;
+            let (_info, mut transport) =
+                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
 
             let target_str = target.as_deref().unwrap_or("");
             let dest = format!("reboot:{}", target_str);
@@ -538,9 +626,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let remote_apk = format!("/data/local/tmp/{file_name}");
 
             // Connect to adbd
-            let mut transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-            handshake(&mut transport, b"host::")?;
+            let (_info, mut transport) =
+                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
 
             // Open sync: service
             let (local_id, remote_id) = open_service(&mut transport, "sync:", 1)?;
@@ -602,9 +691,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Uninstall { package } => {
-            let mut transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-            handshake(&mut transport, b"host::features=shell_v2,cmd")?;
+            let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+                transport,
+                b"host::features=shell_v2,cmd",
+                default_auth(),
+            )?;
 
             let cmd = format!("pm uninstall {package}");
             let result = run_shell(&mut transport, &cmd, true)?;
@@ -621,9 +714,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Logcat { args } => {
-            let mut transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-            handshake(&mut transport, b"host::features=shell_v2,cmd")?;
+            let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+                transport,
+                b"host::features=shell_v2,cmd",
+                default_auth(),
+            )?;
 
             let logcat_cmd = if args.is_empty() {
                 "logcat".to_string()
@@ -636,9 +733,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Bugreport { output } => {
-            let mut transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-            handshake(&mut transport, b"host::features=shell_v2,cmd")?;
+            let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+                transport,
+                b"host::features=shell_v2,cmd",
+                default_auth(),
+            )?;
 
             let dest = "shell,v2,raw:bugreport".to_string();
             println!("[adb-rs] Capturing bugreport from {addr} ...");
