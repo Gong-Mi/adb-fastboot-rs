@@ -90,7 +90,11 @@ fn parse_max_download_size(val: &str) -> Option<usize> {
 #[derive(Subcommand)]
 enum Commands {
     /// List connected fastboot devices
-    Devices,
+    Devices {
+        /// Show long listing with device properties/details
+        #[arg(short = 'l', long)]
+        long: bool,
+    },
     /// Get variable value from bootloader
     Getvar {
         variable: String,
@@ -1284,7 +1288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cli.command {
-        Commands::Devices => {
+        Commands::Devices { long } => {
             println!("List of fastboot devices (fastboot-rs pure rust protocol)");
             if use_usb {
                 #[cfg(feature = "usb")]
@@ -1296,7 +1300,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             for device in &devices {
                                 let serial = device.serial.as_deref().unwrap_or("????????");
-                                println!("{}\tfastboot", serial);
+                                if long {
+                                    println!("{}\tfastboot usb:{}-{}", serial, device.bus_number, device.address);
+                                } else {
+                                    println!("{}\tfastboot", serial);
+                                }
                             }
                         }
                         Err(e) => {
@@ -1314,14 +1322,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 match open_transport(false, &addr, Duration::from_secs(2)) {
                     Ok(mut transport) => {
+                        let mut details = String::new();
+                        if long {
+                            if let Ok(_) = transport.send_cmd("getvar:product") {
+                                if let Ok(fastboot_protocol::FastbootResponse::Okay(val)) = transport.recv_response() {
+                                    details.push_str(&format!(" product:{}", val));
+                                }
+                            }
+                        }
                         if let Ok(_) = transport.send_cmd("getvar:version") {
                             if let Ok(resp) = transport.recv_response() {
-                                println!("{}\tfastboot ({:?})", addr, resp);
+                                println!("{}\tfastboot ({:?}){}", addr, resp, details);
                             } else {
-                                println!("{}\tfastboot", addr);
+                                println!("{}\tfastboot{}", addr, details);
                             }
                         } else {
-                            println!("{}\tfastboot", addr);
+                            println!("{}\tfastboot{}", addr, details);
                         }
                     }
                     Err(e) => {

@@ -53,6 +53,8 @@ Already landed and therefore not counted as gaps here:
 - Fastboot fetch offset/size/slot ranges and max-fetch-size chunking
 - `continue`
 - flashing action validation
+- Fastboot `devices -l` output formatting
+- `VendorBootBuilder` v3/v4 header, ramdisk table, and bootconfig image repacking primitives
 
 ## Fastboot protocol/image — 5 gaps
 

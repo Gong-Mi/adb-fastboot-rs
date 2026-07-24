@@ -204,35 +204,241 @@ fn fixed_string(data: &[u8]) -> String { let end = data.iter().position(|&b| b =
 fn u32_at(data: &[u8], offset: usize) -> u32 { LittleEndian::read_u32(&data[offset..offset + 4]) }
 fn u64_at(data: &[u8], offset: usize) -> u64 { LittleEndian::read_u64(&data[offset..offset + 8]) }
 
-#[cfg(test)]
-fn build_vendor_boot_v4_for_test(ramdisk: &[u8], dtb: &[u8], bootconfig: &[u8], entries: &[VendorRamdiskTableEntry]) -> Vec<u8> {
-    let page = 4096usize;
-    let table_size = entries.len() * VENDOR_RAMDISK_TABLE_ENTRY_SIZE;
-    let mut image = vec![0u8; page];
-    image[..8].copy_from_slice(&VENDOR_BOOT_MAGIC);
-    image[8..12].copy_from_slice(&4u32.to_le_bytes());
-    image[12..16].copy_from_slice(&(page as u32).to_le_bytes());
-    image[24..28].copy_from_slice(&(ramdisk.len() as u32).to_le_bytes());
-    image[2096..2100].copy_from_slice(&(VENDOR_BOOT_HEADER_V4_SIZE as u32).to_le_bytes());
-    image[2100..2104].copy_from_slice(&(dtb.len() as u32).to_le_bytes());
-    image[2112..2116].copy_from_slice(&(table_size as u32).to_le_bytes());
-    image[2116..2120].copy_from_slice(&(entries.len() as u32).to_le_bytes());
-    image[2120..2124].copy_from_slice(&(VENDOR_RAMDISK_TABLE_ENTRY_SIZE as u32).to_le_bytes());
-    image[2124..2128].copy_from_slice(&(bootconfig.len() as u32).to_le_bytes());
-    for section in [ramdisk, dtb] { image.extend_from_slice(section); image.resize((image.len() + page - 1) / page * page, 0); }
-    for entry in entries {
-        let mut raw = [0u8; VENDOR_RAMDISK_TABLE_ENTRY_SIZE];
-        raw[..4].copy_from_slice(&entry.ramdisk_size.to_le_bytes()); raw[4..8].copy_from_slice(&entry.ramdisk_offset.to_le_bytes()); raw[8..12].copy_from_slice(&entry.ramdisk_type.to_le_bytes());
-        let name = entry.ramdisk_name.as_bytes(); raw[12..12 + name.len().min(32)].copy_from_slice(&name[..name.len().min(32)]);
-        for (i, word) in entry.board_id.iter().enumerate() { raw[44 + i * 4..48 + i * 4].copy_from_slice(&word.to_le_bytes()); }
-        image.extend_from_slice(&raw);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendorBootBuilder {
+    pub version: VendorBootVersion,
+    pub page_size: u32,
+    pub kernel_addr: u32,
+    pub ramdisk_addr: u32,
+    pub cmdline: String,
+    pub tags_addr: u32,
+    pub name: String,
+    pub dtb_addr: u64,
+    pub ramdisk: Vec<u8>,
+    pub dtb: Vec<u8>,
+    pub bootconfig: Vec<u8>,
+    pub table_entries: Vec<VendorRamdiskTableEntry>,
+}
+
+impl Default for VendorBootBuilder {
+    fn default() -> Self {
+        Self {
+            version: VendorBootVersion::V4,
+            page_size: VENDOR_BOOT_PAGE_SIZE as u32,
+            kernel_addr: 0x00000000,
+            ramdisk_addr: 0x00000000,
+            cmdline: String::new(),
+            tags_addr: 0x00000000,
+            name: String::new(),
+            dtb_addr: 0x00000000,
+            ramdisk: Vec::new(),
+            dtb: Vec::new(),
+            bootconfig: Vec::new(),
+            table_entries: Vec::new(),
+        }
     }
-    image.resize((image.len() + page - 1) / page * page, 0); image.extend_from_slice(bootconfig); image.resize((image.len() + page - 1) / page * page, 0); image
+}
+
+impl VendorBootBuilder {
+    pub fn new(version: VendorBootVersion) -> Self {
+        Self {
+            version,
+            ..Default::default()
+        }
+    }
+
+    pub fn page_size(mut self, page_size: u32) -> Self {
+        self.page_size = page_size;
+        self
+    }
+
+    pub fn kernel_addr(mut self, addr: u32) -> Self {
+        self.kernel_addr = addr;
+        self
+    }
+
+    pub fn ramdisk_addr(mut self, addr: u32) -> Self {
+        self.ramdisk_addr = addr;
+        self
+    }
+
+    pub fn cmdline(mut self, cmdline: impl Into<String>) -> Self {
+        self.cmdline = cmdline.into();
+        self
+    }
+
+    pub fn tags_addr(mut self, addr: u32) -> Self {
+        self.tags_addr = addr;
+        self
+    }
+
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    pub fn dtb_addr(mut self, addr: u64) -> Self {
+        self.dtb_addr = addr;
+        self
+    }
+
+    pub fn ramdisk(mut self, ramdisk: Vec<u8>) -> Self {
+        self.ramdisk = ramdisk;
+        self
+    }
+
+    pub fn dtb(mut self, dtb: Vec<u8>) -> Self {
+        self.dtb = dtb;
+        self
+    }
+
+    pub fn bootconfig(mut self, bootconfig: Vec<u8>) -> Self {
+        self.bootconfig = bootconfig;
+        self
+    }
+
+    pub fn table_entries(mut self, entries: Vec<VendorRamdiskTableEntry>) -> Self {
+        self.table_entries = entries;
+        self
+    }
+
+    pub fn add_table_entry(mut self, entry: VendorRamdiskTableEntry) -> Self {
+        self.table_entries.push(entry);
+        self
+    }
+
+    pub fn build(&self) -> Result<Vec<u8>, VendorBootError> {
+        if self.page_size == 0 {
+            return Err(VendorBootError::InvalidPageSize(0));
+        }
+
+        let header_size = match self.version {
+            VendorBootVersion::V3 => VENDOR_BOOT_HEADER_V3_SIZE,
+            VendorBootVersion::V4 => VENDOR_BOOT_HEADER_V4_SIZE,
+        };
+
+        let page = self.page_size as usize;
+        let align = |n: usize| (n + page - 1) / page * page;
+
+        let table_size = if self.version == VendorBootVersion::V4 {
+            self.table_entries.len() * VENDOR_RAMDISK_TABLE_ENTRY_SIZE
+        } else {
+            0
+        };
+
+        let mut image = vec![0u8; header_size];
+        image[..8].copy_from_slice(&VENDOR_BOOT_MAGIC);
+
+        let ver_num = match self.version {
+            VendorBootVersion::V3 => 3u32,
+            VendorBootVersion::V4 => 4u32,
+        };
+        image[8..12].copy_from_slice(&ver_num.to_le_bytes());
+        image[12..16].copy_from_slice(&self.page_size.to_le_bytes());
+        image[16..20].copy_from_slice(&self.kernel_addr.to_le_bytes());
+        image[20..24].copy_from_slice(&self.ramdisk_addr.to_le_bytes());
+        image[24..28].copy_from_slice(&(self.ramdisk.len() as u32).to_le_bytes());
+
+        let cmdline_bytes = self.cmdline.as_bytes();
+        let cmdline_len = cmdline_bytes.len().min(VENDOR_BOOT_CMDLINE_SIZE);
+        image[28..28 + cmdline_len].copy_from_slice(&cmdline_bytes[..cmdline_len]);
+
+        image[2076..2080].copy_from_slice(&self.tags_addr.to_le_bytes());
+
+        let name_bytes = self.name.as_bytes();
+        let name_len = name_bytes.len().min(VENDOR_BOOT_NAME_SIZE);
+        image[2080..2080 + name_len].copy_from_slice(&name_bytes[..name_len]);
+
+        image[2096..2100].copy_from_slice(&(header_size as u32).to_le_bytes());
+        image[2100..2104].copy_from_slice(&(self.dtb.len() as u32).to_le_bytes());
+        image[2104..2112].copy_from_slice(&self.dtb_addr.to_le_bytes());
+
+        if self.version == VendorBootVersion::V4 {
+            image[2112..2116].copy_from_slice(&(table_size as u32).to_le_bytes());
+            image[2116..2120].copy_from_slice(&(self.table_entries.len() as u32).to_le_bytes());
+            image[2120..2124].copy_from_slice(&(VENDOR_RAMDISK_TABLE_ENTRY_SIZE as u32).to_le_bytes());
+            image[2124..2128].copy_from_slice(&(self.bootconfig.len() as u32).to_le_bytes());
+        }
+
+        // Header section padding
+        image.resize(align(header_size), 0);
+
+        // Ramdisk section
+        image.extend_from_slice(&self.ramdisk);
+        image.resize(align(image.len()), 0);
+
+        // DTB section
+        image.extend_from_slice(&self.dtb);
+        image.resize(align(image.len()), 0);
+
+        if self.version == VendorBootVersion::V4 {
+            // Ramdisk Table section
+            for entry in &self.table_entries {
+                let mut raw = [0u8; VENDOR_RAMDISK_TABLE_ENTRY_SIZE];
+                raw[..4].copy_from_slice(&entry.ramdisk_size.to_le_bytes());
+                raw[4..8].copy_from_slice(&entry.ramdisk_offset.to_le_bytes());
+                raw[8..12].copy_from_slice(&entry.ramdisk_type.to_le_bytes());
+                let n = entry.ramdisk_name.as_bytes();
+                raw[12..12 + n.len().min(VENDOR_RAMDISK_NAME_SIZE)].copy_from_slice(&n[..n.len().min(VENDOR_RAMDISK_NAME_SIZE)]);
+                for (i, word) in entry.board_id.iter().enumerate() {
+                    raw[44 + i * 4..48 + i * 4].copy_from_slice(&word.to_le_bytes());
+                }
+                image.extend_from_slice(&raw);
+            }
+            image.resize(align(image.len()), 0);
+
+            // Bootconfig section
+            image.extend_from_slice(&self.bootconfig);
+            image.resize(align(image.len()), 0);
+        }
+
+        Ok(image)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_vendor_boot_v4_for_test(ramdisk: &[u8], dtb: &[u8], bootconfig: &[u8], entries: &[VendorRamdiskTableEntry]) -> Vec<u8> {
+        VendorBootBuilder::new(VendorBootVersion::V4)
+            .ramdisk(ramdisk.to_vec())
+            .dtb(dtb.to_vec())
+            .bootconfig(bootconfig.to_vec())
+            .table_entries(entries.to_vec())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn vendor_boot_builder_v3_v4_roundtrip() {
+        let v3_image = VendorBootBuilder::new(VendorBootVersion::V3)
+            .ramdisk(b"v3_ramdisk".to_vec())
+            .dtb(b"v3_dtb".to_vec())
+            .cmdline("console=ttyMSM0")
+            .build()
+            .unwrap();
+
+        let parsed_v3 = VendorBootImage::parse(&v3_image).unwrap();
+        assert_eq!(parsed_v3.header.version, VendorBootVersion::V3);
+        assert_eq!(parsed_v3.ramdisk(), b"v3_ramdisk");
+        assert_eq!(parsed_v3.dtb(), b"v3_dtb");
+        assert_eq!(parsed_v3.header.cmdline, "console=ttyMSM0");
+
+        let entries = vec![VendorRamdiskTableEntry::new(b"platform", 3, 1)];
+        let v4_image = VendorBootBuilder::new(VendorBootVersion::V4)
+            .ramdisk(b"v4_ramdisk".to_vec())
+            .dtb(b"v4_dtb".to_vec())
+            .bootconfig(b"bootconfig_data".to_vec())
+            .table_entries(entries.clone())
+            .build()
+            .unwrap();
+
+        let parsed_v4 = VendorBootImage::parse(&v4_image).unwrap();
+        assert_eq!(parsed_v4.header.version, VendorBootVersion::V4);
+        assert_eq!(parsed_v4.bootconfig(), b"bootconfig_data");
+        assert_eq!(parsed_v4.entries(), entries.as_slice());
+    }
     #[test]
     fn v4_layout_and_table_roundtrip() {
         let entries = vec![VendorRamdiskTableEntry::new(b"platform", 3, 1), VendorRamdiskTableEntry::new(b"recovery", 5, 2)];
