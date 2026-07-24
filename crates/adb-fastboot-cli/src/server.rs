@@ -565,6 +565,40 @@ fn handle_client(
 // Host Service Dispatch
 // ---------------------------------------------------------------------------
 
+/// Parse the ADB host-service `connect` address.
+///
+/// AOSP's ParseNetAddress accepts the usual `host:port` spelling and requires
+/// brackets around IPv6 literals when a port is present. Keep the host
+/// unbracketed for DNS resolution, while preserving the socket's canonical
+/// bracketed spelling for the registry serial below.
+fn parse_adb_host_port(target: &str) -> Result<(String, u16), String> {
+    let (host, port) = if let Some(rest) = target.strip_prefix('[') {
+        let (host, rest) = rest
+            .split_once(']')
+            .ok_or_else(|| "invalid IPv6 address: missing closing ']'".to_string())?;
+        let port = rest
+            .strip_prefix(':')
+            .ok_or_else(|| "invalid address: IPv6 host must be followed by ':port'".to_string())?;
+        (host, port)
+    } else {
+        if target.matches(':').count() != 1 {
+            return Err("invalid address: IPv6 literals must be enclosed in '[' and ']'".to_string());
+        }
+        target
+            .split_once(':')
+            .ok_or_else(|| "invalid connect format: use host:port".to_string())?
+    };
+
+    if host.is_empty() {
+        return Err("invalid address: host is empty".to_string());
+    }
+    let port: u16 = port.parse().map_err(|_| format!("invalid port: {port}"))?;
+    if port == 0 {
+        return Err("invalid port: 0".to_string());
+    }
+    Ok((host.to_string(), port))
+}
+
 fn dispatch_host_service(
     client: &mut TcpStream,
     cmd: &str,
@@ -723,15 +757,14 @@ fn dispatch_host_service(
         // -- host:connect <host>:<port> -------------------------------------
         c if c.starts_with("host:connect:") => {
             let target = &c["host:connect:".len()..];
-            let (host_str, port_str) = target
-                .rsplit_once(':')
-                .ok_or_else(|| "invalid connect format: use host:port".to_string())?;
-            let port: u16 = port_str
-                .parse()
-                .map_err(|_| format!("invalid port: {port_str}"))?;
-            let host = if host_str.is_empty() { "127.0.0.1" } else { host_str };
+            let (parsed_host, port) = parse_adb_host_port(target)?;
+            let host = &parsed_host;
 
-            let addr_str = format!("{host}:{port}");
+            let addr_str = if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            };
             let sock_addrs: Vec<SocketAddr> = addr_str
                 .to_socket_addrs()
                 .map_err(|e| format!("resolve failed: {e}"))?
@@ -767,7 +800,7 @@ fn dispatch_host_service(
                 .unwrap_or(false);
 
             if is_adbd {
-                let serial = format!("{host}:{port}");
+                let serial = addr.to_string();
                 {
                     let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
                     reg.upsert_tcp_device(addr, serial.clone());
@@ -1406,6 +1439,77 @@ fn bridge_tcp_to_usb(mut client: TcpStream, serial: &str) -> Result<bool, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_adb_host_port_supports_ipv4_hostname_and_bracketed_ipv6() {
+        assert_eq!(parse_adb_host_port("127.0.0.1:5555").unwrap(), ("127.0.0.1".to_string(), 5555));
+        assert_eq!(parse_adb_host_port("device.local:5555").unwrap(), ("device.local".to_string(), 5555));
+        assert_eq!(parse_adb_host_port("[::1]:5555").unwrap(), ("::1".to_string(), 5555));
+        assert_eq!(parse_adb_host_port("[fe80::1%wlan0]:5555").unwrap(), ("fe80::1%wlan0".to_string(), 5555));
+    }
+
+    #[test]
+    fn test_parse_adb_host_port_rejects_ambiguous_or_invalid_addresses() {
+        assert!(parse_adb_host_port("::1:5555").is_err());
+        assert!(parse_adb_host_port("[::1]").is_err());
+        assert!(parse_adb_host_port("host:not-a-port").is_err());
+        assert!(parse_adb_host_port("host:0").is_err());
+        assert!(parse_adb_host_port(":5555").is_err());
+    }
+
+    #[test]
+    fn test_host_connect_ipv6_wire_and_canonical_serial() {
+        let device_listener = TcpListener::bind("[::1]:0").unwrap();
+        let device_addr = device_listener.local_addr().unwrap();
+        let device = thread::spawn(move || {
+            let (mut stream, _) = device_listener.accept().unwrap();
+            let mut request_header = [0u8; 24];
+            stream.read_exact(&mut request_header).unwrap();
+            let request = AdbMessageHeader::decode(&request_header).unwrap();
+            let mut request_payload = vec![0u8; request.data_length as usize];
+            stream.read_exact(&mut request_payload).unwrap();
+
+            let response_payload = b"device::features=shell_v2;";
+            let response = AdbMessageHeader::new(
+                A_CNXN,
+                ADB_VERSION,
+                MAX_PAYLOAD_V2,
+                response_payload,
+            );
+            let mut response_header = [0u8; 24];
+            response.encode(&mut response_header);
+            stream.write_all(&response_header).unwrap();
+            stream.write_all(response_payload).unwrap();
+        });
+
+        let server_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = server_listener.local_addr().unwrap();
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let server_registry = Arc::clone(&registry);
+        let server_running = Arc::clone(&running);
+        let command = format!("host:connect:[::1]:{}", device_addr.port());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = server_listener.accept().unwrap();
+            dispatch_host_service(&mut stream, &command, &server_registry, &server_running).unwrap();
+        });
+
+        let mut client = TcpStream::connect(server_addr).unwrap();
+        let mut status = [0u8; 4];
+        client.read_exact(&mut status).unwrap();
+        assert_eq!(&status, b"OKAY");
+        let mut length = [0u8; 4];
+        client.read_exact(&mut length).unwrap();
+        let length = usize::from_str_radix(std::str::from_utf8(&length).unwrap(), 16).unwrap();
+        let mut payload = vec![0u8; length];
+        client.read_exact(&mut payload).unwrap();
+        assert_eq!(std::str::from_utf8(&payload).unwrap(), format!("[::1]:{}", device_addr.port()));
+
+        server.join().unwrap();
+        device.join().unwrap();
+        let reg = registry.lock().unwrap();
+        assert!(reg.find_by_serial(&format!("[::1]:{}", device_addr.port())).is_some());
+    }
 
     #[test]
     fn test_transport_selection_accepts_only_aosp_online_states() {
