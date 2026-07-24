@@ -8,6 +8,10 @@ pub const A_WRTE: u32 = 0x45545257; // "WRTE"
 pub const A_AUTH: u32 = 0x48545541; // "AUTH"
 pub const A_STLS: u32 = 0x534C5453; // "STLS"
 
+/// Stream-based TLS protocol version used by AOSP ADB.
+pub const A_STLS_VERSION_MIN: u32 = 0x01000000;
+pub const A_STLS_VERSION: u32 = 0x01000000;
+
 /// ADB Version & Max Payload
 pub const ADB_VERSION: u32 = 0x01000001;
 pub const MAX_PAYLOAD_V1: u32 = 4096;

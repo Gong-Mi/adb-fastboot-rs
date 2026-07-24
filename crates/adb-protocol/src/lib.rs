@@ -4,6 +4,7 @@ pub mod constants;
 pub mod header;
 pub mod pairing;
 pub mod shell_v2;
+pub mod stls;
 pub mod sync;
 #[cfg(feature = "tls")]
 pub mod tls;
@@ -24,6 +25,7 @@ pub use pairing::{
     PairingPacketType, MAX_PAIRING_PAYLOAD, PAIRING_HEADER_SIZE, PAIRING_VERSION,
 };
 pub use shell_v2::{ShellV2Error, ShellV2Packet};
+pub use stls::{StlsAction, StlsError, StlsPacket, StlsState, StlsStateMachine};
 pub use sync::{
     build_recv_v2_req, build_send_v2_req, build_sync_data_block, build_sync_data_chunk,
     build_sync_done, build_sync_done_u64, build_sync_list_req, build_sync_recv_req,
