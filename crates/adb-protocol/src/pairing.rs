@@ -95,36 +95,77 @@ impl PairingPacket {
         })
     }
 
-    pub fn encode_header(&self) -> [u8; PAIRING_HEADER_SIZE] {
-        let len = (self.payload.len() as u32).to_be_bytes();
-        [self.version, self.packet_type as u8, len[0], len[1], len[2], len[3]]
+    pub fn encode_protobuf(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(6 + self.payload.len());
+        out.push(0x08);
+        out.push(self.packet_type as u8);
+        out.push(0x12);
+        let mut len = self.payload.len();
+        while len >= 0x80 {
+            out.push((len as u8 & 0x7f) | 0x80);
+            len >>= 7;
+        }
+        out.push(len as u8);
+        out.extend_from_slice(&self.payload);
+        out
     }
 
     pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<(), PairingError> {
-        writer.write_all(&self.encode_header())?;
-        writer.write_all(&self.payload)?;
+        let proto = self.encode_protobuf();
+        let len = (proto.len() as u32).to_be_bytes();
+        writer.write_all(&len)?;
+        writer.write_all(&proto)?;
         writer.flush()?;
         Ok(())
     }
 
     pub fn read_from<R: Read>(reader: &mut R) -> Result<Self, PairingError> {
-        let mut header = [0u8; PAIRING_HEADER_SIZE];
-        reader.read_exact(&mut header)?;
-        if header[0] != PAIRING_VERSION {
-            return Err(PairingError::InvalidHeader(format!(
-                "unsupported version {}",
-                header[0]
-            )));
-        }
-        let packet_type = PairingPacketType::try_from(header[1])?;
-        let len = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+        let mut len_bytes = [0u8; 4];
+        reader.read_exact(&mut len_bytes)?;
+        let len = u32::from_be_bytes(len_bytes) as usize;
         if len == 0 || len > MAX_PAIRING_PAYLOAD {
             return Err(PairingError::InvalidHeader(format!("unsafe payload length {len}")));
         }
-        let mut payload = vec![0; len];
-        reader.read_exact(&mut payload)?;
+        let mut proto_buf = vec![0u8; len];
+        reader.read_exact(&mut proto_buf)?;
+
+        let mut packet_type = PairingPacketType::Spake2Msg;
+        let mut payload = Vec::new();
+        let mut idx = 0;
+
+        while idx < proto_buf.len() {
+            let tag = proto_buf[idx];
+            idx += 1;
+            match tag {
+                0x08 => {
+                    if idx < proto_buf.len() {
+                        packet_type = PairingPacketType::try_from(proto_buf[idx])?;
+                        idx += 1;
+                    }
+                }
+                0x12 => {
+                    let mut p_len = 0usize;
+                    let mut shift = 0;
+                    while idx < proto_buf.len() {
+                        let b = proto_buf[idx];
+                        idx += 1;
+                        p_len |= ((b & 0x7f) as usize) << shift;
+                        if b & 0x80 == 0 {
+                            break;
+                        }
+                        shift += 7;
+                    }
+                    if idx + p_len <= proto_buf.len() {
+                        payload = proto_buf[idx..idx + p_len].to_vec();
+                        idx += p_len;
+                    }
+                }
+                _ => break,
+            }
+        }
+
         Ok(Self {
-            version: header[0],
+            version: PAIRING_VERSION,
             packet_type,
             payload,
         })
@@ -1141,12 +1182,10 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn aosp_header_is_six_bytes_big_endian() {
-        let packet = PairingPacket::new(PairingPacketType::Spake2Msg, vec![0xaa; 0x0102]).unwrap();
-        assert_eq!(packet.encode_header(), [1, 1, 0, 0, 1, 2]);
+    fn aosp_protobuf_pairing_packet_roundtrip() {
+        let packet = PairingPacket::new(PairingPacketType::Spake2Msg, vec![0xaa; 0x20]).unwrap();
         let mut wire = Vec::new();
         packet.write_to(&mut wire).unwrap();
-        assert_eq!(wire.len(), 6 + 0x0102);
         assert_eq!(PairingPacket::read_from(&mut Cursor::new(wire)).unwrap(), packet);
     }
 

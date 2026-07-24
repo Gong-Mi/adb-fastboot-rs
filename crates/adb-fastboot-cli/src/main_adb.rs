@@ -272,6 +272,45 @@ fn write_auth_public_key(auth: &AdbAuth, path: &Path) -> Result<(), Box<dyn std:
     write_private_key(path, &bytes)
 }
 
+/// Append the host public key to /data/misc/adb/adb_keys so that future
+/// SIGNATURE-based ADB connections succeed without a re-authorization dialog.
+/// HyperOS does not always persist USB keys via AdbDebuggingManager, so
+/// we write the key ourselves with root.
+#[cfg(target_os = "android")]
+fn persist_adb_pubkey(auth: &AdbAuth) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = auth.build_rsakey_payload()?;
+    // Strip trailing null byte for the plain-text key file
+    let key_line = if payload.ends_with(&[0]) {
+        std::str::from_utf8(&payload[..payload.len() - 1])?
+    } else {
+        std::str::from_utf8(&payload)?
+    };
+    if key_line.is_empty() {
+        return Ok(());
+    }
+
+    let key_path = "/data/misc/adb/adb_keys";
+    // Check whether the key is already present
+    let already_present = std::fs::read_to_string(key_path)
+        .map(|content| content.lines().any(|l| l.trim() == key_line))
+        .unwrap_or(false);
+    if already_present {
+        return Ok(());
+    }
+
+    // Append via root
+    use std::io::Write;
+    let status = std::process::Command::new("su")
+        .arg("-c")
+        .arg(format!("printf '%s\\n' '{}' >> {}", key_line, key_path))
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("su exited with {s}").into()),
+        Err(e) => Err(format!("failed to run su: {e}").into()),
+    }
+}
+
 /// Connect to adbd, perform CNXN handshake with A_STLS TLS upgrade support.
 ///
 /// If the device responds with A_STLS, the transport is upgraded to TLS
@@ -319,6 +358,14 @@ pub fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     if resp_hdr.command == A_CNXN {
         // Normal path — no TLS required
         let banner = String::from_utf8_lossy(&payload).to_string();
+
+        // Persist the public key so future SIGNATURE verifications succeed
+        // without requiring another authorization dialog.
+        #[cfg(target_os = "android")]
+        if sent_public_key {
+            persist_adb_pubkey(auth)?;
+        }
+
         return Ok((DeviceInfo { banner }, transport));
     }
 
