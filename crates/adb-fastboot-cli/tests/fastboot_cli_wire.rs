@@ -110,3 +110,16 @@ fn fastboot_boot_payload_and_boot_command_wire_sequence() {
 
     server.join().unwrap();
 }
+
+#[test]
+fn fetch_command_uses_aosp_optional_range_fields() {
+    assert_eq!(fastboot_protocol::fetch("boot", None, None), "fetch:boot");
+    assert_eq!(
+        fastboot_protocol::fetch("boot", Some(0x1000), None),
+        "fetch:boot:0x00001000"
+    );
+    assert_eq!(
+        fastboot_protocol::fetch("boot", Some(0x1000), Some(0x2000)),
+        "fetch:boot:0x00001000:0x00002000"
+    );
+}

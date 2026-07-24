@@ -123,7 +123,7 @@ fn test_fastboot_new_commands_wire_sequence() {
     assert_eq!(resp4, FastbootResponse::Okay("".to_string()));
 
     // 5. fetch
-    let cmd5 = fastboot_protocol::fetch("boot", 0, 4096);
+    let cmd5 = fastboot_protocol::fetch("boot", Some(0), Some(4096));
     transport.send_cmd(&cmd5).unwrap();
     let resp5 = transport.recv_response().unwrap();
     assert_eq!(resp5, FastbootResponse::Okay("".to_string()));

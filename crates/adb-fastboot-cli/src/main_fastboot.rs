@@ -147,10 +147,20 @@ enum Commands {
         ramdisk: Option<String>,
         second: Option<String>,
     },
-    /// Fetch a partition image to a local file
+    /// Fetch a partition image to a local file (AOSP fetch PARTITION OUT_FILE).
+    /// With no range, queries partition-size and max-fetch-size and fetches in chunks.
     Fetch {
         partition: String,
         out_file: String,
+        /// Optional A/B slot (a/b); appended to PARTITION on the wire.
+        #[arg(long)]
+        slot: Option<String>,
+        /// Starting byte offset (decimal or 0x-prefixed hexadecimal).
+        #[arg(long, value_parser = parse_u64)]
+        offset: Option<u64>,
+        /// Number of bytes to fetch (requires --offset).
+        #[arg(long, value_parser = parse_u64)]
+        size: Option<u64>,
     },
     /// Continue booting after flash operations (re-send to device)
     Continue,
@@ -522,40 +532,122 @@ fn handle_boot_response(
     Ok(())
 }
 
+fn fetch_partition_name(partition: &str, slot: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(slot) = slot else { return Ok(partition.to_string()); };
+    let slot = slot.strip_prefix('_').unwrap_or(slot);
+    if slot.is_empty() || !slot.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!("invalid fetch slot: {slot}").into());
+    }
+    if partition.ends_with(&format!("_{slot}")) {
+        Ok(partition.to_string())
+    } else {
+        Ok(format!("{partition}_{slot}"))
+    }
+}
+
+fn getvar_value(
+    transport: &mut FastbootConnection,
+    variable: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    transport.send_cmd(&fastboot_protocol::getvar(variable))?;
+    match recv_and_print_info(transport)? {
+        fastboot_protocol::FastbootResponse::Okay(value) => Ok(value),
+        fastboot_protocol::FastbootResponse::Fail(reason) => {
+            Err(format!("getvar:{variable} failed: {reason}").into())
+        }
+        response => Err(format!("unexpected getvar:{variable} response: {response:?}").into()),
+    }
+}
+
 fn fetch_to_file(
     transport: &mut FastbootConnection,
     partition: &str,
     out_file: &str,
+    offset: Option<u64>,
+    size: Option<u64>,
+    slot: Option<&str>,
 ) -> Result<fastboot_protocol::FastbootResponse, Box<dyn std::error::Error>> {
-    let mut output = File::create(out_file)?;
-    // AOSP FastBootDriver::Fetch uses `fetch:<partition>` when no range is requested.
-    transport.send_cmd(&format!("fetch:{}", partition))?;
-    let response = recv_data_response(transport, "fetch")?;
-    let size = match response {
-        fastboot_protocol::FastbootResponse::Data(size) if size > 0 => size as usize,
-        fastboot_protocol::FastbootResponse::Data(_) => {
-            return Err("fetch failed: device returned zero bytes".into());
-        }
-        fastboot_protocol::FastbootResponse::Fail(reason) => {
-            return Err(format!("fetch failed: {}", reason).into());
-        }
-        other => {
-            return Err(format!("unexpected fetch response: {:?}", other).into());
-        }
-    };
-
-    let mut remaining = size;
-    let mut buffer = [0u8; 1024 * 1024];
-    while remaining > 0 {
-        let chunk_size = remaining.min(buffer.len());
-        transport.read_exact(&mut buffer[..chunk_size])?;
-        output.write_all(&buffer[..chunk_size])?;
-        remaining -= chunk_size;
+    if size.is_some() && offset.is_none() {
+        return Err("fetch size requires an offset".into());
     }
-    output.sync_all()?;
-    let final_response = transport.recv_response()?;
-    if let fastboot_protocol::FastbootResponse::Fail(reason) = &final_response {
-        return Err(format!("fetch failed after receiving data: {}", reason).into());
+    let partition = fetch_partition_name(partition, slot)?;
+    let max_fetch_size = parse_max_download_size(&getvar_value(transport, "max-fetch-size")?)
+        .ok_or("device returned an invalid max-fetch-size")? as u64;
+    if max_fetch_size == 0 {
+        return Err("device returned zero max-fetch-size".into());
+    }
+
+    let (start, total) = match (offset, size) {
+        (Some(offset), Some(size)) => (offset, size),
+        (Some(offset), None) => (offset, max_fetch_size),
+        (None, None) => {
+            let partition_size = parse_max_download_size(&getvar_value(
+                transport,
+                &format!("partition-size:{partition}"),
+            )?)
+            .ok_or("device returned an invalid partition-size")? as u64;
+            (0, partition_size)
+        }
+        _ => unreachable!(),
+    };
+    if total == 0 {
+        return Err("fetch range has zero size".into());
+    }
+
+    let mut output = File::create(out_file)?;
+    if let (Some(offset), None) = (offset, size) {
+        let command = fastboot_protocol::fetch(&partition, Some(offset), None);
+        transport.send_cmd(&command)?;
+        let data_size = match recv_data_response(transport, "fetch")? {
+            fastboot_protocol::FastbootResponse::Data(size) if size > 0 => size as usize,
+            fastboot_protocol::FastbootResponse::Data(_) => return Err("fetch returned zero bytes".into()),
+            _ => unreachable!("recv_data_response only returns DATA"),
+        };
+        let mut remaining = data_size;
+        let mut buffer = [0u8; 1024 * 1024];
+        while remaining > 0 {
+            let read_size = remaining.min(buffer.len());
+            transport.read_exact(&mut buffer[..read_size])?;
+            output.write_all(&buffer[..read_size])?;
+            remaining -= read_size;
+        }
+        output.sync_data()?;
+        return Ok(transport.recv_response()?);
+    }
+    let mut current_offset = start;
+    let mut remaining = total;
+    let mut final_response = fastboot_protocol::FastbootResponse::Okay(String::new());
+    while remaining > 0 {
+        let chunk_size = remaining.min(max_fetch_size);
+        let command = fastboot_protocol::fetch(&partition, Some(current_offset), Some(chunk_size));
+        transport.send_cmd(&command)?;
+        let response = recv_data_response(transport, "fetch")?;
+        let data_size = match response {
+            fastboot_protocol::FastbootResponse::Data(size) if size > 0 => size as u64,
+            fastboot_protocol::FastbootResponse::Data(_) => return Err("fetch returned zero bytes".into()),
+            _ => unreachable!("recv_data_response only returns DATA"),
+        };
+        if data_size > chunk_size {
+            return Err(format!("fetch returned {data_size} bytes, requested {chunk_size}").into());
+        }
+        let mut left = data_size as usize;
+        let mut buffer = [0u8; 1024 * 1024];
+        while left > 0 {
+            let read_size = left.min(buffer.len());
+            transport.read_exact(&mut buffer[..read_size])?;
+            output.write_all(&buffer[..read_size])?;
+            left -= read_size;
+        }
+        output.sync_data()?;
+        final_response = transport.recv_response()?;
+        if let fastboot_protocol::FastbootResponse::Fail(reason) = &final_response {
+            return Err(format!("fetch failed after receiving data: {reason}").into());
+        }
+        if data_size != chunk_size {
+            return Err(format!("fetch returned {data_size} bytes, requested {chunk_size}").into());
+        }
+        current_offset += chunk_size;
+        remaining -= chunk_size;
     }
     Ok(final_response)
 }
@@ -1741,7 +1833,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Fetch { partition, out_file } => {
+        Commands::Fetch { partition, out_file, offset, size, slot } => {
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1749,7 +1841,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             };
-            let resp = fetch_to_file(&mut transport, &partition, &out_file)?;
+            let resp = fetch_to_file(
+                &mut transport,
+                &partition,
+                &out_file,
+                offset,
+                size,
+                slot.as_deref(),
+            )?;
             println!(
                 "[fastboot-rs] Fetched partition '{}' to '{}': {:?}",
                 partition, out_file, resp

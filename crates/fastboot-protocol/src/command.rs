@@ -90,9 +90,17 @@ pub fn boot() -> String {
 
 /// Formats a `fetch` command for Fastboot.
 ///
-
-pub fn fetch(partition: &str, offset: u64, size: u64) -> String {
-    format!("fetch:{}:0x{:08x}:0x{:08x}", partition, offset, size)
+/// AOSP emits `fetch:PARTITION`, optionally followed by an offset and size.
+/// The size cannot be present without an offset.
+pub fn fetch(partition: &str, offset: Option<u64>, size: Option<u64>) -> String {
+    let mut command = format!("fetch:{}", partition);
+    if let Some(offset) = offset {
+        command.push_str(&format!(":0x{:08x}", offset));
+        if let Some(size) = size {
+            command.push_str(&format!(":0x{:08x}", size));
+        }
+    }
+    command
 }
 
 #[cfg(test)]
@@ -175,12 +183,14 @@ mod tests {
 
     #[test]
     fn test_fetch() {
+        assert_eq!(fetch("boot", None, None), "fetch:boot");
+        assert_eq!(fetch("boot", Some(0), None), "fetch:boot:0x00000000");
         assert_eq!(
-            fetch("boot", 0, 4096),
+            fetch("boot", Some(0), Some(4096)),
             "fetch:boot:0x00000000:0x00001000"
         );
         assert_eq!(
-            fetch("system", 0x10000, 0x80000),
+            fetch("system", Some(0x10000), Some(0x80000)),
             "fetch:system:0x00010000:0x00080000"
         );
     }
