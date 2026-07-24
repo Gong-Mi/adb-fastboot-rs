@@ -328,7 +328,7 @@ fn write_auth_public_key(auth: &AdbAuth, path: &Path) -> Result<(), Box<dyn std:
 /// HyperOS does not always persist USB keys via AdbDebuggingManager, so
 /// we write the key ourselves with root.
 #[cfg(target_os = "android")]
-fn persist_adb_pubkey(auth: &AdbAuth) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn persist_adb_pubkey(auth: &AdbAuth) -> Result<(), Box<dyn std::error::Error>> {
     let payload = auth.build_rsakey_payload()?;
     // Strip trailing null byte for the plain-text key file
     let key_line = if payload.ends_with(&[0]) {
@@ -469,25 +469,61 @@ pub fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
 fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     transport: T,
     cnxn_payload: &[u8],
-    _auth: &AdbAuth,
+    auth: &AdbAuth,
 ) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
     let mut transport: Box<dyn Transport> = Box::new(transport);
     let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
 
     transport.send_message(&cnxn_hdr, cnxn_payload)?;
 
-    let (resp_hdr, payload) = transport.recv_message()?;
+    let (mut resp_hdr, mut payload) = transport.recv_message()?;
+    let mut sent_signature = false;
+    let mut sent_public_key = false;
+    while resp_hdr.command == A_AUTH {
+        if resp_hdr.arg0 != A_AUTH_TOKEN {
+            return Err(format!("Unsupported AUTH request type: {}", resp_hdr.arg0).into());
+        }
+        if payload.len() != 20 {
+            return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
+        }
+
+        let (auth_hdr, auth_payload) = if !sent_signature {
+            sent_signature = true;
+            auth.make_signature_message(&payload)?
+        } else if !sent_public_key {
+            sent_public_key = true;
+            auth.make_rsakey_message()?
+        } else {
+            return Err("adbd rejected the ADB RSA key after signature and public-key exchange".into());
+        };
+        transport.send_message(&auth_hdr, &auth_payload)?;
+        (resp_hdr, payload) = transport.recv_message()?;
+    }
+
+    if resp_hdr.command == A_CNXN {
+        let banner = String::from_utf8_lossy(&payload).to_string();
+
+        // Persist the public key so future SIGNATURE verifications succeed
+        // without requiring another authorization dialog.
+        #[cfg(target_os = "android")]
+        if sent_public_key {
+            persist_adb_pubkey(auth)?;
+        }
+
+        return Ok((DeviceInfo { banner }, transport));
+    }
+
     if resp_hdr.command == A_STLS {
         return Err("Device requires TLS (A_STLS) but the `tls` feature is not enabled. \
                     Rebuild with --features tls"
             .into());
     }
-    if resp_hdr.command != A_CNXN {
-        return Err(format!("Unexpected handshake response: cmd={:#x}", resp_hdr.command).into());
-    }
 
-    let banner = String::from_utf8_lossy(&payload).to_string();
-    Ok((DeviceInfo { banner }, transport))
+    Err(format!(
+        "Unexpected handshake response: cmd={:#x}",
+        resp_hdr.command
+    )
+    .into())
 }
 
 /// Open an adbd service (shell:, sync:, reboot:, etc.) via A_OPEN.
@@ -1423,8 +1459,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("TLS support is required for wireless pairing; rebuild with `--features tls`".into());
             }
 
-            let (serial, dev_name) = peer_info.parse_device_info();
-            println!("Successfully paired to {target_addr} [device={}, serial={}]", dev_name, serial);
+            #[cfg(feature = "tls")]
+            {
+                let (serial, dev_name) = peer_info.parse_device_info();
+                println!("Successfully paired to {target_addr} [device={}, serial={}]", dev_name, serial);
+            }
         }
     }
 
