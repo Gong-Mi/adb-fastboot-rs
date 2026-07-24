@@ -106,10 +106,11 @@ impl Generator {
                 curr
             });
             out.push_str(&format!(
-                "    pub const TRANSACTION_{}: u32 = {};\n",
+                "    pub const TRANSACTION_{}: u32 = FIRST_CALL_TRANSACTION + {};\n",
                 method.name, tx_id
             ));
         }
+        out.push_str("    pub const FIRST_CALL_TRANSACTION: u32 = 1;\n");
         out.push_str("}\n\n");
 
         if self.generate_binder_stubs {

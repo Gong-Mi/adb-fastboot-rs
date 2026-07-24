@@ -17,9 +17,11 @@ pub const UDP_FLAG_NONE: u8 = 0x00;
 pub const UDP_FLAG_CONTINUATION: u8 = 0x01;
 
 /// Default Fastboot UDP packet size limit (including 4-byte header).
-pub const DEFAULT_UDP_PACKET_SIZE: usize = 512;
-pub const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(3);
-pub const DEFAULT_UDP_MAX_RETRIES: usize = 5;
+pub const MIN_UDP_PACKET_SIZE: usize = 512;
+pub const HOST_MAX_UDP_PACKET_SIZE: usize = 8192;
+pub const DEFAULT_UDP_PACKET_SIZE: usize = MIN_UDP_PACKET_SIZE;
+pub const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_millis(500);
+pub const DEFAULT_UDP_MAX_RETRIES: usize = 120;
 
 /// Header structure for Fastboot UDP packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +86,7 @@ impl FastbootUdpTransport {
         Self {
             socket,
             target_addr,
-            seq: 1,
+            seq: 0,
             max_packet_size: DEFAULT_UDP_PACKET_SIZE,
             timeout: DEFAULT_UDP_TIMEOUT,
             max_retries: DEFAULT_UDP_MAX_RETRIES,
@@ -143,7 +145,7 @@ impl FastbootUdpTransport {
         let mut transport = Self {
             socket,
             target_addr,
-            seq: 1,
+            seq: 0,
             max_packet_size: DEFAULT_UDP_PACKET_SIZE,
             timeout,
             max_retries: DEFAULT_UDP_MAX_RETRIES,
@@ -151,8 +153,7 @@ impl FastbootUdpTransport {
             read_pos: 0,
         };
 
-        // Perform optional handshake; if target doesn't respond to Query/Init, fall back smoothly
-        transport.perform_handshake();
+        transport.perform_handshake()?;
 
         Ok(transport)
     }
@@ -184,104 +185,81 @@ impl FastbootUdpTransport {
         self.max_packet_size
     }
 
-    /// Send packet with header and handle ACK / response retransmissions.
+    /// Send a logical packet, handling AOSP continuation packets and retransmissions.
     pub fn send_packet_with_ack(
         &mut self,
         id: u8,
         flags: u8,
         payload: &[u8],
     ) -> Result<Vec<u8>, FastbootTransportError> {
-        let expected_seq = self.seq;
-        let header = UdpHeader::new(id, flags, expected_seq);
-        let header_bytes = header.encode_4byte();
-
-        let mut packet = Vec::with_capacity(header_bytes.len() + payload.len());
-        packet.extend_from_slice(&header_bytes);
-        packet.extend_from_slice(payload);
-
-        let mut recv_buf = [0u8; 4096];
-        let mut last_err = None;
-
-        for _attempt in 0..=self.max_retries {
-            if let Err(e) = self.socket.send(&packet) {
-                last_err = Some(FastbootTransportError::Io(e));
-                continue;
-            }
-
-            match self.socket.recv(&mut recv_buf) {
-                Ok(n) => {
-                    let (resp_header, header_len) = match UdpHeader::decode(&recv_buf[..n]) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            last_err = Some(e);
-                            continue;
-                        }
-                    };
-
-                    if resp_header.id == UDP_ID_ERROR {
-                        let err_msg = String::from_utf8_lossy(&recv_buf[header_len..n]).to_string();
-                        return Err(FastbootTransportError::Protocol(format!(
-                            "UDP Error response from target: {err_msg}"
-                        )));
+        let mut tx_id = id;
+        let mut tx = payload;
+        let mut tx_flags = flags;
+        let mut result = Vec::new();
+        let mut error_data = Vec::new();
+        loop {
+            let expected_seq = self.seq;
+            let header = UdpHeader::new(tx_id, tx_flags, expected_seq).encode_4byte();
+            let mut packet = Vec::with_capacity(UDP_HEADER_LEN + tx.len());
+            packet.extend_from_slice(&header);
+            packet.extend_from_slice(tx);
+            let mut matched = None;
+            let mut last_err = None;
+            for _ in 0..=self.max_retries {
+                self.socket.send(&packet).map_err(FastbootTransportError::Io)?;
+                let mut recv_buf = vec![0u8; HOST_MAX_UDP_PACKET_SIZE];
+                match self.socket.recv(&mut recv_buf) {
+                    Ok(n) => {
+                        let (resp, hlen) = UdpHeader::decode(&recv_buf[..n])?;
+                        if resp.seq != expected_seq || (resp.id != tx_id && resp.id != UDP_ID_ERROR) { continue; }
+                        matched = Some((resp, recv_buf[hlen..n].to_vec()));
+                        break;
                     }
-
-                    if resp_header.seq == expected_seq {
-                        self.seq = self.seq.wrapping_add(1);
-                        return Ok(recv_buf[header_len..n].to_vec());
-                    }
-                    // Out-of-order sequence (e.g. stale retransmission), ignore and retry
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut
-                    {
-                        last_err = Some(FastbootTransportError::Io(e));
-                    } else {
-                        return Err(FastbootTransportError::Io(e));
-                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => last_err = Some(e),
+                    Err(e) => return Err(FastbootTransportError::Io(e)),
                 }
             }
+            let (resp, data) = matched.ok_or_else(|| FastbootTransportError::Io(last_err.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP retransmission limit reached"))))?;
+            self.seq = self.seq.wrapping_add(1);
+            if resp.id == UDP_ID_ERROR {
+                error_data.extend_from_slice(&data);
+            } else {
+                result.extend_from_slice(&data);
+            }
+            if resp.flags & UDP_FLAG_CONTINUATION == 0 {
+                if !error_data.is_empty() {
+                    return Err(FastbootTransportError::Protocol(format!("UDP Error response from target: {}", String::from_utf8_lossy(&error_data))));
+                }
+                return Ok(result);
+            }
+            tx_id = resp.id;
+            tx = &[];
+            tx_flags = UDP_FLAG_NONE;
         }
-
-        Err(last_err.unwrap_or_else(|| {
-            FastbootTransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "UDP retransmission limit reached ({}) for seq {}",
-                    self.max_retries, expected_seq
-                ),
-            ))
-        }))
     }
 
     /// Perform AOSP Query + Init handshake if supported by target.
-    fn perform_handshake(&mut self) {
-        // Query packet
-        if let Ok(resp) = self.send_packet_with_ack(UDP_ID_QUERY, UDP_FLAG_NONE, &[]) {
-            if resp.len() >= 4 {
-                let remote_max = u16::from_be_bytes([resp[2], resp[3]]) as usize;
-                if remote_max >= UDP_HEADER_LEN {
-                    self.max_packet_size = self.max_packet_size.min(remote_max);
-                }
-            }
-        } else {
-            // Reset sequence number if query wasn't acknowledged (raw mode fallback)
-            self.seq = 1;
-            return;
+    fn perform_handshake(&mut self) -> Result<(), FastbootTransportError> {
+        let query = self.send_packet_with_ack(UDP_ID_QUERY, UDP_FLAG_NONE, &[])?;
+        if query.len() < 2 {
+            return Err(FastbootTransportError::Protocol("invalid query response from target".into()));
         }
-
-        // Init packet (version 0.1, max packet size)
-        let mut init_payload = vec![0x00, 0x01];
-        init_payload.extend_from_slice(&(self.max_packet_size as u16).to_be_bytes());
-
-        if let Ok(resp) = self.send_packet_with_ack(UDP_ID_INIT, UDP_FLAG_NONE, &init_payload) {
-            if resp.len() >= 4 {
-                let remote_max = u16::from_be_bytes([resp[2], resp[3]]) as usize;
-                if remote_max >= UDP_HEADER_LEN {
-                    self.max_packet_size = self.max_packet_size.min(remote_max);
-                }
-            }
+        self.seq = u16::from_be_bytes([query[0], query[1]]);
+        let init = [0u8, 1, (HOST_MAX_UDP_PACKET_SIZE >> 8) as u8, HOST_MAX_UDP_PACKET_SIZE as u8];
+        let response = self.send_packet_with_ack(UDP_ID_INIT, UDP_FLAG_NONE, &init)?;
+        if response.len() < 4 {
+            return Err(FastbootTransportError::Protocol("invalid initialization response from target".into()));
         }
+        let version = u16::from_be_bytes([response[0], response[1]]);
+        let remote = u16::from_be_bytes([response[2], response[3]]) as usize;
+        if version < 1 {
+            return Err(FastbootTransportError::Protocol(format!("target reported invalid protocol version {version}")));
+        }
+        if remote < MIN_UDP_PACKET_SIZE {
+            return Err(FastbootTransportError::Protocol(format!("target reported invalid packet size {remote}")));
+        }
+        self.max_packet_size = HOST_MAX_UDP_PACKET_SIZE.min(remote);
+        Ok(())
     }
 }
 
@@ -302,19 +280,18 @@ impl Read for FastbootUdpTransport {
             .send_packet_with_ack(UDP_ID_FASTBOOT, UDP_FLAG_NONE, &[])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
+        if payload.len() > buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "UDP target sent more fastboot data than requested buffer",
+            ));
+        }
         if payload.is_empty() {
             return Ok(0);
         }
 
-        let n = std::cmp::min(buf.len(), payload.len());
-        buf[..n].copy_from_slice(&payload[..n]);
-
-        if n < payload.len() {
-            self.read_buf = payload[n..].to_vec();
-            self.read_pos = 0;
-        }
-
-        Ok(n)
+        buf[..payload.len()].copy_from_slice(&payload);
+        Ok(payload.len())
     }
 }
 
@@ -434,6 +411,56 @@ mod tests {
         let n = transport.read(&mut resp_buf).unwrap();
         assert_eq!(&resp_buf[..n], b"OKAY0.4");
 
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_aosp_handshake_uses_query_sequence_and_payload_offsets() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let (_n, peer) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..4], &[UDP_ID_QUERY, UDP_FLAG_NONE, 0, 0]);
+            let mut response = UdpHeader::new(UDP_ID_QUERY, UDP_FLAG_NONE, 0).encode_4byte().to_vec();
+            response.extend_from_slice(&0x1234u16.to_be_bytes());
+            server.send_to(&response, peer).unwrap();
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..4], &[UDP_ID_INIT, UDP_FLAG_NONE, 0x12, 0x34]);
+            assert_eq!(&buf[4..n], &[0, 1, 0x20, 0x00]);
+            let mut response = UdpHeader::new(UDP_ID_INIT, UDP_FLAG_NONE, 0x1234).encode_4byte().to_vec();
+            response.extend_from_slice(&[0, 1, 0x02, 0x00]);
+            server.send_to(&response, peer).unwrap();
+        });
+        let transport = FastbootUdpTransport::connect_timeout(addr, Duration::from_millis(100)).unwrap();
+        assert_eq!(transport.sequence_number(), 0x1235);
+        assert_eq!(transport.max_packet_size(), 512);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_continuation_response_is_prompted_with_next_sequence() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            let (h, _) = UdpHeader::decode(&buf[..n]).unwrap();
+            assert_eq!(h.seq, 0);
+            let mut response = UdpHeader::new(UDP_ID_FASTBOOT, UDP_FLAG_CONTINUATION, 0).encode_4byte().to_vec();
+            response.extend_from_slice(b"one");
+            server.send_to(&response, peer).unwrap();
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &[UDP_ID_FASTBOOT, UDP_FLAG_NONE, 0, 1]);
+            let mut response = UdpHeader::new(UDP_ID_FASTBOOT, UDP_FLAG_NONE, 1).encode_4byte().to_vec();
+            response.extend_from_slice(b"two");
+            server.send_to(&response, peer).unwrap();
+        });
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.connect(addr).unwrap();
+        let mut transport = FastbootUdpTransport::from_socket(socket, addr);
+        transport.set_timeout(Duration::from_millis(100));
+        assert_eq!(transport.send_packet_with_ack(UDP_ID_FASTBOOT, UDP_FLAG_NONE, b"x").unwrap(), b"onetwo");
         handle.join().unwrap();
     }
 

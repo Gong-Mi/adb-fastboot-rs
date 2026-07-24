@@ -27,6 +27,7 @@ pub enum ParseError {
 pub enum Token {
     Ident(String),
     StringLit(String),
+    CharLit(String),
     IntLit(i64),
     FloatLit(f64),
     At,
@@ -53,6 +54,7 @@ impl Token {
         match self {
             Token::Ident(s) => format!("identifier '{s}'"),
             Token::StringLit(s) => format!("string \"{s}\""),
+            Token::CharLit(s) => format!("character {s}"),
             Token::IntLit(n) => format!("integer '{n}'"),
             Token::FloatLit(f) => format!("float '{f}'"),
             Token::At => "'@'".into(),
@@ -217,6 +219,12 @@ impl<'a> Lexer<'a> {
                 continue;
             }
 
+            if ch == '\'' {
+                let value = self.read_char(idx)?;
+                tokens.push((Token::CharLit(value), idx));
+                continue;
+            }
+
             if ch.is_ascii_digit() {
                 let tok = self.read_number(idx)?;
                 tokens.push((tok, idx));
@@ -264,6 +272,24 @@ impl<'a> Lexer<'a> {
         Err(ParseError::UnterminatedString(start_idx))
     }
 
+    fn read_char(&mut self, start_idx: usize) -> Result<String, ParseError> {
+        self.chars.next();
+        let value = match self.chars.next() {
+            Some((_, '\\')) => match self.chars.next() {
+                Some((_, escaped)) => match escaped {
+                    'n' => '\n', 'r' => '\r', 't' => '\t', '\\' => '\\', '\'' => '\'', other => other,
+                },
+                None => return Err(ParseError::UnterminatedString(start_idx)),
+            },
+            Some((_, value)) => value,
+            None => return Err(ParseError::UnterminatedString(start_idx)),
+        };
+        match self.chars.next() {
+            Some((_, '\'')) => Ok(format!("'{value}'")),
+            _ => Err(ParseError::UnterminatedString(start_idx)),
+        }
+    }
+
     fn read_ident(&mut self) -> String {
         let mut s = String::new();
         while let Some(&(_, ch)) = self.chars.peek() {
@@ -280,27 +306,28 @@ impl<'a> Lexer<'a> {
     fn read_number(&mut self, start_idx: usize) -> Result<Token, ParseError> {
         let mut s = String::new();
         while let Some(&(_, ch)) = self.chars.peek() {
-            if ch.is_ascii_hexdigit() || ch == 'x' || ch == 'X' || ch == 'b' || ch == 'B' || ch == '.' {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
                 s.push(ch);
                 self.chars.next();
             } else {
                 break;
             }
         }
-        if s.starts_with("0x") || s.starts_with("0X") {
-            let val = i64::from_str_radix(&s[2..], 16)
+        let normalized = ["u8", "u32", "u64", "U8", "U32", "U64", "u", "U", "l", "L", "f"]
+            .iter()
+            .find_map(|suffix| s.strip_suffix(suffix))
+            .unwrap_or(&s)
+            .replace('_', "");
+        if normalized.starts_with("0x") || normalized.starts_with("0X") {
+            let val = i64::from_str_radix(&normalized[2..], 16)
                 .map_err(|_| ParseError::InvalidNumber(s.clone(), start_idx))?;
             Ok(Token::IntLit(val))
-        } else if s.starts_with("0b") || s.starts_with("0B") {
-            let val = i64::from_str_radix(&s[2..], 2)
-                .map_err(|_| ParseError::InvalidNumber(s.clone(), start_idx))?;
-            Ok(Token::IntLit(val))
-        } else if s.contains('.') {
-            let val = s.parse::<f64>()
+        } else if normalized.contains('.') || normalized.contains('e') || normalized.contains('E') {
+            let val = normalized.parse::<f64>()
                 .map_err(|_| ParseError::InvalidNumber(s.clone(), start_idx))?;
             Ok(Token::FloatLit(val))
         } else {
-            let val = s.parse::<i64>()
+            let val = normalized.parse::<i64>()
                 .map_err(|_| ParseError::InvalidNumber(s.clone(), start_idx))?;
             Ok(Token::IntLit(val))
         }
@@ -458,6 +485,7 @@ impl Parser {
         let (tok, idx) = self.advance();
         match tok {
             Token::StringLit(s) => Ok(format!("\"{s}\"")),
+            Token::CharLit(s) => Ok(s),
             Token::IntLit(n) => Ok(n.to_string()),
             Token::FloatLit(f) => Ok(f.to_string()),
             Token::Ident(s) => Ok(s),
@@ -935,5 +963,34 @@ mod tests {
         assert!(code.contains("pub enum Payload"));
         assert!(code.contains("Number(i32)"));
         assert!(code.contains("Text(String)"));
+    }
+
+    #[test]
+    fn test_android_numeric_suffixes_and_char_literals() {
+        let aidl = r#"
+            interface Values {
+                const int HEX = 0x10u32;
+                const int DECIMAL = 1_000L;
+                const char LETTER = 'a';
+            }
+        "#;
+        let parsed = Parser::parse_str(aidl).expect("Android literal forms should parse");
+        if let AidlDecl::Interface(iface) = &parsed.decls[0] {
+            assert_eq!(iface.constants[0].value, "16");
+            assert_eq!(iface.constants[1].value, "1000");
+            assert_eq!(iface.constants[2].value, "'a'");
+        } else {
+            panic!("Expected interface decl");
+        }
+    }
+
+    #[test]
+    fn test_transaction_ids_use_binder_base() {
+        let parsed = Parser::parse_str("interface IFoo { void first(); void second() = 7; }")
+            .expect("interface should parse");
+        let code = Generator::new().generate_file(&parsed);
+        assert!(code.contains("TRANSACTION_first: u32 = FIRST_CALL_TRANSACTION + 0;"));
+        assert!(code.contains("TRANSACTION_second: u32 = FIRST_CALL_TRANSACTION + 7;"));
+        assert!(code.contains("FIRST_CALL_TRANSACTION: u32 = 1;"));
     }
 }
