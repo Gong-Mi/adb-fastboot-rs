@@ -616,6 +616,32 @@ fn dispatch_host_service(
             ok_str(client, &list)
         }
 
+        // -- host:track-devices ----------------------------------------------
+        // Keep this connection open and publish a new length-prefixed device
+        // list whenever the registry changes. This is the service used by IDEs
+        // and scrcpy to receive hotplug updates.
+        "host:track-devices" => {
+            let mut last: Option<String> = None;
+            ok_empty(client)?;
+            while running.load(Ordering::Relaxed) {
+                let current = {
+                    let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                    reg.list_devices(false)
+                };
+                if last.as_deref() != Some(current.as_str()) {
+                    let len_hdr = format!("{:04x}", current.len());
+                    client
+                        .write_all(len_hdr.as_bytes())
+                        .and_then(|_| client.write_all(current.as_bytes()))
+                        .and_then(|_| client.flush())
+                        .map_err(|e| format!("track-devices write failed: {e}"))?;
+                    last = Some(current);
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+            Ok(())
+        }
+
         // -- host:get-state / host:get-serialno / host:get-devpath ----------
         c if c == "host:get-state" || c == "host:get-serialno" || c == "host:get-devpath" => {
             let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
@@ -1358,6 +1384,45 @@ mod tests {
             Some(("localabstract:foo", "tcp:9000"))
         );
         assert_eq!(parse_spec_pair("invalid"), None);
+    }
+
+    #[test]
+    fn test_track_devices_emits_initial_snapshot() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let server_registry = Arc::clone(&registry);
+        let server_running = Arc::clone(&running);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            dispatch_host_service(
+                &mut stream,
+                "host:track-devices",
+                &server_registry,
+                &server_running,
+            )
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let mut okay = [0u8; 4];
+        client.read_exact(&mut okay).unwrap();
+        assert_eq!(&okay, b"OKAY");
+
+        let mut len = [0u8; 4];
+        client.read_exact(&mut len).unwrap();
+        let snapshot_len = usize::from_str_radix(std::str::from_utf8(&len).unwrap(), 16).unwrap();
+        let mut snapshot = vec![0u8; snapshot_len];
+        client.read_exact(&mut snapshot).unwrap();
+        assert!(std::str::from_utf8(&snapshot).is_ok());
+
+        running.store(false, Ordering::Relaxed);
+        drop(client);
+        server.join().unwrap();
     }
 
     #[test]
