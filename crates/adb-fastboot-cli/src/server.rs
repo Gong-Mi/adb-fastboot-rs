@@ -455,7 +455,25 @@ fn usb_device_watcher(_registry: Arc<Mutex<TransportRegistry>>, _running: Arc<At
 // ---------------------------------------------------------------------------
 
 pub fn run_server() -> ! {
-    run_server_on_port(ADB_SERVER_PORT);
+    run_server_fork(None);
+    std::process::exit(0);
+}
+
+/// Start the ADB server in fork-server mode.
+///
+/// `ack_reply_fd` is the write-end of a pipe from the parent process.
+/// After USB scan completes, the server writes "OK\n" to this fd to
+/// signal the parent that it's ready, then closes it.
+/// Only after that are client connections accepted.
+pub fn run_server_fork(ack_reply_fd: Option<i32>) -> ! {
+    let listener = match TcpListener::bind(format!("127.0.0.1:{ADB_SERVER_PORT}")) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[adb-server] Cannot bind to 127.0.0.1:{ADB_SERVER_PORT}: {e}");
+            std::process::exit(1);
+        }
+    };
+    run_server_with_listener(listener, ack_reply_fd);
     std::process::exit(0);
 }
 
@@ -467,10 +485,10 @@ pub fn run_server_on_port(port: u16) {
             std::process::exit(1);
         }
     };
-    run_server_with_listener(listener);
+    run_server_with_listener(listener, None);
 }
 
-pub fn run_server_with_listener(listener: TcpListener) {
+pub fn run_server_with_listener(listener: TcpListener, ack_reply_fd: Option<i32>) {
     let running = Arc::new(AtomicBool::new(true));
     let registry = Arc::new(Mutex::new(TransportRegistry::new()));
 
@@ -486,6 +504,18 @@ pub fn run_server_with_listener(listener: TcpListener) {
     thread::spawn(move || {
         usb_device_watcher(reg_for_poll, running_poll);
     });
+
+    // Give the USB watcher a brief moment for its initial scan, then
+    // signal the parent (fork-server mode) that we're ready.
+    // AOSP's adb_server_main does the same via adb_wait_for_device_initialization.
+    thread::sleep(Duration::from_millis(500));
+    if let Some(reply_fd) = ack_reply_fd {
+        use std::io::Write;
+        use std::os::unix::io::FromRawFd;
+        let mut f = unsafe { std::fs::File::from_raw_fd(reply_fd) };
+        let _ = f.write_all(b"OK\n");
+        // f is dropped here, closing the fd
+    }
 
     // Accept loop
     listener.set_nonblocking(true).ok();

@@ -105,6 +105,12 @@ pub enum Commands {
     /// Kill the running ADB server daemon
     #[command(name = "kill-server")]
     KillServer,
+    /// Internal: fork-server mode (started by the adb client)
+    #[command(name = "fork-server", hide = true)]
+    ForkServer {
+        #[arg(long = "reply-fd")]
+        reply_fd: i32,
+    },
     /// Pair with wireless device using 6-digit code
     Pair {
         /// Target device address (host:port)
@@ -767,7 +773,6 @@ pub fn ensure_server_running() -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn ensure_server_running_at(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     use std::net::TcpStream;
-    use std::process::{Command, Stdio};
 
     let addr = format!("127.0.0.1:{port}");
     if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)).is_ok() {
@@ -775,30 +780,137 @@ pub fn ensure_server_running_at(port: u16) -> Result<(), Box<dyn std::error::Err
     }
 
     eprintln!("* daemon not running; starting it now at tcp:{port} *");
-    let exe = std::env::current_exe().unwrap_or_else(|_| "adb-rs".into());
-    let mut child = Command::new(&exe)
-        .arg("serve")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn ADB server daemon: {e}"))?;
 
-    let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(3);
-    while start.elapsed() < timeout {
-        if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(100)).is_ok() {
-            eprintln!("* daemon started successfully *");
-            return Ok(());
+    // AOSP fork-server protocol:
+    //   pipe() → fork() → child exec's "adb -L tcp:5037 fork-server server --reply-fd N"
+    //   → parent reads "OK\n" from pipe → server is ready.
+    //
+    // The pipe fd is passed as --reply-fd. The server clears CLOEXEC on it
+    // so the child process inherits the write end across exec().
+    let exe = std::env::current_exe().map_err(|e| format!("Cannot get executable path: {e}"))?;
+    let exe_cstr = std::ffi::CString::new(exe.to_str().ok_or("Executable path is not valid UTF-8")?)
+        .map_err(|_| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Executable path contains null byte")))?;
+
+    let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
+    let rc = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(format!("pipe() failed: errno={}", unsafe { *libc::__errno() }).into());
+    }
+    let pipe_read = pipe_fds[0];
+    let pipe_write = pipe_fds[1];
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let _ = unsafe { libc::close(pipe_read) };
+        let _ = unsafe { libc::close(pipe_write) };
+        return Err(format!("fork() failed: errno={}", unsafe { *libc::__errno() }).into());
+    }
+
+    if pid == 0 {
+        // ---- child process ----
+        unsafe {
+            libc::close(pipe_read);
         }
-        std::thread::sleep(Duration::from_millis(100));
+        // Clear CLOEXEC so pipe_write survives exec()
+        unsafe {
+            libc::fcntl(pipe_write, libc::F_SETFD, 0);
+        }
+
+        // argv: adb-rs fork-server --reply-fd N
+        let fork_server = std::ffi::CString::new("fork-server").unwrap();
+        let reply_fd_arg = std::ffi::CString::new("--reply-fd").unwrap();
+        let reply_fd_str = std::ffi::CString::new(pipe_write.to_string()).unwrap();
+
+        // Build null-terminated argv array
+        let mut raw_args: Vec<*const libc::c_char> = Vec::with_capacity(5);
+        raw_args.push(exe_cstr.as_ptr());
+        raw_args.push(fork_server.as_ptr());
+        raw_args.push(reply_fd_arg.as_ptr());
+        raw_args.push(reply_fd_str.as_ptr());
+        raw_args.push(std::ptr::null::<libc::c_char>());
+
+        unsafe {
+            libc::execv(exe_cstr.as_ptr(), raw_args.as_ptr());
+        }
+        // execv only returns on error
+        unsafe {
+            libc::_exit(127);
+        }
     }
 
-    if let Ok(Some(status)) = child.try_wait() {
-        return Err(format!("ADB server daemon exited immediately with status: {status}").into());
+    // ---- parent process ----
+    unsafe {
+        libc::close(pipe_write);
     }
 
-    Err(format!("Timeout waiting for ADB server daemon to start at {addr}").into())
+    // Wait for "OK\n" (3 bytes) from the server
+    let mut ok_buf = [0u8; 3];
+    let mut total_read = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        if total_read >= 3 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            // Timeout — server failed to start
+            unsafe {
+                libc::close(pipe_read);
+            }
+            // Try to reap the child
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+                let mut status: libc::c_int = 0;
+                libc::waitpid(pid, &mut status, 0);
+            }
+            return Err("Timeout waiting for ADB server to start".into());
+        }
+
+        let n = unsafe {
+            libc::read(
+                pipe_read,
+                ok_buf[total_read..].as_mut_ptr() as *mut libc::c_void,
+                3 - total_read,
+            )
+        };
+        if n > 0 {
+            total_read += n as usize;
+        } else if n == 0 {
+            // EOF without OK — server exited
+            break;
+        } else {
+            let err = unsafe { *libc::__errno() };
+            if err == libc::EINTR {
+                continue;
+            }
+            // EAGAIN/EWOULDBLOCK — retry
+            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            break;
+        }
+    }
+
+    unsafe {
+        libc::close(pipe_read);
+    }
+
+    if &ok_buf == b"OK\n" {
+        eprintln!("* daemon started successfully *");
+        Ok(())
+    } else {
+        // Server exited before sending OK
+        let mut status: libc::c_int = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        Err(format!(
+            "ADB server daemon exited with status {}",
+            status
+        )
+        .into())
+    }
 }
 
 /// Kill the running ADB server on 127.0.0.1:5037.
@@ -1259,6 +1371,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             kill_server()?;
         }
 
+        Commands::ForkServer { reply_fd } => {
+            server::run_server_fork(Some(*reply_fd));
+        }
+
         Commands::Pair { addr, code } => {
             let target_addr = if addr.contains(':') { addr.clone() } else { format!("{addr}:5555") };
             let pair_code = match code {
@@ -1334,7 +1450,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let handle = std::thread::spawn(move || {
-            server::run_server_with_listener(listener);
+            server::run_server_with_listener(listener, None);
         });
 
         let addr = format!("127.0.0.1:{port}");
