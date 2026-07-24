@@ -145,6 +145,23 @@ pub fn open_adb_transport(
         return Ok(Box::new(t));
     }
 
+    // Try connecting via local ADB server daemon (port 5037) if running.
+    // Using the server means all commands share one persistent transport,
+    // which avoids repeated AUTH dialogs.
+    // Send host:transport:<serial> (or host:transport-any) so the server
+    // bridges to the device before we start the CNXN/AUTH handshake.
+    {
+        let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+        if let Ok(mut t) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(500)) {
+            if let Some(s) = serial {
+                t.switch_transport(Some(s))?;
+            } else {
+                t.switch_transport(None)?;
+            }
+            return Ok(Box::new(t));
+        }
+    }
+
     if use_usb {
         #[cfg(feature = "usb")]
         {
@@ -180,12 +197,6 @@ pub fn open_adb_transport(
         }
     }
 
-    // Try connecting via local ADB server daemon (port 5037) if running
-    let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
-    if let Ok(t) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
-        return Ok(Box::new(t));
-    }
-
     let addr = resolve_target_addr(serial, ADBD_PORT);
     let t = TcpTransport::connect_timeout(&addr, timeout)
         .map_err(|_| format!("Connection failed to {addr} (Connection refused). Specify target device with `-s <IP:PORT>` or start ADB server."))?;
@@ -199,7 +210,7 @@ pub struct DeviceInfo {
 }
 
 /// Get or create the persistent ADB host identity.
-fn default_auth() -> &'static AdbAuth {
+pub fn default_auth() -> &'static AdbAuth {
     static AUTH: OnceLock<AdbAuth> = OnceLock::new();
     AUTH.get_or_init(|| {
         load_or_create_auth().expect("Failed to load or create persistent ADB auth key")
@@ -266,7 +277,7 @@ fn write_auth_public_key(auth: &AdbAuth, path: &Path) -> Result<(), Box<dyn std:
 /// If the device responds with A_STLS, the transport is upgraded to TLS
 /// using the auth key, and the CNXN handshake is retried over the encrypted channel.
 #[cfg(feature = "tls")]
-fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
+pub fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     transport: T,
     cnxn_payload: &[u8],
     auth: &AdbAuth,
