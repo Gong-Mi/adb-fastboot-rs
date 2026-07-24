@@ -145,19 +145,8 @@ pub fn open_adb_transport(
         return Ok(Box::new(t));
     }
 
-    // Prefer a running ADB server daemon (port 5037) when available.
-    // The server holds a persistent USB transport between commands,
-    // avoiding repeated AUTH and USB endpoint-stall (EPROTO) on
-    // the second consecutive connection.  AOSP adb works this way.
-    {
-        let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
-        if let Ok(mut t) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
-            if t.switch_transport(serial).is_ok() {
-                return Ok(Box::new(t));
-            }
-        }
-    }
-
+    // 1. Explicit USB request — bypass ADB server, connect directly.
+    //    This is the `-d` / `--usb` path and requires full CNXN/AUTH.
     if use_usb {
         #[cfg(feature = "usb")]
         {
@@ -192,6 +181,27 @@ pub fn open_adb_transport(
             return Ok(Box::new(adapter));
         }
     }
+
+    // 2. Prefer a running ADB server daemon (port 5037) when available.
+    //    The server holds a persistent USB transport between commands,
+    //    avoiding repeated AUTH and USB endpoint-stall (EPROTO) on
+    //    the second consecutive connection.  AOSP adb works this way.
+    //
+    //    NOTE: this must come AFTER the USB paths because server
+    //    transport cannot perform CNXN/AUTH — the server already
+    //    handled that. Commands that need raw ADB wire (shell,
+    //    push, pull) do their own CNXN and must go via direct USB.
+    //    Server transport is only useful for `host:devices` etc.
+    //    For now, skip server for non-devices commands to avoid
+    //    CNXN-over-server incompatibility.
+    //{
+    //    let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+    //    if let Ok(mut t) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+    //        if t.switch_transport(serial).is_ok() {
+    //            return Ok(Box::new(t));
+    //        }
+    //    }
+    //}
 
     let addr = resolve_target_addr(serial, ADBD_PORT);
     let t = TcpTransport::connect_timeout(&addr, timeout)
@@ -674,6 +684,70 @@ fn stream_shell_v2(
     Ok(captured)
 }
 
+/// Stream shell output via ADB server forwarding mode.
+///
+/// After `send_host_request("shell,v2,raw:...")` + `read_status()` OKAY,
+/// the server returns the shell output as a raw byte stream (no ADB
+/// WRTE framing), followed by a CLSE or connection close.
+///
+/// The server sends the full ShellV2 packet stream as raw bytes;
+/// we parse and strip the ShellV2 framing to produce clean stdout.
+fn stream_shell_v2_server(
+    transport: &mut dyn Transport,
+    capture: bool,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut captured = if capture { Some(Vec::new()) } else { None };
+    let mut buf = [0u8; 8192];
+    let mut remainder = Vec::new();
+
+    loop {
+        let n = match transport.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.kind() == std::io::ErrorKind::ConnectionReset
+                {
+                    break;
+                }
+                return Err(e.into());
+            }
+        };
+
+        remainder.extend_from_slice(&buf[..n]);
+
+        // Parse ShellV2 packets from the accumulated buffer
+        while !remainder.is_empty() {
+            match ShellV2Packet::parse(&remainder) {
+                Ok((pkt, consumed)) => {
+                    match pkt {
+                        ShellV2Packet::Stdout(data) | ShellV2Packet::Stderr(data) => {
+                            if let Some(ref mut buf) = captured {
+                                buf.extend_from_slice(data);
+                            }
+                            std::io::stdout().write_all(data)?;
+                            std::io::stdout().flush()?;
+                        }
+                        ShellV2Packet::ExitCode(_) => {
+                            // Don't print exit codes to stdout
+                        }
+                        _ => {}
+                    }
+                    remainder.drain(..consumed);
+                }
+                Err(_) => {
+                    // Incomplete packet — wait for more data
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(captured)
+}
+
 /// Open shell connection and stream output to stdout.
 fn run_shell(
     transport: &mut dyn Transport,
@@ -830,10 +904,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Shell { command } => {
+            let cmd_str = command.join(" ");
+            let shell_service = if cmd_str.is_empty() {
+                "shell,v2,raw:".to_string()
+            } else {
+                format!("shell,v2,raw:{}", cmd_str)
+            };
+
+            // Priority 1: ADB server (port 5037) — borrow the system ADB's
+            // already-authenticated transport.
+            //
+            // Server protocol after host:transport:<serial>:
+            //   Client sends shell service as hex-length prefixed string
+            //   (NOT raw A_OPEN — the server creates A_OPEN internally).
+            //   Server responds OKAY, then enters raw ADB forwarding mode.
+            //   Client then reads WRTE/CLSE from the device via server.
+            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+                if server.switch_transport(cli.serial.as_deref()).is_ok() {
+                    // Send shell service via host service protocol
+                    server.send_host_request(&shell_service)?;
+                    server.read_status()?; // OKAY -> server created A_OPEN, device OK'd
+                    // Now in raw forwarding mode — stream shell output
+                    stream_shell_v2_server(&mut server, false)?;
+                    return Ok(());
+                }
+            }
+
+            // Priority 2: direct USB/TCP transport — full CNXN/AUTH handshake.
             let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
             };
@@ -844,9 +946,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ) {
                 Ok(result) => result,
                 Err(e) if e.to_string().contains("0x45534c43") => {
-                    // adbd may emit CLSE while the previous USB transport is still
-                    // being torn down. Re-enumerate instead of treating that stale
-                    // close packet as a handshake failure.
                     std::thread::sleep(Duration::from_secs(15));
                     let retry_transport = open_adb_transport(
                         cli.serial.as_deref(),
@@ -862,14 +961,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => return Err(e),
             };
 
-            let cmd_str = command.join(" ");
-            let dest = if cmd_str.is_empty() {
-                "shell,v2,raw:".to_string()
-            } else {
-                format!("shell,v2,raw:{}", cmd_str)
-            };
-
-            let (_lid, remote_id) = open_service(&mut transport, &dest, 1)?;
+            let (_lid, remote_id) = open_service(&mut transport, &shell_service, 1)?;
             stream_shell_v2(&mut transport, _lid, remote_id, false)?;
         }
         Commands::Push { local, remote } => {
