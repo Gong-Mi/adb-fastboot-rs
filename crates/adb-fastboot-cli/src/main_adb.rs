@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand};
 use adb_protocol::{
     AdbAuth, AdbMessageHeader, AdbServerTransport, ShellV2Packet, TcpTransport, Transport,
     TransportError,
-    ADB_VERSION, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_STLS, A_WRTE, MAX_PAYLOAD_V2,
+    ADB_VERSION, A_AUTH, A_AUTH_TOKEN,
+    A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_STLS, A_WRTE, MAX_PAYLOAD_V2,
     build_sync_send_req, build_sync_data_chunk, build_sync_done, SyncMessageHeader,
     SYNC_FAIL, SYNC_OKAY,
 };
@@ -220,8 +221,30 @@ fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
     transport.send_message(&cnxn_hdr, cnxn_payload)?;
 
-    // Read response
-    let (resp_hdr, payload) = transport.recv_message()?;
+    // Read response. Legacy USB adbd may require RSA AUTH before CNXN/STLS.
+    let (mut resp_hdr, mut payload) = transport.recv_message()?;
+    let mut sent_signature = false;
+    let mut sent_public_key = false;
+    while resp_hdr.command == A_AUTH {
+        if resp_hdr.arg0 != A_AUTH_TOKEN {
+            return Err(format!("Unsupported AUTH request type: {}", resp_hdr.arg0).into());
+        }
+        if payload.len() != 20 {
+            return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
+        }
+
+        let (auth_hdr, auth_payload) = if !sent_signature {
+            sent_signature = true;
+            auth.make_signature_message(&payload)?
+        } else if !sent_public_key {
+            sent_public_key = true;
+            auth.make_rsakey_message()?
+        } else {
+            return Err("adbd rejected the ADB RSA key after signature and public-key exchange".into());
+        };
+        transport.send_message(&auth_hdr, &auth_payload)?;
+        (resp_hdr, payload) = transport.recv_message()?;
+    }
 
     if resp_hdr.command == A_CNXN {
         // Normal path — no TLS required
