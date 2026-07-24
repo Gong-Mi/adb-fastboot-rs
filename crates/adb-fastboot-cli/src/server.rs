@@ -642,6 +642,24 @@ fn dispatch_host_service(
             Ok(())
         }
 
+        // -- host:wait-for-device ---------------------------------------------
+        // AOSP clients use this service to block until at least one transport
+        // reaches a usable registry state. Do not acknowledge before a device
+        // exists; otherwise callers race the transport watcher.
+        "host:wait-for-device" | "host:wait-for-any-device" => {
+            while running.load(Ordering::Relaxed) {
+                let available = {
+                    let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                    reg.find_any_device().is_some()
+                };
+                if available {
+                    return ok_empty(client);
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+            fail(client, "server is shutting down")
+        }
+
         // -- host:get-state / host:get-serialno / host:get-devpath ----------
         c if c == "host:get-state" || c == "host:get-serialno" || c == "host:get-devpath" => {
             let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
@@ -1420,6 +1438,48 @@ mod tests {
         client.read_exact(&mut snapshot).unwrap();
         assert!(std::str::from_utf8(&snapshot).is_ok());
 
+        running.store(false, Ordering::Relaxed);
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_wait_for_device_acknowledges_available_transport() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        registry.lock().unwrap().devices.push(DeviceEntry {
+            serial: "test-device".to_string(),
+            state: DeviceState::Device,
+            origin: DeviceOrigin::Tcp {
+                addr: "127.0.0.1:5555".parse().unwrap(),
+            },
+            product: None,
+            model: None,
+            device_name: None,
+            transport_features: None,
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        let server_registry = Arc::clone(&registry);
+        let server_running = Arc::clone(&running);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            dispatch_host_service(
+                &mut stream,
+                "host:wait-for-device",
+                &server_registry,
+                &server_running,
+            )
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let mut response = [0u8; 4];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"OKAY");
         running.store(false, Ordering::Relaxed);
         drop(client);
         server.join().unwrap();
