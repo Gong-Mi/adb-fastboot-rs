@@ -72,6 +72,19 @@ impl DeviceState {
     }
 }
 
+/// Matches AOSP's `acquire_one_transport(..., accept_any_state=false)` online
+/// states. Connecting, authorizing, unauthorized, and offline transports must
+/// not be selected for a device-level host service.
+fn is_usable_state(state: DeviceState) -> bool {
+    matches!(
+        state,
+        DeviceState::Device
+            | DeviceState::Recovery
+            | DeviceState::Sideload
+            | DeviceState::Bootloader
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceOrigin {
     Usb,
@@ -189,7 +202,7 @@ impl TransportRegistry {
     }
 
     fn find_any_device(&self) -> Option<&DeviceEntry> {
-        self.devices.iter().find(|d| d.state == DeviceState::Device)
+        self.devices.iter().find(|d| is_usable_state(d.state))
     }
 
     fn upsert_tcp_device(&mut self, addr: SocketAddr, serial: String) {
@@ -683,7 +696,9 @@ fn dispatch_host_service(
             let serial = &c["host:transport:".len()..];
             let exists = {
                 let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-                reg.find_by_serial(serial).is_some()
+                reg.find_by_serial(serial)
+                    .map(|d| is_usable_state(d.state))
+                    .unwrap_or(false)
             };
             if exists {
                 ok_empty(client)
@@ -741,11 +756,15 @@ fn dispatch_host_service(
                 .and_then(|_| test_stream.write_all(probe))
                 .and_then(|_| test_stream.flush());
 
-            let is_adbd = cnxn_sent.is_ok()
-                && test_stream.read_exact(&mut hdr_buf).is_ok()
-                && AdbMessageHeader::decode(&hdr_buf)
-                    .map(|h| h.command == A_CNXN)
-                    .unwrap_or(false);
+            let response = if cnxn_sent.is_ok() && test_stream.read_exact(&mut hdr_buf).is_ok() {
+                AdbMessageHeader::decode(&hdr_buf).ok()
+            } else {
+                None
+            };
+            let is_adbd = response
+                .as_ref()
+                .map(|h| h.command == A_CNXN)
+                .unwrap_or(false);
 
             if is_adbd {
                 let serial = format!("{host}:{port}");
@@ -754,7 +773,12 @@ fn dispatch_host_service(
                     reg.upsert_tcp_device(addr, serial.clone());
 
                     // Read CNXN payload for features
-                    let payload_len = cnxn.data_length as usize;
+                    // The response header, not our request header, describes the
+                    // payload that follows. AOSP's CNXN banner carries the device
+                    // state, properties, and negotiated features; consuming the
+                    // request length desynchronizes the stream when those lengths
+                    // differ.
+                    let payload_len = response.unwrap().data_length as usize;
                     if payload_len > 0 && payload_len < 4096 {
                         let mut actual_payload = vec![0u8; payload_len];
                         let _ = test_stream.read_exact(&mut actual_payload);
@@ -1382,6 +1406,62 @@ fn bridge_tcp_to_usb(mut client: TcpStream, serial: &str) -> Result<bool, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_transport_selection_accepts_only_aosp_online_states() {
+        assert!(is_usable_state(DeviceState::Device));
+        assert!(is_usable_state(DeviceState::Recovery));
+        assert!(is_usable_state(DeviceState::Sideload));
+        assert!(is_usable_state(DeviceState::Bootloader));
+        assert!(!is_usable_state(DeviceState::Offline));
+        assert!(!is_usable_state(DeviceState::Authorizing));
+        assert!(!is_usable_state(DeviceState::Connecting));
+        assert!(!is_usable_state(DeviceState::NoPerm));
+    }
+
+    #[test]
+    fn test_connect_consumes_response_cnxn_banner_length() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let device_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_listener.local_addr().unwrap();
+        let banner = b"device::features=shell_v2;".to_vec();
+        let device = thread::spawn(move || {
+            let (mut stream, _) = device_listener.accept().unwrap();
+            let mut header = [0u8; 24];
+            stream.read_exact(&mut header).unwrap();
+            let request = AdbMessageHeader::decode(&header).unwrap();
+            let mut request_payload = vec![0u8; request.data_length as usize];
+            stream.read_exact(&mut request_payload).unwrap();
+
+            let response = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, &banner);
+            response.encode(&mut header);
+            stream.write_all(&header).unwrap();
+            stream.write_all(&banner).unwrap();
+        });
+
+        let server_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = server_listener.local_addr().unwrap();
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let server_registry = Arc::clone(&registry);
+        let server_running = Arc::clone(&running);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = server_listener.accept().unwrap();
+            let command = format!("host:connect:{device_addr}");
+            dispatch_host_service(&mut stream, &command, &server_registry, &server_running).unwrap();
+        });
+
+        let _client = TcpStream::connect(server_addr).unwrap();
+        server.join().unwrap();
+        device.join().unwrap();
+
+        let serial = device_addr.to_string();
+        let reg = registry.lock().unwrap();
+        assert_eq!(reg.find_by_serial(&serial).unwrap().transport_features.as_deref(),
+                   Some("device::features=shell_v2;"));
+    }
 
     #[test]
     fn test_parse_spec_pair() {
