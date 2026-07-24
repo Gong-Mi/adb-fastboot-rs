@@ -145,6 +145,19 @@ pub fn open_adb_transport(
         return Ok(Box::new(t));
     }
 
+    // Prefer a running ADB server daemon (port 5037) when available.
+    // The server holds a persistent USB transport between commands,
+    // avoiding repeated AUTH and USB endpoint-stall (EPROTO) on
+    // the second consecutive connection.  AOSP adb works this way.
+    {
+        let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+        if let Ok(mut t) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+            if t.switch_transport(serial).is_ok() {
+                return Ok(Box::new(t));
+            }
+        }
+    }
+
     if use_usb {
         #[cfg(feature = "usb")]
         {
@@ -200,38 +213,77 @@ pub fn default_auth() -> &'static AdbAuth {
     })
 }
 
+fn adb_key_dirs() -> Vec<PathBuf> {
+    // Priority order for ADB key directories.
+    // 1. $HOME/.android  — standard ADB location, same as system ADB.
+    //    When run via `su -c HOME=...`, this picks up the system ADB's key,
+    //    giving the same device fingerprint and reusing any prior authorization.
+    // 2. /sdcard/.android — fallback writable from both normal UID and root.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut dirs = Vec::with_capacity(2);
+    if !home.is_empty() {
+        dirs.push(PathBuf::from(&home).join(".android"));
+    }
+    dirs.push(PathBuf::from("/sdcard/.android"));
+    dirs
+}
+
 fn load_or_create_auth() -> Result<AdbAuth, Box<dyn std::error::Error>> {
-    let android_dir = PathBuf::from("/sdcard/.android");
-    std::fs::create_dir_all(&android_dir)?;
-    let private_path = android_dir.join("adbkey");
-    let public_path = android_dir.join("adbkey.pub");
+    let dirs = adb_key_dirs();
 
-    if private_path.is_file() {
-        let pem = std::fs::read_to_string(&private_path)?;
-        let private_key = adb_protocol::auth::load_private_key_from_pem(&pem)?;
-        let mut label = "adb-rs@localhost".to_string();
-        let auth = AdbAuth::new(private_key, &label);
+    // Try to load an existing key from each candidate directory.
+    for dir in &dirs {
+        let private_path = dir.join("adbkey");
+        let public_path = dir.join("adbkey.pub");
 
-        if public_path.is_file() {
-            let public_text = std::fs::read_to_string(&public_path)?;
-            if let Ok((public_key, public_label)) = adb_protocol::auth::parse_adb_public_key_string(&public_text) {
-                if public_key == *auth.public_key() {
-                    label = if public_label.is_empty() { label } else { public_label };
+        if private_path.is_file() {
+            let pem = std::fs::read_to_string(&private_path)?;
+            let private_key = adb_protocol::auth::load_private_key_from_pem(&pem)?;
+            let mut label = "adb-rs@localhost".to_string();
+            let auth = AdbAuth::new(private_key, &label);
+
+            if public_path.is_file() {
+                let public_text = std::fs::read_to_string(&public_path)?;
+                if let Ok((public_key, public_label)) =
+                    adb_protocol::auth::parse_adb_public_key_string(&public_text)
+                {
+                    if public_key == *auth.public_key() {
+                        label = if public_label.is_empty() {
+                            label
+                        } else {
+                            public_label
+                        };
+                    }
                 }
             }
-        }
 
-        let auth = AdbAuth::new(auth.private_key().clone(), &label);
-        if !public_path.is_file() || std::fs::read(&public_path)? != auth.build_rsakey_payload()? {
-            write_auth_public_key(&auth, &public_path)?;
+            let auth = AdbAuth::new(auth.private_key().clone(), &label);
+            if !public_path.is_file()
+                || std::fs::read(&public_path)? != auth.build_rsakey_payload()?
+            {
+                write_auth_public_key(&auth, &public_path)?;
+            }
+            return Ok(auth);
         }
-        return Ok(auth);
     }
 
+    // No existing key found — generate a new one.
     let auth = AdbAuth::generate("adb-rs@localhost")?;
     let pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key())?;
-    write_private_key(&private_path, pem.as_bytes())?;
-    write_auth_public_key(&auth, &public_path)?;
+
+    // Save to the first writable directory.
+    for dir in &dirs {
+        if std::fs::create_dir_all(dir).is_ok() {
+            let private_path = dir.join("adbkey");
+            let public_path = dir.join("adbkey.pub");
+            if write_private_key(&private_path, pem.as_bytes()).is_ok()
+                && write_auth_public_key(&auth, &public_path).is_ok()
+            {
+                break;
+            }
+        }
+    }
+
     Ok(auth)
 }
 
