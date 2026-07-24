@@ -145,23 +145,6 @@ pub fn open_adb_transport(
         return Ok(Box::new(t));
     }
 
-    // Try connecting via local ADB server daemon (port 5037) if running.
-    // Using the server means all commands share one persistent transport,
-    // which avoids repeated AUTH dialogs.
-    // Send host:transport:<serial> (or host:transport-any) so the server
-    // bridges to the device before we start the CNXN/AUTH handshake.
-    {
-        let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
-        if let Ok(mut t) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(500)) {
-            if let Some(s) = serial {
-                t.switch_transport(Some(s))?;
-            } else {
-                t.switch_transport(None)?;
-            }
-            return Ok(Box::new(t));
-        }
-    }
-
     if use_usb {
         #[cfg(feature = "usb")]
         {
@@ -298,17 +281,24 @@ fn persist_adb_pubkey(auth: &AdbAuth) -> Result<(), Box<dyn std::error::Error>> 
         return Ok(());
     }
 
-    // Append via root
+    // Append: use root if not already root, otherwise write directly
     use std::io::Write;
-    let status = std::process::Command::new("su")
-        .arg("-c")
-        .arg(format!("printf '%s\\n' '{}' >> {}", key_line, key_path))
-        .status();
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!("su exited with {s}").into()),
-        Err(e) => Err(format!("failed to run su: {e}").into()),
+    let can_write = std::fs::OpenOptions::new().append(true).open(key_path).is_ok();
+    if can_write {
+        let mut f = std::fs::OpenOptions::new().append(true).open(key_path)?;
+        writeln!(f, "{}", key_line)?;
+    } else {
+        let status = std::process::Command::new("su")
+            .arg("-c")
+            .arg(format!("printf '%s\\n' '{}' >> {}", key_line, key_path))
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => return Err(format!("su exited with {s}").into()),
+            Err(e) => return Err(format!("failed to run su: {e}").into()),
+        }
     }
+    Ok(())
 }
 
 /// Connect to adbd, perform CNXN handshake with A_STLS TLS upgrade support.
