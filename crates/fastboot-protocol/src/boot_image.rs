@@ -60,6 +60,13 @@ pub enum BootImageError {
         len: usize,
     },
 
+    #[error("Invalid {section} offset: {offset} (current section end is {minimum})")]
+    InvalidSectionOffset {
+        section: &'static str,
+        offset: usize,
+        minimum: usize,
+    },
+
     #[error("cmdline too long: {len} bytes (max {max})")]
     CmdlineTooLong { len: usize, max: usize },
 
@@ -861,21 +868,37 @@ pub fn parse_boot_image(data: &[u8]) -> Result<BootImage, BootImageError> {
         Vec::new()
     };
 
-    // Recovery DTBO (v1)
+    // Recovery DTBO (v1). AOSP stores recovery_dtbo_offset as an absolute
+    // image offset; it is not necessarily immediately after the second
+    // stage, so do not infer its location from the preceding section sizes.
     let recovery_dtbo = if version == 1 && header.recovery_dtbo_size > 0 {
         let sz = header.recovery_dtbo_size as usize;
         let padded = align_up(sz, ps);
-        if offset + padded > data.len() {
+        let recovery_offset = usize::try_from(header.recovery_dtbo_offset).map_err(|_| {
+            BootImageError::InvalidSectionOffset {
+                section: "recovery_dtbo",
+                offset: usize::MAX,
+                minimum: offset,
+            }
+        })?;
+        if recovery_offset < offset {
+            return Err(BootImageError::InvalidSectionOffset {
+                section: "recovery_dtbo",
+                offset: recovery_offset,
+                minimum: offset,
+            });
+        }
+        if recovery_offset.checked_add(padded).is_none()
+            || recovery_offset + padded > data.len()
+        {
             return Err(BootImageError::SectionBounds {
                 section: "recovery_dtbo",
-                offset,
+                offset: recovery_offset,
                 size: padded,
                 len: data.len(),
             });
         }
-        let section = data[offset..offset + sz].to_vec();
-        offset += padded;
-        section
+        data[recovery_offset..recovery_offset + sz].to_vec()
     } else {
         Vec::new()
     };
@@ -1345,5 +1368,55 @@ mod tests {
         let parsed = parse_boot_image(&image_bytes).unwrap();
         assert_eq!(parsed.kernel, kernel_data);
         assert_eq!(parsed.ramdisk, ramdisk_data);
+    }
+
+    #[test]
+    fn test_v1_recovery_dtbo_uses_absolute_offset() {
+        let page_size = 4096usize;
+        let kernel = [0x11u8];
+        let ramdisk = [0x22u8];
+        let recovery = [0x33u8, 0x44, 0x55];
+        let recovery_offset = page_size * 4;
+
+        let mut header = BootImageHeader::new_v0();
+        header.header_version = 1;
+        header.page_size = page_size as u32;
+        header.kernel_size = kernel.len() as u32;
+        header.ramdisk_size = ramdisk.len() as u32;
+        header.recovery_dtbo_size = recovery.len() as u32;
+        header.recovery_dtbo_offset = recovery_offset as u64;
+        header.boot_header_size = BOOT_IMAGE_HEADER_V1_SIZE as u32;
+
+        let mut image = header.encode();
+        image.resize(page_size, 0);
+        image.extend_from_slice(&kernel);
+        image.resize(page_size * 2, 0);
+        image.extend_from_slice(&ramdisk);
+        image.resize(recovery_offset, 0);
+        image.extend_from_slice(&recovery);
+        image.resize(recovery_offset + page_size, 0);
+
+        let parsed = parse_boot_image(&image).unwrap();
+        assert_eq!(parsed.kernel, kernel);
+        assert_eq!(parsed.ramdisk, ramdisk);
+        assert_eq!(parsed.recovery_dtbo, recovery);
+    }
+
+    #[test]
+    fn test_v1_recovery_dtbo_rejects_offset_before_previous_sections() {
+        let page_size = 4096usize;
+        let mut header = BootImageHeader::new_v0();
+        header.header_version = 1;
+        header.page_size = page_size as u32;
+        header.kernel_size = 1;
+        header.ramdisk_size = 1;
+        header.recovery_dtbo_size = 1;
+        header.recovery_dtbo_offset = page_size as u64;
+        header.boot_header_size = BOOT_IMAGE_HEADER_V1_SIZE as u32;
+
+        let mut image = header.encode();
+        image.resize(page_size * 3, 0);
+        let err = parse_boot_image(&image).unwrap_err();
+        assert!(matches!(err, BootImageError::InvalidSectionOffset { .. }));
     }
 }
