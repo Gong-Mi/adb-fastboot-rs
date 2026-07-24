@@ -148,12 +148,15 @@ pub fn open_adb_transport(
     if use_usb {
         #[cfg(feature = "usb")]
         {
-            let dev = if let Some(s) = serial {
+            let mut dev = if let Some(s) = serial {
                 adb_protocol::UsbfsAdbDevice::open_by_serial(s)
             } else {
                 adb_protocol::UsbfsAdbDevice::open_first()
             }
             .map_err(|e| format!("Failed to open ADB USB device: {e}"))?;
+            // AOSP adbd waits for the user/framework after AUTH_RSAKEY.
+            // Do not abort while the authorization dialog is still visible.
+            dev.set_timeout(Duration::from_secs(30 * 60));
             let adapter = adb_protocol::UsbTransportAdapter::new(dev);
             return Ok(Box::new(adapter));
         }
@@ -170,7 +173,8 @@ pub fn open_adb_transport(
         } else {
             adb_protocol::UsbfsAdbDevice::open_first()
         };
-        if let Ok(dev) = usb_res {
+        if let Ok(mut dev) = usb_res {
+            dev.set_timeout(Duration::from_secs(30 * 60));
             let adapter = adb_protocol::UsbTransportAdapter::new(dev);
             return Ok(Box::new(adapter));
         }
