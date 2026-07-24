@@ -1,0 +1,138 @@
+//! ADB authentication (RSA key loading/saving).
+//! Maps to AOSP `vendor/adb/client/auth.cpp`.
+
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use adb_protocol::AdbAuth;
+
+/// Get or create the persistent ADB host identity.
+pub fn default_auth() -> &'static AdbAuth {
+    static AUTH: OnceLock<AdbAuth> = OnceLock::new();
+    AUTH.get_or_init(|| {
+        load_or_create_auth().expect("Failed to load or create persistent ADB auth key")
+    })
+}
+
+fn adb_key_dirs() -> Vec<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut dirs = Vec::with_capacity(2);
+    if !home.is_empty() {
+        dirs.push(PathBuf::from(&home).join(".android"));
+    }
+    dirs.push(PathBuf::from("/sdcard/.android"));
+    dirs
+}
+
+fn load_or_create_auth() -> Result<AdbAuth, Box<dyn std::error::Error>> {
+    let dirs = adb_key_dirs();
+
+    for dir in &dirs {
+        let private_path = dir.join("adbkey");
+        let public_path = dir.join("adbkey.pub");
+
+        if private_path.is_file() {
+            let pem = std::fs::read_to_string(&private_path)?;
+            let private_key = adb_protocol::auth::load_private_key_from_pem(&pem)?;
+            let mut label = "adb-rs@localhost".to_string();
+            let auth = AdbAuth::new(private_key, &label);
+
+            if public_path.is_file() {
+                let public_text = std::fs::read_to_string(&public_path)?;
+                if let Ok((public_key, public_label)) =
+                    adb_protocol::auth::parse_adb_public_key_string(&public_text)
+                {
+                    if public_key == *auth.public_key() {
+                        label = if public_label.is_empty() { label } else { public_label };
+                    }
+                }
+            }
+
+            let auth = AdbAuth::new(auth.private_key().clone(), &label);
+            if !public_path.is_file()
+                || std::fs::read(&public_path)? != auth.build_rsakey_payload()?
+            {
+                write_auth_public_key(&auth, &public_path)?;
+            }
+            return Ok(auth);
+        }
+    }
+
+    let auth = AdbAuth::generate("adb-rs@localhost")?;
+    let pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key())?;
+
+    for dir in &dirs {
+        if std::fs::create_dir_all(dir).is_ok() {
+            let private_path = dir.join("adbkey");
+            let public_path = dir.join("adbkey.pub");
+            if write_private_key(&private_path, pem.as_bytes()).is_ok()
+                && write_auth_public_key(&auth, &public_path).is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    Ok(auth)
+}
+
+fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn write_auth_public_key(auth: &AdbAuth, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = auth.build_rsakey_payload()?;
+    write_private_key(path, &bytes)
+}
+
+/// Append the host public key to /data/misc/adb/adb_keys so that future
+/// SIGNATURE-based ADB connections succeed without a re-authorization dialog.
+#[cfg(target_os = "android")]
+pub fn persist_adb_pubkey(auth: &AdbAuth) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = auth.build_rsakey_payload()?;
+    let key_line = if payload.ends_with(&[0]) {
+        std::str::from_utf8(&payload[..payload.len() - 1])?
+    } else {
+        std::str::from_utf8(&payload)?
+    };
+    if key_line.is_empty() {
+        return Ok(());
+    }
+
+    let key_path = "/data/misc/adb/adb_keys";
+    let already_present = std::fs::read_to_string(key_path)
+        .map(|content| content.lines().any(|l| l.trim() == key_line))
+        .unwrap_or(false);
+    if already_present {
+        return Ok(());
+    }
+
+    use std::io::Write;
+    let can_write = std::fs::OpenOptions::new().append(true).open(key_path).is_ok();
+    if can_write {
+        let mut f = std::fs::OpenOptions::new().append(true).open(key_path)?;
+        writeln!(f, "{}", key_line)?;
+    } else {
+        let status = std::process::Command::new("su")
+            .arg("-c")
+            .arg(format!("printf '%s\\n' '{}' >> {}", key_line, key_path))
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => return Err(format!("su exited with {s}").into()),
+            Err(e) => return Err(format!("failed to run su: {e}").into()),
+        }
+    }
+    Ok(())
+}

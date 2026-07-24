@@ -303,7 +303,7 @@ impl TransportRegistry {
         let transport = UsbTransportAdapter::new(usb_dev);
 
         // 2. Load ADB host auth key
-        let auth = super::default_auth();
+        let auth = crate::client::auth::default_auth();
 
         // 3. Perform AUTH/CNXN handshake
         let cnxn_payload = b"host::";
@@ -361,7 +361,7 @@ impl TransportRegistry {
         #[cfg(target_os = "android")]
         {
             if sent_public_key {
-                let _ = super::persist_adb_pubkey(auth);
+                let _ = crate::client::auth::persist_adb_pubkey(auth);
             }
         }
 

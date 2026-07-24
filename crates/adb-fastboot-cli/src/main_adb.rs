@@ -13,6 +13,7 @@ use adb_protocol::{
 };
 
 mod server;
+mod client;
 
 const ADBD_PORT: u16 = 5555;
 const ADB_SERVER_PORT: u16 = 5037;
