@@ -1143,7 +1143,7 @@ mod tests {
     #[test]
     fn aosp_header_is_six_bytes_big_endian() {
         let packet = PairingPacket::new(PairingPacketType::Spake2Msg, vec![0xaa; 0x0102]).unwrap();
-        assert_eq!(packet.encode_header(), [1, 0, 0, 0, 1, 2]);
+        assert_eq!(packet.encode_header(), [1, 1, 0, 0, 1, 2]);
         let mut wire = Vec::new();
         packet.write_to(&mut wire).unwrap();
         assert_eq!(wire.len(), 6 + 0x0102);

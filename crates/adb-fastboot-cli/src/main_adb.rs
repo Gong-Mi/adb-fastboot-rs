@@ -138,9 +138,8 @@ pub fn open_adb_transport(
     timeout: Duration,
 ) -> Result<Box<dyn Transport>, Box<dyn std::error::Error>> {
     let is_tcp_spec = serial.map_or(false, |s| s.contains(':'));
-    let addr = resolve_target_addr(serial, ADBD_PORT);
-
     if is_tcp_spec {
+        let addr = resolve_target_addr(serial, ADBD_PORT);
         let t = TcpTransport::connect_timeout(&addr, timeout)?;
         return Ok(Box::new(t));
     }
@@ -176,7 +175,15 @@ pub fn open_adb_transport(
         }
     }
 
-    let t = TcpTransport::connect_timeout(&addr, timeout)?;
+    // Try connecting via local ADB server daemon (port 5037) if running
+    let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+    if let Ok(t) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+        return Ok(Box::new(t));
+    }
+
+    let addr = resolve_target_addr(serial, ADBD_PORT);
+    let t = TcpTransport::connect_timeout(&addr, timeout)
+        .map_err(|_| format!("Connection failed to {addr} (Connection refused). Specify target device with `-s <IP:PORT>` or start ADB server."))?;
     Ok(Box::new(t))
 }
 
