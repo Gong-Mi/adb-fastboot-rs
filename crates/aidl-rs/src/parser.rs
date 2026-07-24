@@ -46,6 +46,22 @@ pub enum Token {
     RAngle,
     Plus,
     Minus,
+    Star,
+    Slash,
+    Percent,
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    Bang,
+    AndAnd,
+    OrOr,
+    EqEq,
+    NotEq,
+    LAngleAngle,
+    RAngleAngle,
+    LessEqual,
+    GreaterEqual,
     Eof,
 }
 
@@ -73,6 +89,22 @@ impl Token {
             Token::RAngle => "'>'".into(),
             Token::Plus => "'+'".into(),
             Token::Minus => "'-'".into(),
+            Token::Star => "'*'".into(),
+            Token::Slash => "'/'".into(),
+            Token::Percent => "'%'".into(),
+            Token::Amp => "'&'".into(),
+            Token::Pipe => "'|'".into(),
+            Token::Caret => "'^'".into(),
+            Token::Tilde => "'~'".into(),
+            Token::Bang => "'!'".into(),
+            Token::AndAnd => "'&&'".into(),
+            Token::OrOr => "'||'".into(),
+            Token::EqEq => "'=='".into(),
+            Token::NotEq => "'!='".into(),
+            Token::LAngleAngle => "'<<'".into(),
+            Token::RAngleAngle => "'>>'".into(),
+            Token::LessEqual => "'<='".into(),
+            Token::GreaterEqual => "'>='".into(),
             Token::Eof => "EOF".into(),
         }
     }
@@ -159,7 +191,13 @@ impl<'a> Lexer<'a> {
             }
             if ch == '=' {
                 self.chars.next();
-                tokens.push((Token::Equals, idx));
+                let token = if self.chars.peek().is_some_and(|&(_, c)| c == '=') {
+                    self.chars.next();
+                    Token::EqEq
+                } else {
+                    Token::Equals
+                };
+                tokens.push((token, idx));
                 continue;
             }
             if ch == '{' {
@@ -194,12 +232,30 @@ impl<'a> Lexer<'a> {
             }
             if ch == '<' {
                 self.chars.next();
-                tokens.push((Token::LAngle, idx));
+                let token = if self.chars.peek().is_some_and(|&(_, c)| c == '<') {
+                    self.chars.next();
+                    Token::LAngleAngle
+                } else if self.chars.peek().is_some_and(|&(_, c)| c == '=') {
+                    self.chars.next();
+                    Token::LessEqual
+                } else {
+                    Token::LAngle
+                };
+                tokens.push((token, idx));
                 continue;
             }
             if ch == '>' {
                 self.chars.next();
-                tokens.push((Token::RAngle, idx));
+                let token = if self.chars.peek().is_some_and(|&(_, c)| c == '>') {
+                    self.chars.next();
+                    Token::RAngleAngle
+                } else if self.chars.peek().is_some_and(|&(_, c)| c == '=') {
+                    self.chars.next();
+                    Token::GreaterEqual
+                } else {
+                    Token::RAngle
+                };
+                tokens.push((token, idx));
                 continue;
             }
             if ch == '+' {
@@ -210,6 +266,34 @@ impl<'a> Lexer<'a> {
             if ch == '-' {
                 self.chars.next();
                 tokens.push((Token::Minus, idx));
+                continue;
+            }
+            let simple_operator = match ch {
+                '*' => Some(Token::Star),
+                '/' => Some(Token::Slash),
+                '%' => Some(Token::Percent),
+                '&' if self.chars.clone().nth(1).is_some_and(|(_, c)| c == '&') => {
+                    self.chars.next();
+                    Some(Token::AndAnd)
+                }
+                '&' => Some(Token::Amp),
+                '|' if self.chars.clone().nth(1).is_some_and(|(_, c)| c == '|') => {
+                    self.chars.next();
+                    Some(Token::OrOr)
+                }
+                '|' => Some(Token::Pipe),
+                '^' => Some(Token::Caret),
+                '~' => Some(Token::Tilde),
+                '!' if self.chars.clone().nth(1).is_some_and(|(_, c)| c == '=') => {
+                    self.chars.next();
+                    Some(Token::NotEq)
+                }
+                '!' => Some(Token::Bang),
+                _ => None,
+            };
+            if let Some(token) = simple_operator {
+                self.chars.next();
+                tokens.push((token, idx));
                 continue;
             }
 
@@ -482,27 +566,75 @@ impl Parser {
     }
 
     fn parse_expression_as_string(&mut self) -> Result<String, ParseError> {
+        self.parse_expression_bp(0)
+    }
+
+    fn parse_expression_bp(&mut self, min_precedence: u8) -> Result<String, ParseError> {
         let (tok, idx) = self.advance();
-        match tok {
-            Token::StringLit(s) => Ok(format!("\"{s}\"")),
-            Token::CharLit(s) => Ok(s),
-            Token::IntLit(n) => Ok(n.to_string()),
-            Token::FloatLit(f) => Ok(f.to_string()),
-            Token::Ident(s) => Ok(s),
-            Token::Minus => {
-                let sub = self.parse_expression_as_string()?;
-                Ok(format!("-{sub}"))
+        let mut left = match tok {
+            Token::StringLit(s) => format!("\"{s}\""),
+            Token::CharLit(s) => s,
+            Token::IntLit(n) => n.to_string(),
+            Token::FloatLit(f) => f.to_string(),
+            Token::Ident(s) => s,
+            Token::Minus => format!("-{}", self.parse_expression_bp(10)?),
+            Token::Plus => format!("+{}", self.parse_expression_bp(10)?),
+            Token::Tilde => format!("~{}", self.parse_expression_bp(10)?),
+            Token::Bang => format!("!{}", self.parse_expression_bp(10)?),
+            Token::LParen => {
+                let value = self.parse_expression_bp(0)?;
+                self.expect_token(Token::RParen)?;
+                if value.starts_with('(') && value.ends_with(')') {
+                    value
+                } else {
+                    format!("({value})")
+                }
             }
-            Token::Plus => {
-                let sub = self.parse_expression_as_string()?;
-                Ok(format!("+{sub}"))
-            }
-            other => Err(ParseError::ExpectedToken {
-                expected: "literal or identifier".into(),
+            other => return Err(ParseError::ExpectedToken {
+                expected: "constant expression operand".into(),
                 found: other.description(),
                 location: idx,
             }),
+        };
+
+        while let Some((operator, precedence)) = self.binary_operator() {
+            if precedence < min_precedence {
+                break;
+            }
+            self.advance();
+            let right = self.parse_expression_bp(precedence + 1)?;
+            left = format!("({left}{operator}{right})");
         }
+        Ok(left)
+    }
+
+    fn binary_operator(&self) -> Option<(&'static str, u8)> {
+        let result = match self.peek().0 {
+            Token::OrOr => ("||", 1),
+            Token::AndAnd => ("&&", 2),
+            Token::Pipe => ("|", 3),
+            Token::Caret => ("^", 4),
+            Token::Amp => ("&", 5),
+            Token::EqEq => ("==", 6),
+            Token::NotEq => ("!=", 6),
+            Token::LAngle | Token::RAngle | Token::LessEqual | Token::GreaterEqual => {
+                (match self.peek().0 {
+                    Token::LAngle => "<",
+                    Token::RAngle => ">",
+                    Token::LessEqual => "<=",
+                    _ => ">=",
+                }, 7)
+            }
+            Token::LAngleAngle => ("<<", 8),
+            Token::RAngleAngle => (">>", 8),
+            Token::Plus => ("+", 9),
+            Token::Minus => ("-", 9),
+            Token::Star => ("*", 10),
+            Token::Slash => ("/", 10),
+            Token::Percent => ("%", 10),
+            _ => return None,
+        };
+        Some(result)
     }
 
     fn parse_decl(&mut self) -> Result<AidlDecl, ParseError> {
@@ -779,7 +911,7 @@ impl Parser {
                     break;
                 }
             }
-            self.expect_token(Token::RAngle)?;
+            self.expect_generic_close()?;
         }
 
         let mut array_dimensions = 0;
@@ -789,12 +921,68 @@ impl Parser {
             array_dimensions += 1;
         }
 
-        Ok(AidlType {
+        let ty = AidlType {
             name,
             generic_args,
             array_dimensions,
             is_nullable,
-        })
+        };
+        self.validate_type_shape(&ty)?;
+        Ok(ty)
+    }
+
+    fn validate_type_shape(&self, ty: &AidlType) -> Result<(), ParseError> {
+        let builtin = matches!(
+            ty.name.as_str(),
+            "void" | "boolean" | "byte" | "char" | "int" | "long" | "float" | "double"
+                | "String" | "IBinder"
+        );
+        if ty.name == "void" && (ty.array_dimensions != 0 || !ty.generic_args.is_empty()) {
+            return Err(ParseError::Custom {
+                message: "void cannot be an array or generic type".into(),
+                location: 0,
+            });
+        }
+        if builtin && !ty.generic_args.is_empty() {
+            return Err(ParseError::Custom {
+                message: format!("{} cannot have type arguments", ty.name),
+                location: 0,
+            });
+        }
+        let valid_arity = match ty.name.as_str() {
+            "List" => ty.generic_args.len() == 1,
+            // AOSP retains the Java-compatible raw Map shape as well as Map<K,V>.
+            "Map" => ty.generic_args.is_empty() || ty.generic_args.len() == 2,
+            _ => true,
+        };
+        if matches!(ty.name.as_str(), "List" | "Map") {
+            if !valid_arity {
+                let expected = if ty.name == "List" { "exactly 1" } else { "0 or 2" };
+                return Err(ParseError::Custom {
+                    message: format!("{} requires {} type arguments", ty.name, expected),
+                    location: 0,
+                });
+            }
+        } else if !ty.generic_args.is_empty() {
+            return Err(ParseError::Custom {
+                message: format!("{} is not a generic AIDL type", ty.name),
+                location: 0,
+            });
+        }
+        for arg in &ty.generic_args {
+            self.validate_type_shape(arg)?;
+        }
+        Ok(())
+    }
+
+    fn expect_generic_close(&mut self) -> Result<usize, ParseError> {
+        if let (Token::RAngleAngle, idx) = self.peek().clone() {
+            self.advance();
+            self.tokens.insert(self.pos, (Token::RAngle, idx + 1));
+            Ok(idx)
+        } else {
+            self.expect_token(Token::RAngle)
+        }
     }
 }
 
@@ -1005,5 +1193,26 @@ mod tests {
         assert!(code.contains("TRANSACTION_first: u32 = FIRST_CALL_TRANSACTION + 0;"));
         assert!(code.contains("TRANSACTION_second: u32 = FIRST_CALL_TRANSACTION + 7;"));
         assert!(code.contains("FIRST_CALL_TRANSACTION: u32 = 1;"));
+    }
+
+    #[test]
+    fn test_constant_expressions_accept_aidl_operators_and_parentheses() {
+        let parsed = Parser::parse_str(
+            "interface Values { const int MASK = (1 << 4) | 3; const boolean ENABLED = true && !false; }",
+        )
+        .expect("AIDL constant expressions should parse");
+        if let AidlDecl::Interface(iface) = &parsed.decls[0] {
+            assert_eq!(iface.constants[0].value, "((1<<4)|3)");
+            assert_eq!(iface.constants[1].value, "(true&&!false)");
+        } else {
+            panic!("Expected interface decl");
+        }
+    }
+
+    #[test]
+    fn test_invalid_generic_type_shape_is_rejected() {
+        let error = Parser::parse_str("interface Bad { void run(Map<String> value); }")
+            .expect_err("Map must have exactly two type arguments");
+        assert!(error.to_string().contains("Map requires 0 or 2 type arguments"));
     }
 }
