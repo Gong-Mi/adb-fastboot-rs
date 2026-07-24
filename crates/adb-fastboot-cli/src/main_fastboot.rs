@@ -107,11 +107,22 @@ enum Commands {
         partition: String,
     },
     /// Reboot device
+    #[command(name = "reboot")]
     Reboot {
         target: Option<String>,
     },
+    /// Reboot into the bootloader (AOSP fastboot alias).
+    #[command(name = "reboot-bootloader")]
+    RebootBootloader,
+    /// Reboot into recovery (AOSP fastboot alias).
+    #[command(name = "reboot-recovery")]
+    RebootRecovery,
+    /// Reboot into fastbootd (AOSP fastboot alias).
+    #[command(name = "reboot-fastboot")]
+    RebootFastboot,
     /// Send OEM command
     Oem {
+        #[arg(required = true, num_args = 1..)]
         command: Vec<String>,
     },
     /// Create dynamic logical partition
@@ -157,18 +168,22 @@ enum Commands {
         out_file: String,
     },
     /// Stage data onto the device for a subsequent command (reverse of get_staged).
-    /// Reads from FILE if specified, or from stdin if not. Sends download:DATA
-    /// with streamed chunks.
+    /// Reads from FILE and sends download:DATA with streamed chunks.
     Stage {
-        /// Path to the file to stage. Reads from stdin if omitted.
+        /// Path to the file to stage.
+        #[arg(required = true)]
         file: Option<String>,
     },
     /// Send flashing command to bootloader (e.g. lock, unlock, close, lock_critical, unlock_critical)
     Flashing {
+        #[arg(value_parser = ["unlock", "lock", "unlock_critical", "lock_critical", "get_unlock_ability"])]
         action: String,
     },
-    /// GSI command (not yet implemented)
-    Gsi,
+    /// GSI command
+    Gsi {
+        #[arg(value_parser = ["wipe", "disable", "status"])]
+        action: String,
+    },
     /// Flash all partitions from an update.zip package
     Update {
         /// Path to the update.zip file
@@ -607,6 +622,34 @@ fn wait_for_disconnect(transport: FastbootConnection, timeout: Duration) -> bool
         Err(mpsc::RecvTimeoutError::Timeout) => false,   // 超时，设备未断开
         Err(mpsc::RecvTimeoutError::Disconnected) => false, // 线程 panic 等异常
     }
+}
+
+fn run_reboot(
+    use_usb: bool,
+    addr: &str,
+    target: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut transport = open_transport(use_usb, addr, Duration::from_secs(3))?;
+    let cmd = fastboot_protocol::reboot(target);
+    transport.send_cmd(&cmd)?;
+
+    // A rebooting device may close the connection before returning a status.
+    match transport.recv_response() {
+        Ok(response) => println!("[fastboot-rs] Reboot response: {:?}", response),
+        Err(error) => eprintln!(
+            "[fastboot-rs] Warning: Could not read reboot response (device may be disconnecting): {}",
+            error
+        ),
+    }
+
+    if wait_for_disconnect(transport, Duration::from_secs(5)) {
+        println!("[fastboot-rs] Device disconnected — reboot confirmed");
+    } else {
+        eprintln!(
+            "[fastboot-rs] Warning: Device did not disconnect within 5s timeout (reboot may still be in progress)"
+        );
+    }
+    Ok(())
 }
 
 /// 解析 android-info.txt，检查设备兼容性。
@@ -1474,45 +1517,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let resp = transport.recv_response()?;
             println!("[fastboot-rs] Erase response: {:?}", resp);
         }
-        Commands::Reboot { target } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let target_str = target.as_deref().unwrap_or("");
-            let cmd = if target_str.is_empty() {
-                "reboot".to_string()
-            } else {
-                format!("reboot-{}", target_str)
-            };
-            transport.send_cmd(&cmd)?;
-
-            // 尝试读取 reboot 响应（设备可能已经断开）
-            let resp = transport.recv_response();
-            match &resp {
-                Ok(r) => println!("[fastboot-rs] Reboot response: {:?}", r),
-                Err(e) => {
-                    eprintln!(
-                        "[fastboot-rs] Warning: Could not read reboot response (device may be disconnecting): {}",
-                        e
-                    );
-                }
-            }
-
-            // 等待设备断开连接，确认 reboot 已开始
-            let disconnected = wait_for_disconnect(transport, Duration::from_secs(5));
-            if disconnected {
-                println!("[fastboot-rs] Device disconnected — reboot confirmed");
-            } else {
-                eprintln!(
-                    "[fastboot-rs] Warning: Device did not disconnect within 5s timeout \
-                     (reboot may still be in progress)"
-                );
-            }
-        }
+        Commands::Reboot { target } => run_reboot(use_usb, &addr, target.as_deref())?,
+        Commands::RebootBootloader => run_reboot(use_usb, &addr, Some("bootloader"))?,
+        Commands::RebootRecovery => run_reboot(use_usb, &addr, Some("recovery"))?,
+        Commands::RebootFastboot => run_reboot(use_usb, &addr, Some("fastboot"))?,
         Commands::Oem { command } => {
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
@@ -2061,8 +2069,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[fastboot-rs] 已连接至 fastboot 目标 {addr}");
             do_update(&mut transport, &zip_file)?;
         }
-        Commands::Gsi => {
-            eprintln!("[fastboot-rs] GSI 命令未实现");
+        Commands::Gsi { action } => {
+            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            transport.send_cmd(&format!("gsi:{action}"))?;
+            let response = recv_and_print_info(&mut transport)?;
+            if let fastboot_protocol::FastbootResponse::Fail(reason) = response {
+                return Err(format!("gsi:{action} failed: {reason}").into());
+            }
         }
     }
 
@@ -2224,5 +2243,36 @@ mod tests {
             cli.command,
             Commands::GetStaged { ref out_file } if out_file == "staged.bin"
         ));
+    }
+
+    #[test]
+    fn aosp_reboot_variant_commands_parse_without_a_target_argument() {
+        for (name, expected) in [
+            ("reboot-bootloader", "bootloader"),
+            ("reboot-recovery", "recovery"),
+            ("reboot-fastboot", "fastboot"),
+        ] {
+            let cli = Cli::try_parse_from(["fastboot-rs", name])
+                .expect("AOSP reboot variant should parse");
+            let actual = match cli.command {
+                Commands::RebootBootloader => "bootloader",
+                Commands::RebootRecovery => "recovery",
+                Commands::RebootFastboot => "fastboot",
+                _ => panic!("expected a reboot variant"),
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn aosp_stage_requires_an_input_file() {
+        assert!(Cli::try_parse_from(["fastboot-rs", "stage"]).is_err());
+    }
+
+    #[test]
+    fn flashing_rejects_unknown_action_and_oem_requires_a_command() {
+        assert!(Cli::try_parse_from(["fastboot-rs", "flashing", "unlock"]).is_ok());
+        assert!(Cli::try_parse_from(["fastboot-rs", "flashing", "unknown"]).is_err());
+        assert!(Cli::try_parse_from(["fastboot-rs", "oem"]).is_err());
     }
 }

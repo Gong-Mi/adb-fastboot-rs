@@ -32,6 +32,7 @@ pub const SYNC_OKAY: u32 = 0x59414B4F; // "OKAY"
 /// ADB Sync Protocol v2 Command Identifiers
 pub const SYNC_STA2: u32 = 0x32415453; // "STA2" (STAT_V2)
 pub const SYNC_LST2: u32 = 0x3254534C; // "LST2" (LSTAT_V2)
+pub const SYNC_DENT_V2: u32 = 0x32544E44; // "DNT2" (DENT_V2)
 pub const SYNC_STAT_V2: u32 = SYNC_STA2;
 pub const SYNC_LSTAT_V2: u32 = SYNC_LST2;
 

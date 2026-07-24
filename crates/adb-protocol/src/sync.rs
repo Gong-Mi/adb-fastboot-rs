@@ -486,7 +486,7 @@ impl SyncDentV2Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{SYNC_SEND, SYNC_STA2};
+    use crate::constants::{SYNC_DENT_V2, SYNC_SEND, SYNC_STA2};
 
     #[test]
     fn test_sync_header_roundtrip() {
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn test_sync_dent_v2_response_encode_decode() {
         let stat_v2 = SyncStatV2Response {
-            id: SYNC_STA2,
+            id: SYNC_DENT_V2,
             error: 0,
             dev: 2049,
             ino: 12345678,
