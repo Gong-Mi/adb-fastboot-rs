@@ -31,8 +31,8 @@ pub const ADB_DEVICE_GUID: u8 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PairingPacketType {
-    Spake2Msg = 0,
-    PeerInfo = 1,
+    Spake2Msg = 1,
+    PeerInfo = 2,
 }
 
 impl TryFrom<u8> for PairingPacketType {
@@ -40,8 +40,8 @@ impl TryFrom<u8> for PairingPacketType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::Spake2Msg),
-            1 => Ok(Self::PeerInfo),
+            0 | 1 => Ok(Self::Spake2Msg),
+            2 => Ok(Self::PeerInfo),
             other => Err(PairingError::InvalidHeader(format!("unknown packet type {other}"))),
         }
     }
@@ -773,11 +773,8 @@ impl Spake2 {
             SpakeRole::Bob => x25519_ladder(&self.password_scalar, &n_point),
         };
 
-        let p_point = ExtendedPoint::decode(&p_u).unwrap_or_else(ExtendedPoint::base);
-        let mask_point = ExtendedPoint::decode(&mask_u).unwrap_or_else(ExtendedPoint::base);
-        let p_star = p_point.add(&mask_point);
-
-        self.my_msg = p_star.encode();
+        let p_star = Fe::from_bytes(&p_u).add(&Fe::from_bytes(&mask_u)).to_bytes();
+        self.my_msg = p_star;
         Ok(self.my_msg.to_vec())
     }
 
@@ -809,10 +806,8 @@ impl Spake2 {
             SpakeRole::Bob => x25519_ladder(&self.password_scalar, &m_point),
         };
 
-        let peer_mask = ExtendedPoint::decode(&peer_mask_u).unwrap_or_else(ExtendedPoint::base);
-        let q = q_star.sub(&peer_mask);
-        let q_bytes = q.encode();
-        let k_dh_bytes = x25519_ladder(&self.private_key, &q_bytes);
+        let q_u = Fe::from_bytes(&peer_bytes).sub(&Fe::from_bytes(&peer_mask_u)).to_bytes();
+        let k_dh_bytes = x25519_ladder(&self.private_key, &q_u);
 
         let mut ctx = Context::new(&SHA512);
         let mut update_len_prefixed = |data: &[u8]| {
