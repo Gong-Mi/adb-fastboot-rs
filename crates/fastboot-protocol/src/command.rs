@@ -79,7 +79,7 @@ pub fn boot() -> String {
 ///
 
 pub fn fetch(partition: &str, offset: u64, size: u64) -> String {
-    format!("fetch:{}:0x{:x}:0x{:x}", partition, offset, size)
+    format!("fetch:{}:0x{:08x}:0x{:08x}", partition, offset, size)
 }
 
 #[cfg(test)]
@@ -152,11 +152,11 @@ mod tests {
     fn test_fetch() {
         assert_eq!(
             fetch("boot", 0, 4096),
-            "fetch:boot:0x0:0x1000"
+            "fetch:boot:0x00000000:0x00001000"
         );
         assert_eq!(
             fetch("system", 0x10000, 0x80000),
-            "fetch:system:0x10000:0x80000"
+            "fetch:system:0x00010000:0x00080000"
         );
     }
 }
