@@ -203,10 +203,7 @@ fn default_auth() -> &'static AdbAuth {
 }
 
 fn load_or_create_auth() -> Result<AdbAuth, Box<dyn std::error::Error>> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or("HOME is not set; cannot locate persistent ADB key")?;
-    let android_dir = home.join(".android");
+    let android_dir = PathBuf::from("/sdcard/.android");
     std::fs::create_dir_all(&android_dir)?;
     let private_path = android_dir.join("adbkey");
     let public_path = android_dir.join("adbkey.pub");
