@@ -194,12 +194,58 @@ pub struct DeviceInfo {
     pub banner: String,
 }
 
-/// Get or create a default ADB auth key (singleton).
+/// Get or create the persistent ADB host identity.
 fn default_auth() -> &'static AdbAuth {
     static AUTH: OnceLock<AdbAuth> = OnceLock::new();
     AUTH.get_or_init(|| {
-        AdbAuth::generate("adb-rs@localhost").expect("Failed to generate ADB auth key")
+        load_or_create_auth().expect("Failed to load or create persistent ADB auth key")
     })
+}
+
+fn load_or_create_auth() -> Result<AdbAuth, Box<dyn std::error::Error>> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("HOME is not set; cannot locate persistent ADB key")?;
+    let android_dir = home.join(".android");
+    std::fs::create_dir_all(&android_dir)?;
+    let private_path = android_dir.join("adbkey");
+    let public_path = android_dir.join("adbkey.pub");
+
+    if private_path.is_file() {
+        let pem = std::fs::read_to_string(&private_path)?;
+        let private_key = adb_protocol::auth::load_private_key_from_pem(&pem)?;
+        let auth = AdbAuth::new(private_key, "adb-rs@localhost");
+        if !public_path.is_file() {
+            write_auth_public_key(&auth, &public_path)?;
+        }
+        return Ok(auth);
+    }
+
+    let auth = AdbAuth::generate("adb-rs@localhost")?;
+    let pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key())?;
+    write_private_key(&private_path, pem.as_bytes())?;
+    write_auth_public_key(&auth, &public_path)?;
+    Ok(auth)
+}
+
+fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn write_auth_public_key(auth: &AdbAuth, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = auth.build_rsakey_payload()?;
+    write_private_key(path, &bytes)
 }
 
 /// Connect to adbd, perform CNXN handshake with A_STLS TLS upgrade support.
