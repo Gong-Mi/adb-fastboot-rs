@@ -6,6 +6,7 @@ pub mod response;
 pub mod sparse;
 pub mod transport;
 pub mod udp;
+pub mod image;
 #[cfg(feature = "usb")]
 pub mod usb;
 #[cfg(feature = "usb-rusb")]
@@ -17,6 +18,7 @@ pub use boot_image::{BootImage, BootImageBuilder, BootImageHeader, build_boot_im
 pub use command::*;
 pub use slot::{SlotError, SlotSelection};
 pub use response::{FastbootResponse, FastbootResponseError};
+pub use image::{AOSP_IMAGE_MAPPINGS, resolve_image_path, resolve_super_empty_path};
 pub use sparse::{
     SparseChunk, SparseChunkBuilder, SparseChunkHeader, SparseError, SparseFile, SparseHeader,
     CHUNK_TYPE_CRC32, CHUNK_TYPE_DONT_CARE, CHUNK_TYPE_FILL, CHUNK_TYPE_RAW,

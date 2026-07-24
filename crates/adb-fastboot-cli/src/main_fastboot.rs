@@ -110,6 +110,12 @@ enum Commands {
         partition: String,
         file: Option<String>,
     },
+    /// Wipe super partition using super_empty image (AOSP CLI: wipe-super [SUPER_EMPTY])
+    #[command(name = "wipe-super", visible_alias = "wipe_super")]
+    WipeSuper {
+        /// Optional path to super_empty.img. If omitted, derives <ANDROID_PRODUCT_OUT>/super_empty.img
+        image: Option<String>,
+    },
     /// Package kernel/ramdisk as boot image and flash to partition (AOSP flash:raw).
     /// Usage: flash:raw <partition> <kernel> [ramdisk [second]]
     #[command(name = "flash:raw")]
@@ -1270,6 +1276,224 @@ fn do_update<T: FastbootTransport>(
     Ok(())
 }
 
+/// Helper to handle download and flashing of an image file to a specified partition over fastboot transport.
+fn flash_image_file<T: FastbootTransport>(
+    transport: &mut T,
+    partition_label: &str,
+    wire_partition: &str,
+    image_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut image_file = match File::open(image_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error opening image file '{}': {}", image_path.display(), e);
+            std::process::exit(1);
+        }
+    };
+
+    let file_size = match image_file.metadata() {
+        Ok(m) => m.len() as usize,
+        Err(e) => {
+            eprintln!("Error reading metadata for '{}': {}", image_path.display(), e);
+            std::process::exit(1);
+        }
+    };
+
+    if file_size == 0 {
+        eprintln!("Error: image file '{}' is empty", image_path.display());
+        std::process::exit(1);
+    }
+
+    if file_size > u32::MAX as usize {
+        eprintln!(
+            "Error: image file '{}' size ({}) exceeds u32 max ({}); protocol limit",
+            image_path.display(),
+            file_size,
+            u32::MAX
+        );
+        std::process::exit(1);
+    }
+
+    let max_download_size = match transport.send_cmd("getvar:max-download-size") {
+        Ok(_) => match transport.recv_response() {
+            Ok(fastboot_protocol::FastbootResponse::Okay(val)) => parse_max_download_size(&val),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    if let Some(limit) = max_download_size {
+        println!("[fastboot-rs] Bootloader max-download-size: {} bytes ({:#x})", limit, limit);
+    }
+
+    let need_split = match max_download_size {
+        Some(limit) => limit > 0 && file_size > limit,
+        None => false,
+    };
+
+    if need_split {
+        let image_data = match std::fs::read(image_path) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("Error reading image file '{}': {}", image_path.display(), e);
+                std::process::exit(1);
+            }
+        };
+
+        let limit = max_download_size.unwrap();
+        println!(
+            "[fastboot-rs] Image size ({} bytes) exceeds max-download-size ({} bytes). Splitting image into sparse chunks...",
+            image_data.len(),
+            limit
+        );
+
+        let is_sparse = image_data.len() >= 28
+            && u32::from_le_bytes(image_data[0..4].try_into().unwrap()) == fastboot_protocol::SPARSE_HEADER_MAGIC;
+
+        let sparse_file = if is_sparse {
+            match fastboot_protocol::SparseFile::from_bytes(&image_data) {
+                Ok(sf) => sf,
+                Err(e) => {
+                    eprintln!("Error parsing sparse file: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            fastboot_protocol::SparseFile::from_raw(&image_data, 4096)
+        };
+
+        let splits = match sparse_file.split(limit) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error splitting image: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        println!("[fastboot-rs] Split into {} sparse chunk file(s)", splits.len());
+
+        for (idx, split_file) in splits.iter().enumerate() {
+            let payload = split_file.encode();
+            println!(
+                "[fastboot-rs] Sending split chunk {}/{} ({} bytes)...",
+                idx + 1,
+                splits.len(),
+                payload.len()
+            );
+
+            let download_cmd = fastboot_protocol::download(payload.len() as u32);
+            transport.send_cmd(&download_cmd)?;
+            let dl_resp = transport.recv_response()?;
+            match dl_resp {
+                fastboot_protocol::FastbootResponse::Data(expected_len) => {
+                    if expected_len != payload.len() as u32 {
+                        eprintln!(
+                            "Error: Device requested {} bytes, but chunk payload is {} bytes",
+                            expected_len,
+                            payload.len()
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                fastboot_protocol::FastbootResponse::Fail(reason) => {
+                    eprintln!("Error download failed for chunk {}: {}", idx + 1, reason);
+                    std::process::exit(1);
+                }
+                other => {
+                    eprintln!("Unexpected download response for chunk {}: {:?}", idx + 1, other);
+                    std::process::exit(1);
+                }
+            }
+
+            transport.write_all(&payload)?;
+            transport.flush()?;
+
+            let post_dl_resp = transport.recv_response()?;
+            if let fastboot_protocol::FastbootResponse::Fail(reason) = post_dl_resp {
+                eprintln!("Error after payload send for chunk {}: {}", idx + 1, reason);
+                std::process::exit(1);
+            }
+
+            let flash_cmd = fastboot_protocol::flash(wire_partition);
+            transport.send_cmd(&flash_cmd)?;
+            let flash_resp = transport.recv_response()?;
+            println!(
+                "[fastboot-rs] Flash response for split chunk {}/{}: {:?}",
+                idx + 1,
+                splits.len(),
+                flash_resp
+            );
+        }
+    } else {
+        let chunk_size = max_download_size.unwrap_or(16 * 1024 * 1024);
+        println!(
+            "[fastboot-rs] Flashing partition '{}' with image '{}' ({} bytes, chunk size: {} bytes)",
+            partition_label,
+            image_path.display(),
+            file_size,
+            chunk_size
+        );
+
+        let download_cmd = fastboot_protocol::download(file_size as u32);
+        transport.send_cmd(&download_cmd)?;
+        let dl_resp = transport.recv_response()?;
+        match dl_resp {
+            fastboot_protocol::FastbootResponse::Data(expected_len) => {
+                if expected_len != file_size as u32 {
+                    eprintln!("Error: Device requested {} bytes, but local file is {} bytes", expected_len, file_size);
+                    std::process::exit(1);
+                }
+            }
+            fastboot_protocol::FastbootResponse::Fail(reason) => {
+                eprintln!("Error download failed: {}", reason);
+                std::process::exit(1);
+            }
+            other => {
+                eprintln!("Unexpected download response: {:?}", other);
+                std::process::exit(1);
+            }
+        }
+
+        println!("[fastboot-rs] Sending image payload in chunks ({} bytes total)...", file_size);
+        let mut buffer = vec![0u8; chunk_size];
+        let mut remaining = file_size;
+        let mut chunk_index = 0u64;
+
+        while remaining > 0 {
+            let to_read = remaining.min(chunk_size);
+            if let Err(e) = image_file.read_exact(&mut buffer[..to_read]) {
+                eprintln!("Error reading from '{}' at offset {}: {}", image_path.display(), file_size - remaining, e);
+                std::process::exit(1);
+            }
+            if let Err(e) = transport.write_all(&buffer[..to_read]) {
+                eprintln!(
+                    "Error writing to transport at chunk {} (offset {}): {}",
+                    chunk_index,
+                    file_size - remaining,
+                    e
+                );
+                std::process::exit(1);
+            }
+            remaining -= to_read;
+            chunk_index += 1;
+        }
+        transport.flush()?;
+
+        let post_dl_resp = transport.recv_response()?;
+        if let fastboot_protocol::FastbootResponse::Fail(reason) = post_dl_resp {
+            eprintln!("Error after payload send: {}", reason);
+            std::process::exit(1);
+        }
+
+        let flash_cmd = fastboot_protocol::flash(wire_partition);
+        transport.send_cmd(&flash_cmd)?;
+        let flash_resp = transport.recv_response()?;
+        println!("[fastboot-rs] Flash response for partition '{}': {:?}", partition_label, flash_resp);
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let addr = resolve_target_addr(cli.serial.as_deref(), 5554);
@@ -1393,64 +1617,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Flash { partition, file } => {
             let wire_partition = slot_selection.partition_name(&partition)?;
-            // Resolve image path: use explicit file if provided, otherwise
-            // fall back to ANDROID_PRODUCT_OUT/<partition>.img (AOSP find_item behavior)
-            let image_path = match file {
-                Some(path) => path,
-                None => {
-                    match std::env::var("ANDROID_PRODUCT_OUT") {
-                        Ok(out_dir) => {
-                            let path = format!("{}/{}.img", out_dir, partition);
-                            println!(
-                                "[fastboot-rs] Image path not specified; derived from ANDROID_PRODUCT_OUT: {}",
-                                path
-                            );
-                            path
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "Error: no image file specified and ANDROID_PRODUCT_OUT is not set.\n\
-                                 Either provide FILE argument or set ANDROID_PRODUCT_OUT environment variable\n\
-                                 to the build output directory containing {} partition images.",
-                                partition
-                            );
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            };
-
-            // Step 1: Open file and get size via metadata (avoids loading entire file into memory)
-            let mut image_file = match File::open(&image_path) {
-                Ok(f) => f,
+            let image_path = match fastboot_protocol::resolve_image_path(
+                &partition,
+                file.as_deref(),
+                std::env::var("ANDROID_PRODUCT_OUT").ok().as_deref(),
+            ) {
+                Ok(p) => p,
                 Err(e) => {
-                    eprintln!("Error opening image file '{}': {}", image_path, e);
+                    eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
-            let file_size = match image_file.metadata() {
-                Ok(m) => m.len() as usize,
-                Err(e) => {
-                    eprintln!("Error reading metadata for '{}': {}", image_path, e);
-                    std::process::exit(1);
-                }
-            };
-
-            if file_size == 0 {
-                eprintln!("Error: image file '{}' is empty", image_path);
-                std::process::exit(1);
-            }
-
-            // u32 overflow check for the download command
-            if file_size > u32::MAX as usize {
-                eprintln!(
-                    "Error: image file '{}' size ({}) exceeds u32 max ({}); protocol limit",
-                    image_path,
-                    file_size,
-                    u32::MAX
-                );
-                std::process::exit(1);
-            }
 
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
@@ -1461,188 +1638,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!("[fastboot-rs] Connected to fastboot target {}", addr);
 
-            // Fetch max-download-size if available
-            let max_download_size = match transport.send_cmd("getvar:max-download-size") {
-                Ok(_) => match transport.recv_response() {
-                    Ok(fastboot_protocol::FastbootResponse::Okay(val)) => parse_max_download_size(&val),
-                    _ => None,
-                },
-                _ => None,
-            };
-
-            if let Some(limit) = max_download_size {
-                println!("[fastboot-rs] Bootloader max-download-size: {} bytes ({:#x})", limit, limit);
-            }
-
-            let need_split = match max_download_size {
-                Some(limit) => limit > 0 && file_size > limit,
-                None => false,
-            };
-
-            if need_split {
-                // For sparse splitting, we must load the entire file into memory
-                // (sparse parsing requires random access to the full data)
-                let image_data = match std::fs::read(&image_path) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        eprintln!("Error reading image file '{}': {}", image_path, e);
-                        std::process::exit(1);
-                    }
-                };
-
-                let limit = max_download_size.unwrap();
-                println!(
-                    "[fastboot-rs] Image size ({} bytes) exceeds max-download-size ({} bytes). Splitting image into sparse chunks...",
-                    image_data.len(),
-                    limit
-                );
-
-                let is_sparse = image_data.len() >= 28
-                    && u32::from_le_bytes(image_data[0..4].try_into().unwrap()) == fastboot_protocol::SPARSE_HEADER_MAGIC;
-
-                let sparse_file = if is_sparse {
-                    match fastboot_protocol::SparseFile::from_bytes(&image_data) {
-                        Ok(sf) => sf,
-                        Err(e) => {
-                            eprintln!("Error parsing sparse file: {}", e);
-                            std::process::exit(1);
-                        }
-                    }
-                } else {
-                    fastboot_protocol::SparseFile::from_raw(&image_data, 4096)
-                };
-
-                let splits = match sparse_file.split(limit) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("Error splitting image: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-
-                println!("[fastboot-rs] Split into {} sparse chunk file(s)", splits.len());
-
-                use std::io::Write;
-                for (idx, split_file) in splits.iter().enumerate() {
-                    let payload = split_file.encode();
-                    println!(
-                        "[fastboot-rs] Sending split chunk {}/{} ({} bytes)...",
-                        idx + 1,
-                        splits.len(),
-                        payload.len()
-                    );
-
-                    let download_cmd = fastboot_protocol::download(payload.len() as u32);
-                    transport.send_cmd(&download_cmd)?;
-                    let dl_resp = transport.recv_response()?;
-                    match dl_resp {
-                        fastboot_protocol::FastbootResponse::Data(expected_len) => {
-                            if expected_len != payload.len() as u32 {
-                                eprintln!(
-                                    "Error: Device requested {} bytes, but chunk payload is {} bytes",
-                                    expected_len,
-                                    payload.len()
-                                );
-                                std::process::exit(1);
-                            }
-                        }
-                        fastboot_protocol::FastbootResponse::Fail(reason) => {
-                            eprintln!("Error download failed for chunk {}: {}", idx + 1, reason);
-                            std::process::exit(1);
-                        }
-                        other => {
-                            eprintln!("Unexpected download response for chunk {}: {:?}", idx + 1, other);
-                            std::process::exit(1);
-                        }
-                    }
-
-                    transport.write_all(&payload)?;
-                    transport.flush()?;
-
-                    let post_dl_resp = transport.recv_response()?;
-                    if let fastboot_protocol::FastbootResponse::Fail(reason) = post_dl_resp {
-                        eprintln!("Error after payload send for chunk {}: {}", idx + 1, reason);
-                        std::process::exit(1);
-                    }
-
-                    let flash_cmd = fastboot_protocol::flash(&wire_partition);
-                    transport.send_cmd(&flash_cmd)?;
-                    let flash_resp = transport.recv_response()?;
-                    println!(
-                        "[fastboot-rs] Flash response for split chunk {}/{}: {:?}",
-                        idx + 1,
-                        splits.len(),
-                        flash_resp
-                    );
-                }
-            } else {
-                // Non-split path: stream DATA payload in chunks from file to transport,
-                // avoiding loading the entire image into memory.
-                let chunk_size = max_download_size.unwrap_or(16 * 1024 * 1024); // 16MB default
-                println!(
-                    "[fastboot-rs] Flashing partition '{}' with image '{}' ({} bytes, chunk size: {} bytes)",
-                    partition, image_path, file_size, chunk_size
-                );
-
-                // Step 1: Send download command
-                let download_cmd = fastboot_protocol::download(file_size as u32);
-                transport.send_cmd(&download_cmd)?;
-                let dl_resp = transport.recv_response()?;
-                match dl_resp {
-                    fastboot_protocol::FastbootResponse::Data(expected_len) => {
-                        if expected_len != file_size as u32 {
-                            eprintln!("Error: Device requested {} bytes, but local file is {} bytes", expected_len, file_size);
-                            std::process::exit(1);
-                        }
-                    }
-                    fastboot_protocol::FastbootResponse::Fail(reason) => {
-                        eprintln!("Error download failed: {}", reason);
-                        std::process::exit(1);
-                    }
-                    other => {
-                        eprintln!("Unexpected download response: {:?}", other);
-                        std::process::exit(1);
-                    }
-                }
-
-                // Step 2: Stream payload data in chunks, reading from file on-demand
-                println!("[fastboot-rs] Sending image payload in chunks ({} bytes total)...", file_size);
-                let mut buffer = vec![0u8; chunk_size];
-                let mut remaining = file_size;
-                let mut chunk_index = 0u64;
-
-                while remaining > 0 {
-                    let to_read = remaining.min(chunk_size);
-                    if let Err(e) = image_file.read_exact(&mut buffer[..to_read]) {
-                        eprintln!("Error reading from '{}' at offset {}: {}", image_path, file_size - remaining, e);
-                        std::process::exit(1);
-                    }
-                    if let Err(e) = transport.write_all(&buffer[..to_read]) {
-                        eprintln!(
-                            "Error writing to transport at chunk {} (offset {}): {}",
-                            chunk_index,
-                            file_size - remaining,
-                            e
-                        );
-                        std::process::exit(1);
-                    }
-                    remaining -= to_read;
-                    chunk_index += 1;
-                }
-                transport.flush()?;
-
-                let post_dl_resp = transport.recv_response()?;
-                if let fastboot_protocol::FastbootResponse::Fail(reason) = post_dl_resp {
-                    eprintln!("Error after payload send: {}", reason);
+            flash_image_file(&mut transport, &partition, &wire_partition, &image_path)?;
+        }
+        Commands::WipeSuper { image } => {
+            let wire_partition = slot_selection.partition_name("super")?;
+            let image_path = match fastboot_protocol::resolve_super_empty_path(
+                image.as_deref(),
+                std::env::var("ANDROID_PRODUCT_OUT").ok().as_deref(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
+            };
 
-                // Step 3: Send flash command
-                let flash_cmd = fastboot_protocol::flash(&wire_partition);
-                transport.send_cmd(&flash_cmd)?;
-                let flash_resp = transport.recv_response()?;
-                println!("[fastboot-rs] Flash response for partition '{}': {:?}", partition, flash_resp);
-            }
+            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            println!("[fastboot-rs] Connected to fastboot target {}", addr);
+
+            println!("[fastboot-rs] Wiping super partition using image '{}'", image_path.display());
+            flash_image_file(&mut transport, "super", &wire_partition, &image_path)?;
         }
         Commands::Erase { partition } => {
             let wire_partition = slot_selection.partition_name(&partition)?;
