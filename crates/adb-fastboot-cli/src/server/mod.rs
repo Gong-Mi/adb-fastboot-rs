@@ -18,6 +18,7 @@ pub mod handler;
 pub mod models;
 pub mod bridge;
 pub mod forward;
+pub mod transport;
 pub mod watcher;
 
 // Re-export all items for backward compatibility within the crate.
@@ -26,6 +27,7 @@ pub(crate) use handler::*;
 pub(crate) use models::*;
 pub(crate) use bridge::*;
 pub(crate) use forward::*;
+pub(crate) use transport::*;
 pub(crate) use watcher::*;
 
 // Re-export old.rs items too (tests and any remaining public items).

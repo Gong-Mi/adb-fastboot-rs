@@ -4,9 +4,9 @@
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::server::models::{DeviceOrigin, TransportRegistry};
+use crate::server::transport::open_transport_by_origin;
 
 /// Bridge a client TCP connection to an ADB device (TCP or USB).
 ///
@@ -23,34 +23,8 @@ pub(crate) fn bridge_to_device(
     };
 
     let is_tcp = matches!(origin, Some(DeviceOrigin::Tcp { .. }));
-    let result = match origin {
-        Some(DeviceOrigin::Tcp { addr }) => {
-            // TCP transport: connect to adbd and enter smart socket loop
-            let device = adb_protocol::TcpTransport::connect_timeout(&addr, Duration::from_secs(5))
-                .map_err(|e| format!("cannot connect to device at {addr}: {e}"))?;
-            smart_socket_bridge(client, Box::new(device), &serial)
-        }
-        Some(DeviceOrigin::Usb) => {
-            #[cfg(feature = "usb")]
-            {
-                use adb_protocol::usb::UsbTransportAdapter;
-                use adb_protocol::usb_android::UsbfsAdbDevice;
-                let device = UsbfsAdbDevice::open_by_serial(&serial)
-                    .map_err(|e| format!("cannot open USB device: {e}"))?;
-                let transport = UsbTransportAdapter::new(device);
-                smart_socket_bridge(client, Box::new(transport), &serial)
-            }
-            #[cfg(not(feature = "usb"))]
-            {
-                drop(client);
-                Err("USB transport not supported (compile with --features usb)".to_string())
-            }
-        }
-        None => {
-            drop(client);
-            Err(format!("device '{serial}' not found"))
-        }
-    };
+    let origin_ref = origin.as_ref().ok_or_else(|| format!("device '{serial}' not found"))?;
+    let result = smart_socket_bridge(client, open_transport_by_origin(origin_ref, &serial)?, &serial);
 
     // After bridge ends, remove TCP device from registry
     if is_tcp && result.is_ok() {

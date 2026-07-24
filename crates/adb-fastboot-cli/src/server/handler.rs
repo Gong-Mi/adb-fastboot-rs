@@ -9,8 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use adb_protocol::{AdbMessageHeader, ADB_VERSION, A_CNXN, MAX_PAYLOAD_V2};
-
 use crate::server::bridge::bridge_to_device;
 use crate::server::forward::{handle_forward, handle_reverse};
 use crate::server::models::{
@@ -396,60 +394,15 @@ pub(crate) fn dispatch_host_service(
                 .ok_or_else(|| "no address resolved".to_string())?
                 .to_owned();
 
-            let mut test_stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-                .map_err(|e| format!("cannot connect to {addr_str}: {e}"))?;
-            let _ = test_stream.set_nodelay(true);
+            let serial = addr.to_string();
 
-            // Probe with CNXN
-            let probe = b"host::";
-            let cnxn = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, probe);
-            let mut hdr_buf = [0u8; 24];
-            cnxn.encode(&mut hdr_buf);
-
-            let cnxn_sent = test_stream
-                .write_all(&hdr_buf)
-                .and_then(|_| test_stream.write_all(probe))
-                .and_then(|_| test_stream.flush());
-
-            let response = if cnxn_sent.is_ok() && test_stream.read_exact(&mut hdr_buf).is_ok() {
-                AdbMessageHeader::decode(&hdr_buf).ok()
-            } else {
-                None
-            };
-            let is_adbd = response
-                .as_ref()
-                .map(|h| h.command == A_CNXN)
-                .unwrap_or(false);
-
-            if is_adbd {
-                let serial = addr.to_string();
-                {
-                    let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-                    reg.upsert_tcp_device(addr, serial.clone());
-
-                    // Read CNXN payload for features
-                    let payload_len = response.unwrap().data_length as usize;
-                    if payload_len > 0 && payload_len < 4096 {
-                        let mut actual_payload = vec![0u8; payload_len];
-                        let _ = test_stream.read_exact(&mut actual_payload);
-                        let cnxn_str = String::from_utf8_lossy(&actual_payload);
-                        if let Some(dev) = reg.devices.iter_mut().find(|d| d.serial == serial) {
-                            dev.transport_features = Some(cnxn_str.to_string());
-                            for part in cnxn_str.trim().split(';') {
-                                if let Some(val) = part.strip_prefix("product=") {
-                                    dev.product = Some(val.to_string());
-                                } else if let Some(val) = part.strip_prefix("model=") {
-                                    dev.model = Some(val.to_string());
-                                } else if let Some(val) = part.strip_prefix("device=") {
-                                    dev.device_name = Some(val.to_string());
-                                }
-                            }
-                        }
-                    }
+            match crate::server::transport::connect_to_remote(addr, registry) {
+                Ok(_transport) => {
+                    ok_str(client, &serial)
                 }
-                ok_str(client, &serial)
-            } else {
-                fail(client, "connection refused: not an ADB device")
+                Err(e) => {
+                    fail(client, &format!("connection failed: {e}"))
+                }
             }
         }
 
