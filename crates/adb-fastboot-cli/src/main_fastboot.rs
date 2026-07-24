@@ -151,8 +151,11 @@ enum Commands {
         #[arg(long)]
         partition_type: Option<String>,
     },
-    /// Read staged data from the device (sends get_staged, prints DATA response content)
-    GetStaged,
+    /// Read staged data from the device into OUT_FILE (sends get_staged)
+    GetStaged {
+        /// Destination file for the staged bytes.
+        out_file: String,
+    },
     /// Stage data onto the device for a subsequent command (reverse of get_staged).
     /// Reads from FILE if specified, or from stdin if not. Sends download:DATA
     /// with streamed chunks.
@@ -495,16 +498,15 @@ fn handle_boot_response(
     Ok(())
 }
 
-fn fetch_to_file<T: FastbootTransport>(
-    transport: &mut T,
+fn fetch_to_file(
+    transport: &mut FastbootConnection,
     partition: &str,
     out_file: &str,
 ) -> Result<fastboot_protocol::FastbootResponse, Box<dyn std::error::Error>> {
     let mut output = File::create(out_file)?;
+    // AOSP FastBootDriver::Fetch uses `fetch:<partition>` when no range is requested.
     transport.send_cmd(&format!("fetch:{}", partition))?;
-    let mut header = [0u8; 12];
-    transport.read_exact(&mut header)?;
-    let response = fastboot_protocol::FastbootResponse::parse(&header)?;
+    let response = recv_data_response(transport, "fetch")?;
     let size = match response {
         fastboot_protocol::FastbootResponse::Data(size) if size > 0 => size as usize,
         fastboot_protocol::FastbootResponse::Data(_) => {
@@ -532,6 +534,42 @@ fn fetch_to_file<T: FastbootTransport>(
         return Err(format!("fetch failed after receiving data: {}", reason).into());
     }
     Ok(final_response)
+}
+
+/// Read the DATA status for commands whose response is followed by a byte payload.
+/// AOSP FastBootDriver::RunAndReadBuffer accepts INFO/TEXT packets before DATA and
+/// then reads exactly the advertised number of bytes. Keep that framing separate from
+/// the payload consumer so fetch and get_staged cannot accidentally treat INFO as DATA.
+fn recv_data_response(
+    transport: &mut FastbootConnection,
+    operation: &str,
+) -> Result<fastboot_protocol::FastbootResponse, Box<dyn std::error::Error>> {
+    let mut info_logs = Vec::new();
+    let response = match transport {
+        // TCP keeps response bytes read ahead of DATA in its internal buffer. Calling
+        // the inherent method here is important: the blanket trait implementation
+        // cannot preserve those bytes for the subsequent payload read.
+        FastbootConnection::Tcp(transport) => transport.recv_response_with_info(&mut info_logs)?,
+        FastbootConnection::Udp(transport) => {
+            FastbootTransport::recv_response_with_info(transport, &mut info_logs)?
+        }
+        #[cfg(feature = "usb")]
+        FastbootConnection::Usb(transport) => {
+            FastbootTransport::recv_response_with_info(transport, &mut info_logs)?
+        }
+    };
+    for info in info_logs {
+        println!("[fastboot-rs] INFO {}", info);
+    }
+    match response {
+        fastboot_protocol::FastbootResponse::Data(size) => {
+            Ok(fastboot_protocol::FastbootResponse::Data(size))
+        }
+        fastboot_protocol::FastbootResponse::Fail(reason) => {
+            Err(format!("{operation} failed: {reason}").into())
+        }
+        other => Err(format!("unexpected {operation} response: {other:?}").into()),
+    }
 }
 
 fn recv_and_print_info(
@@ -1750,7 +1788,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::GetStaged => {
+        Commands::GetStaged { out_file } => {
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1759,47 +1797,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             transport.send_cmd("get_staged")?;
-            // 先读 DATA 头部（12 字节）
-            let mut header = [0u8; 12];
-            transport.read_exact(&mut header)?;
-            let response = fastboot_protocol::FastbootResponse::parse(&header)?;
-            let data_size = match response {
+            let data_size = match recv_data_response(&mut transport, "get_staged")? {
                 fastboot_protocol::FastbootResponse::Data(size) if size > 0 => size as usize,
                 fastboot_protocol::FastbootResponse::Data(_) => {
-                    eprintln!("[fastboot-rs] GetStaged: device returned zero bytes of staged data");
-                    std::process::exit(1);
+                    return Err("get_staged failed: device returned zero bytes".into());
                 }
-                fastboot_protocol::FastbootResponse::Fail(reason) => {
-                    eprintln!("[fastboot-rs] GetStaged FAIL: {}", reason);
-                    std::process::exit(1);
-                }
-                other => {
-                    eprintln!("[fastboot-rs] Unexpected get_staged response: {:?}", other);
-                    std::process::exit(1);
-                }
+                _ => unreachable!("recv_data_response only returns DATA"),
             };
-            // 读取 DATA 内容
-            let mut data = vec![0u8; data_size];
-            transport.read_exact(&mut data)?;
-            // 读取后续状态（OKAY/FAIL）
+            let mut output = File::create(&out_file)?;
+            let mut remaining = data_size;
+            let mut buffer = [0u8; 1024 * 1024];
+            while remaining > 0 {
+                let chunk_size = remaining.min(buffer.len());
+                transport.read_exact(&mut buffer[..chunk_size])?;
+                output.write_all(&buffer[..chunk_size])?;
+                remaining -= chunk_size;
+            }
+            output.sync_all()?;
             let final_resp = transport.recv_response()?;
-            match &final_resp {
+            match final_resp {
                 fastboot_protocol::FastbootResponse::Okay(msg) => {
-                    println!("[fastboot-rs] GetStaged DATA ({} bytes):", data_size);
-                    // 尝试以 UTF-8 打印；如果非 UTF-8 则显示 hex
-                    match std::str::from_utf8(&data) {
-                        Ok(s) => println!("{}", s),
-                        Err(_) => println!("{:02x?}", data),
-                    }
-                    println!("[fastboot-rs] GetStaged OK: {}", msg);
+                    println!("[fastboot-rs] GetStaged wrote {} bytes to '{}': {}", data_size, out_file, msg);
                 }
                 fastboot_protocol::FastbootResponse::Fail(reason) => {
-                    eprintln!("[fastboot-rs] GetStaged FAIL after DATA: {}", reason);
-                    std::process::exit(1);
+                    return Err(format!("get_staged failed after receiving data: {reason}").into());
                 }
-                other => {
-                    println!("[fastboot-rs] GetStaged final response: {:?}", other);
-                }
+                other => return Err(format!("unexpected get_staged final response: {other:?}").into()),
             }
         }
         Commands::Stage { file } => {
@@ -2160,50 +2183,46 @@ mod tests {
         }
     }
 
-    struct MockFetchTransport {
-        incoming: std::io::Cursor<Vec<u8>>,
-        sent: Vec<u8>,
-    }
-
-    impl std::io::Read for MockFetchTransport {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            std::io::Read::read(&mut self.incoming, buf)
-        }
-    }
-
-    impl std::io::Write for MockFetchTransport {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.sent.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[test]
-    fn test_fetch_receives_data_and_writes_output_file() {
-        let mut transport = MockFetchTransport {
-            incoming: std::io::Cursor::new(
-                b"DATA00000005HELLOOKAYFetched boot (offset=0x0, size=0x5)".to_vec(),
-            ),
-            sent: Vec::new(),
-        };
+    fn fetch_accepts_info_before_data_like_aosp_run_and_read_buffer() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut command = [0u8; 10];
+            socket.read_exact(&mut command).unwrap();
+            assert_eq!(&command, b"fetch:boot");
+            socket.write_all(b"INFOreading boot\nDATA00000005HELLOOKAYdone").unwrap();
+        });
+        let mut transport = FastbootConnection::Tcp(
+            fastboot_protocol::FastbootTcpTransport::raw_connect(addr).unwrap(),
+        );
         let path = std::env::temp_dir().join(format!(
-            "fastboot-rs-fetch-test-{}",
+            "fastboot-rs-fetch-info-test-{}",
             std::process::id()
         ));
 
         let response = fetch_to_file(&mut transport, "boot", path.to_str().unwrap()).unwrap();
-        assert_eq!(transport.sent, b"fetch:boot");
         assert_eq!(
             response,
-            fastboot_protocol::FastbootResponse::Okay(
-                "Fetched boot (offset=0x0, size=0x5)".to_string()
-            )
+            fastboot_protocol::FastbootResponse::Okay("done".to_string())
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"HELLO");
         std::fs::remove_file(path).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn get_staged_requires_a_destination_file_like_aosp_cli() {
+        let cli = Cli::try_parse_from(["fastboot-rs", "get-staged", "staged.bin"])
+            .expect("AOSP get_staged takes an output file");
+        assert!(matches!(
+            cli.command,
+            Commands::GetStaged { ref out_file } if out_file == "staged.bin"
+        ));
     }
 }
