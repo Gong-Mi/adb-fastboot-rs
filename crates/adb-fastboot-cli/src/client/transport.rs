@@ -14,7 +14,7 @@ use crate::client::auth;
 const ADBD_PORT: u16 = 5555;
 const ADB_SERVER_PORT: u16 = 5037;
 
-fn resolve_target_addr(serial: Option<&str>, default_port: u16) -> String {
+pub fn resolve_target_addr(serial: Option<&str>, default_port: u16) -> String {
     serial.map_or_else(
         || format!("127.0.0.1:{default_port}"),
         |s| {

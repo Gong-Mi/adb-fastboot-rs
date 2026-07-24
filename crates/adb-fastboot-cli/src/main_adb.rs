@@ -17,9 +17,11 @@ mod client;
 
 use client::{protocol, shell, exec_out, server_cmds, host_command};
 use client::server_cmds::{ensure_server_running, ensure_server_running_at, kill_server, kill_server_at};
+use client::host_command::host_command;
+use client::transport::resolve_target_addr;
 
-const ADBD_PORT: u16 = 5555;
-const ADB_SERVER_PORT: u16 = 5037;
+pub const ADBD_PORT: u16 = 5555;
+pub const ADB_SERVER_PORT: u16 = 5037;
 
 #[derive(Parser)]
 #[command(name = "adb-rs", author, version, about = "Rust ADB Command-Line Interface")]
@@ -160,14 +162,6 @@ pub enum Commands {
         /// 6-digit pairing code (prompted if omitted)
         code: Option<String>,
     },
-}
-
-fn resolve_target_addr(serial: Option<&str>, default_port: u16) -> String {
-    match serial {
-        Some(s) if s.contains(':') => s.to_string(),
-        Some(s) => format!("{}:{}", s, default_port),
-        None => format!("127.0.0.1:{}", default_port),
-    }
 }
 
 /// Resolve transport for ADB commands based on CLI parameters (`serial`, `-d`) and device availability.
@@ -566,38 +560,6 @@ fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
         resp_hdr.command
     )
     .into())
-}
-
-/// Connect to ADB server (port 5037), switch transport if needed, and execute a host command.
-
-/// Connect to ADB server (port 5037), switch transport if needed, and execute a host command.
-fn host_command(
-    serial: Option<&str>,
-    request: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let addr = resolve_target_addr(serial, ADB_SERVER_PORT);
-    let mut server = match AdbServerTransport::connect_timeout(&addr, Duration::from_secs(1)) {
-        Ok(s) => s,
-        Err(_) => {
-            ensure_server_running()?;
-            AdbServerTransport::connect_timeout(&addr, Duration::from_secs(3))
-                .map_err(|e| format!("Cannot connect to ADB server at {addr}: {e}"))?
-        }
-    };
-
-    if !request.starts_with("host:connect")
-        && !request.starts_with("host:disconnect")
-        && !request.starts_with("host:forward")
-        && !request.starts_with("host:reverse")
-        && !request.starts_with("host:devices")
-    {
-        server.switch_transport(serial)?;
-    }
-
-    // Execute the host command
-    let result = server.execute_host_command(request)
-        .map_err(|e| format!("ADB host command failed: {e}"))?;
-    Ok(result)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
