@@ -966,6 +966,19 @@ mod tests {
     }
 
     #[test]
+    fn test_interface_inheritance_is_preserved_in_rust_trait() {
+        let aidl = r#"
+            import com.example.IBase;
+            interface IChild extends com.example.IBase {
+                void run();
+            }
+        "#;
+        let parsed = Parser::parse_str(aidl).expect("interface inheritance should parse");
+        let code = Generator::new().generate_file(&parsed);
+        assert!(code.contains("pub trait IChild: IBase + Send + Sync {"));
+    }
+
+    #[test]
     fn test_android_numeric_suffixes_and_char_literals() {
         let aidl = r#"
             interface Values {

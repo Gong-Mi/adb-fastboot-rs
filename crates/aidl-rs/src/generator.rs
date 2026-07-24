@@ -1,5 +1,9 @@
 use crate::ast::*;
 
+fn last_rust_ident(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
 pub struct Generator {
     pub generate_binder_stubs: bool,
 }
@@ -54,7 +58,13 @@ impl Generator {
     pub fn generate_interface(&self, iface: &AidlInterface) -> String {
         let mut out = String::new();
 
-        out.push_str(&format!("pub trait {}: Send + Sync {{\n", iface.name));
+        let trait_super = iface
+            .extends
+            .as_deref()
+            .map(last_rust_ident)
+            .map(|name| format!("{name} + "))
+            .unwrap_or_default();
+        out.push_str(&format!("pub trait {}: {}Send + Sync {{\n", iface.name, trait_super));
 
         // Constants inside interface
         for c in &iface.constants {
