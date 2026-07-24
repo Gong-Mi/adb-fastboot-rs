@@ -852,6 +852,12 @@ fn dispatch_host_service(
             Ok(())
         }
 
+        // -- host:start-server ------------------------------------------------
+        // AOSP adb_client.cpp sends this after connecting to the server to
+        // confirm the daemon is running. Always succeed — if we're here,
+        // the server is alive and responding.
+        "host:start-server" => ok_empty(client),
+
         // -- host:devices / host:devices-l ----------------------------------
         "host:devices" | "host:devices-l" => {
             let verbose = cmd.ends_with("-l");

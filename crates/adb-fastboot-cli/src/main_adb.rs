@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -94,6 +94,16 @@ pub enum Commands {
     Uninstall {
         package: String,
     },
+    /// Restart adbd as root
+    Root,
+    /// Restart adbd as non-root
+    Unroot,
+    /// Restart adbd listening on TCP on the specified port
+    Tcpip {
+        port: u16,
+    },
+    /// Restart adbd listening on USB
+    Usb,
     /// Show log output from device
     Logcat {
         args: Vec<String>,
@@ -104,6 +114,15 @@ pub enum Commands {
     },
     /// List JDWP PIDs (uses ADB server on port 5037)
     Jdwp,
+    /// Get device state: offline, device, recovery, etc.
+    #[command(name = "get-state")]
+    GetState,
+    /// Get the device serial number
+    #[command(name = "get-serialno")]
+    GetSerialno,
+    /// Get the device path (e.g., usb:12345)
+    #[command(name = "get-devpath")]
+    GetDevpath,
     /// Start the ADB server (listens on 127.0.0.1:5037)
     Serve,
     /// Start the ADB server daemon
@@ -369,7 +388,7 @@ pub(crate) fn persist_adb_pubkey(auth: &AdbAuth) -> Result<(), Box<dyn std::erro
     }
 
     // Append: use root if not already root, otherwise write directly
-    use std::io::Write;
+    use std::io::{Read, Write};
     let can_write = std::fs::OpenOptions::new().append(true).open(key_path).is_ok();
     if can_write {
         let mut f = std::fs::OpenOptions::new().append(true).open(key_path)?;
@@ -1552,6 +1571,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        Commands::GetState => {
+            match host_command(cli.serial.as_deref(), "host:get-state") {
+                Ok(resp) => println!("{}", resp.trim()),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::GetSerialno => {
+            match host_command(cli.serial.as_deref(), "host:get-serialno") {
+                Ok(resp) => println!("{}", resp.trim()),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::GetDevpath => {
+            match host_command(cli.serial.as_deref(), "host:get-devpath") {
+                Ok(resp) => println!("{}", resp.trim()),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         Commands::Serve => {
             println!("[adb-rs] Starting ADB server on 127.0.0.1:5037 ...");
             server::run_server();
@@ -1673,6 +1722,113 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Successfully paired to {target_addr} [device={}, serial={}]", dev_name, serial);
             }
         }
+
+        Commands::Root => {
+            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("Error: ADB server not running. Start it with `adb-rs start-server`.");
+                    std::process::exit(1);
+                }
+            };
+            server.switch_transport(cli.serial.as_deref())
+                .map_err(|e| format!("Failed to switch transport: {e}"))?;
+            server.send_host_request("root:")?;
+            server.read_status()?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = match server.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                };
+                std::io::stdout().write_all(&buf[..n])?;
+            }
+            std::io::stdout().flush()?;
+        }
+
+        Commands::Unroot => {
+            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("Error: ADB server not running. Start it with `adb-rs start-server`.");
+                    std::process::exit(1);
+                }
+            };
+            server.switch_transport(cli.serial.as_deref())
+                .map_err(|e| format!("Failed to switch transport: {e}"))?;
+            server.send_host_request("unroot:")?;
+            server.read_status()?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = match server.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                };
+                std::io::stdout().write_all(&buf[..n])?;
+            }
+            std::io::stdout().flush()?;
+        }
+
+        Commands::Tcpip { port } => {
+            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("Error: ADB server not running. Start it with `adb-rs start-server`.");
+                    std::process::exit(1);
+                }
+            };
+            server.switch_transport(cli.serial.as_deref())
+                .map_err(|e| format!("Failed to switch transport: {e}"))?;
+            let service = format!("tcpip:{}", port);
+            server.send_host_request(&service)?;
+            server.read_status()?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = match server.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                };
+                std::io::stdout().write_all(&buf[..n])?;
+            }
+            std::io::stdout().flush()?;
+        }
+
+        Commands::Usb => {
+            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("Error: ADB server not running. Start it with `adb-rs start-server`.");
+                    std::process::exit(1);
+                }
+            };
+            server.switch_transport(cli.serial.as_deref())
+                .map_err(|e| format!("Failed to switch transport: {e}"))?;
+            server.send_host_request("usb:")?;
+            server.read_status()?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = match server.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                };
+                std::io::stdout().write_all(&buf[..n])?;
+            }
+            std::io::stdout().flush()?;
+        }
+
+        _ => todo!("command not yet implemented"),
     }
 
     Ok(())
