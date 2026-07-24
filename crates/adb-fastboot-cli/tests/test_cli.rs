@@ -90,9 +90,9 @@ fn test_fastboot_new_commands_wire_sequence() {
         assert_eq!(&buf[..n], b"boot");
         socket.write_all(b"OKAY").unwrap();
 
-        // 5. Expect fetch:boot:0x0:0x1000
+        // 5. Expect fetch:boot:0x00000000:0x00001000
         let n = socket.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"fetch:boot:0x0:0x1000");
+        assert_eq!(&buf[..n], b"fetch:boot:0x00000000:0x00001000");
         socket.write_all(b"OKAY").unwrap();
     });
 
