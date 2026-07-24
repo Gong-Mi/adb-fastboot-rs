@@ -6,7 +6,7 @@ This file separates design/implementation work from device acceptance. Passing u
 
 ## Current count
 
-There are 35 identified design items that are not fully landed in code:
+There are 34 identified design items that are not fully landed in code:
 
 - ADB: 10
 - Fastboot CLI: 16
@@ -42,10 +42,9 @@ The count is an implementation-gap count, not an acceptance score.
 10. Complete `update` task orchestration: `fastboot-info.txt`, slots, snapshots, secondary slot.
 11. Fetch offset/size/slot orchestration.
 12. `wipe-super`.
-13. `snapshot-update`.
-14. `signature`.
-15. Persistent `connect`/`disconnect` device storage.
-16. Global options such as skip-reboot, skip-secondary, force, slot, disable-verity, and disable-verification.
+13. `signature`.
+14. Persistent `connect`/`disconnect` device storage.
+15. Global options such as skip-reboot, skip-secondary, force, slot, disable-verity, and disable-verification.
 
 Already landed and therefore not counted as gaps here:
 
@@ -53,6 +52,7 @@ Already landed and therefore not counted as gaps here:
 - Fastboot INFO/TEXT/DATA upload handling
 - reboot aliases
 - GSI command argument wiring
+- `snapshot-update [cancel|merge]`
 - flashing action validation
 
 ## Fastboot protocol/image — 5 gaps
