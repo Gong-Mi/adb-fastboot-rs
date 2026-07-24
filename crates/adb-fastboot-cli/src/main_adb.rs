@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 use clap::{Parser, Subcommand};
@@ -954,10 +954,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             kill_server()?;
         }
 
-        Commands::Pair { addr, code: _ } => {
+        Commands::Pair { addr, code } => {
             let target_addr = if addr.contains(':') { addr.clone() } else { format!("{addr}:5555") };
-            eprintln!("Cannot pair with {target_addr}: AOSP pairing requires TLS 1.3 exporter + BoringSSL Curve25519 SPAKE2 and certificate persistence; this build refuses plaintext and the former custom SPAP protocol.");
-            std::process::exit(1);
+            let pair_code = match code {
+                Some(c) => c.clone(),
+                None => {
+                    eprint!("Enter 6-digit pairing code: ");
+                    std::io::stdout().flush()?;
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    input.trim().to_string()
+                }
+            };
+
+            let mut client = adb_protocol::PairingClient::new(&pair_code)
+                .map_err(|e| format!("Invalid pairing code: {e}"))?;
+
+            println!("Connecting to pairing service at {target_addr}...");
+            let tcp_stream = std::net::TcpStream::connect_timeout(
+                &target_addr.parse().map_err(|e| format!("Invalid target address {target_addr}: {e}"))?,
+                Duration::from_secs(5),
+            ).map_err(|e| format!("Failed to connect to {target_addr}: {e}"))?;
+
+            #[cfg(feature = "tls")]
+            let peer_info = {
+                println!("Establishing TLS 1.3 transport to {target_addr}...");
+                let rsa_key = adb_protocol::auth::generate_rsa_key()?;
+                let pem = adb_protocol::auth::export_private_key_to_pem(&rsa_key)?;
+                let (cert_der, key_der) = adb_protocol::tls::generate_self_signed_cert(&pem)?;
+                let tls_config = adb_protocol::tls::create_tls_config(cert_der, key_der)?;
+                let (mut tls_stream, exported) = adb_protocol::tls::perform_tls_handshake_with_pairing_export(tcp_stream, tls_config, "localhost")?;
+
+                println!("Executing SPAKE2+ key exchange and certificate pairing...");
+                let peer_info = client.execute_pairing_with_exported_keys(&mut tls_stream, Some(&exported))
+                    .map_err(|e| format!("Pairing failed with {target_addr}: {e}"))?;
+
+                let home_dir = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+                let android_dir = home_dir.join(".android");
+                let keystore = adb_protocol::pairing::save_adb_keystore(&rsa_key, "adb-rs", &android_dir)?;
+                println!("Saved paired keystore to {}", keystore.public_key_path.display());
+                peer_info
+            };
+
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = tcp_stream;
+                return Err("TLS support is required for wireless pairing; rebuild with `--features tls`".into());
+            }
+
+            let (serial, dev_name) = peer_info.parse_device_info();
+            println!("Successfully paired to {target_addr} [device={}, serial={}]", dev_name, serial);
         }
     }
 

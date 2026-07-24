@@ -583,13 +583,10 @@ fn test_adb_sync_list_dent_wire_sequence() {
 }
 
 #[test]
-fn test_aosp_pairing_is_explicitly_unsupported_until_spake2_backend_exists() {
+fn test_aosp_pairing_client_rejects_empty_stream() {
     let mut client = adb_protocol::PairingClient::new("123456").unwrap();
     let mut io = std::io::Cursor::new(Vec::<u8>::new());
-    assert_eq!(
-        client.execute_pairing(&mut io),
-        Err(adb_protocol::PairingError::UnsupportedSpake2)
-    );
+    assert!(client.execute_pairing(&mut io).is_err());
 }
 
 #[test]
