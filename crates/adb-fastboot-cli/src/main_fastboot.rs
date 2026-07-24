@@ -154,6 +154,10 @@ enum Commands {
     },
     /// Continue booting after flash operations (re-send to device)
     Continue,
+    /// Install a 256-byte bootloader signature.
+    Signature {
+        file: String,
+    },
     /// Send a snapshot update command (cancel or merge).
     SnapshotUpdate {
         #[arg(value_parser = ["cancel", "merge"])]
@@ -1774,6 +1778,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::Signature { file } => {
+            let signature = read_file_bytes(&file);
+            if signature.len() != 256 {
+                return Err(format!(
+                    "signature must be 256 bytes (got {})",
+                    signature.len()
+                )
+                .into());
+            }
+            let mut transport = open_transport(use_usb, &addr, Duration::from_secs(3))?;
+            transport.send_cmd(&fastboot_protocol::download(256))?;
+            match transport.recv_response()? {
+                fastboot_protocol::FastbootResponse::Data(size) if size == 256 => {}
+                response => {
+                    return Err(format!("signature download rejected: {:?}", response).into());
+                }
+            }
+            transport.write_all(&signature)?;
+            transport.flush()?;
+            match transport.recv_response()? {
+                fastboot_protocol::FastbootResponse::Okay(_) => {}
+                response => return Err(format!("signature payload rejected: {:?}", response).into()),
+            }
+            transport.send_cmd(&fastboot_protocol::signature())?;
+            let response = recv_and_print_info(&mut transport)?;
+            match response {
+                fastboot_protocol::FastbootResponse::Fail(reason) => {
+                    return Err(format!("signature installation failed: {reason}").into());
+                }
+                other => println!("[fastboot-rs] Signature response: {:?}", other),
+            }
+        }
         Commands::SnapshotUpdate { action } => {
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
@@ -2285,6 +2321,12 @@ mod tests {
             };
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn signature_requires_a_file() {
+        assert!(Cli::try_parse_from(["fastboot-rs", "signature"]).is_err());
+        assert!(Cli::try_parse_from(["fastboot-rs", "signature", "sig.bin"]).is_ok());
     }
 
     #[test]

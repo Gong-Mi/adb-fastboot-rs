@@ -68,6 +68,11 @@ pub fn resize_logical_partition(partition: &str, size: u64) -> String {
     format!("resize-logical-partition:{}:{}", partition, size)
 }
 
+/// Formats the Fastboot signature installation command.
+pub fn signature() -> String {
+    "signature".to_string()
+}
+
 /// Formats a snapshot-update command for Fastboot.
 ///
 /// AOSP sends `snapshot-update:<command>`, where the command may be empty,
@@ -149,6 +154,11 @@ mod tests {
             resize_logical_partition("system_a", 2097152),
             "resize-logical-partition:system_a:2097152"
         );
+    }
+
+    #[test]
+    fn test_signature() {
+        assert_eq!(signature(), "signature");
     }
 
     #[test]
