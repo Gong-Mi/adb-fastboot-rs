@@ -130,7 +130,7 @@ enum Commands {
         #[arg(value_parser = parse_u64)]
         size: u64,
     },
-    /// Download and boot a kernel image (not yet supported by this protocol layer)
+    /// Download and boot a kernel image with optional ramdisk
     Boot {
         kernel: String,
         ramdisk: Option<String>,
@@ -186,6 +186,7 @@ type UsbFastbootTransport = fastboot_protocol::FastbootUsbTransport<fastboot_pro
 
 enum FastbootConnection {
     Tcp(FastbootTcpTransport),
+    Udp(fastboot_protocol::FastbootUdpTransport),
     #[cfg(feature = "usb")]
     Usb(UsbFastbootTransport),
 }
@@ -194,6 +195,7 @@ impl std::io::Read for FastbootConnection {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Tcp(transport) => transport.read(buf),
+            Self::Udp(transport) => transport.read(buf),
             #[cfg(feature = "usb")]
             Self::Usb(transport) => transport.read(buf),
         }
@@ -204,6 +206,7 @@ impl std::io::Write for FastbootConnection {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Tcp(transport) => transport.write(buf),
+            Self::Udp(transport) => transport.write(buf),
             #[cfg(feature = "usb")]
             Self::Usb(transport) => transport.write(buf),
         }
@@ -212,6 +215,7 @@ impl std::io::Write for FastbootConnection {
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::Tcp(transport) => transport.flush(),
+            Self::Udp(transport) => transport.flush(),
             #[cfg(feature = "usb")]
             Self::Usb(transport) => transport.flush(),
         }
@@ -237,6 +241,12 @@ fn open_transport(
             let _ = (addr, timeout);
             return Err("USB support is not enabled; rebuild with `--features usb`".into());
         }
+    }
+
+    if let Some(udp_addr) = addr.strip_prefix("udp:") {
+        return fastboot_protocol::FastbootUdpTransport::connect_timeout(udp_addr, timeout)
+            .map(FastbootConnection::Udp)
+            .map_err(|error| error.into());
     }
 
     FastbootTcpTransport::connect_timeout(addr, timeout)
@@ -447,132 +457,6 @@ fn download_and_flash_payload<T: FastbootTransport>(
     println!("[fastboot-rs] 发送 flash:{} 命令...", partition);
     let flash_cmd = fastboot_protocol::flash(partition);
     transport.send_cmd(&flash_cmd)?;
-
-    Ok(())
-}
-
-/// 直接下载 kernel 文件并 boot（无 ramdisk 时的原始行为）。
-fn download_and_boot_kernel<T: FastbootTransport>(
-    transport: &mut T,
-    kernel: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // 打开 kernel 文件
-    let mut image_file = match File::open(kernel) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("[fastboot-rs] 错误: 无法打开 kernel 文件 '{}': {}", kernel, e);
-            std::process::exit(1);
-        }
-    };
-    let file_size = match image_file.metadata() {
-        Ok(m) => m.len() as usize,
-        Err(e) => {
-            eprintln!("[fastboot-rs] 错误: 无法读取文件元数据 '{}': {}", kernel, e);
-            std::process::exit(1);
-        }
-    };
-
-    if file_size == 0 {
-        eprintln!("[fastboot-rs] 错误: kernel 文件 '{}' 为空", kernel);
-        std::process::exit(1);
-    }
-    if file_size > u32::MAX as usize {
-        eprintln!(
-            "[fastboot-rs] 错误: 文件 '{}' 大小 ({}) 超过 u32 上限 ({}); 协议限制",
-            kernel,
-            file_size,
-            u32::MAX
-        );
-        std::process::exit(1);
-    }
-
-    // 获取 max-download-size
-    let max_download_size = match transport.send_cmd("getvar:max-download-size") {
-        Ok(_) => match transport.recv_response() {
-            Ok(fastboot_protocol::FastbootResponse::Okay(val)) => {
-                parse_max_download_size(&val)
-            }
-            _ => None,
-        },
-        _ => None,
-    };
-    if let Some(limit) = max_download_size {
-        println!(
-            "[fastboot-rs] Bootloader max-download-size: {} bytes ({:#x})",
-            limit, limit
-        );
-    }
-
-    // Step 1: 发送 download 命令
-    let download_cmd = fastboot_protocol::download(file_size as u32);
-    transport.send_cmd(&download_cmd)?;
-    let dl_resp = transport.recv_response()?;
-    match dl_resp {
-        fastboot_protocol::FastbootResponse::Data(expected_len) => {
-            if expected_len != file_size as u32 {
-                eprintln!(
-                    "[fastboot-rs] 错误: 设备请求 {} 字节，但本地文件为 {} 字节",
-                    expected_len, file_size
-                );
-                std::process::exit(1);
-            }
-        }
-        fastboot_protocol::FastbootResponse::Fail(reason) => {
-            eprintln!("[fastboot-rs] download 失败: {}", reason);
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("[fastboot-rs] 意外的 download 响应: {:?}", other);
-            std::process::exit(1);
-        }
-    }
-
-    // Step 2: 分块发送 payload，避免将整个文件加载到内存
-    let chunk_size = max_download_size.unwrap_or(16 * 1024 * 1024); // 默认 16MB
-    println!(
-        "[fastboot-rs] 发送 kernel payload ({} 字节, 分块大小: {} 字节)...",
-        file_size, chunk_size
-    );
-    let mut buffer = vec![0u8; chunk_size];
-    let mut remaining = file_size;
-    let mut chunk_index = 0u64;
-
-    while remaining > 0 {
-        let to_read = remaining.min(chunk_size);
-        if let Err(e) = image_file.read_exact(&mut buffer[..to_read]) {
-            eprintln!(
-                "[fastboot-rs] 错误: 读取文件 '{}' 失败 at offset {}: {}",
-                kernel,
-                file_size - remaining,
-                e
-            );
-            std::process::exit(1);
-        }
-        if let Err(e) = transport.write_all(&buffer[..to_read]) {
-            eprintln!(
-                "[fastboot-rs] 错误: 写入 transport 失败 at chunk {} (offset {}): {}",
-                chunk_index,
-                file_size - remaining,
-                e
-            );
-            std::process::exit(1);
-        }
-        remaining -= to_read;
-        chunk_index += 1;
-    }
-    transport.flush()?;
-
-    // Step 3: 读取 payload 发送完成后的 OKAY/FAIL
-    let post_dl_resp = transport.recv_response()?;
-    if let fastboot_protocol::FastbootResponse::Fail(reason) = &post_dl_resp {
-        eprintln!("[fastboot-rs] payload 发送失败: {}", reason);
-        std::process::exit(1);
-    }
-    println!("[fastboot-rs] Download 完成: {:?}", post_dl_resp);
-
-    // Step 4: 发送 boot 命令
-    println!("[fastboot-rs] 发送 boot 命令...");
-    transport.send_cmd("boot")?;
 
     Ok(())
 }
@@ -1679,14 +1563,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!(
                         "[fastboot-rs] 构建 boot image (header v4, page_size=4096)..."
                     );
-                    boot_payload = fastboot_protocol::boot_image::build_boot_image(
-                        &kernel_data,
-                        &ramdisk_data,
-                        second_data,
-                        &[], // dtb — 暂不提供
-                        4096,
-                        4,
-                    );
+                    boot_payload = fastboot_protocol::boot_image::BootImageBuilder::new()
+                        .kernel(kernel_data)
+                        .ramdisk(ramdisk_data)
+                        .second(second_data.to_vec())
+                        .build();
                     println!(
                         "[fastboot-rs] boot image 构建完成: {} 字节",
                         boot_payload.len()
@@ -1705,13 +1586,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     boot_payload = kernel_data;
                 } else {
-                    // 无 ramdisk 且非 boot image：保持原始直接 download + boot 行为
                     println!(
-                        "[fastboot-rs] 无 ramdisk，直接发送 kernel payload: {}",
-                        kernel
+                        "[fastboot-rs] 无 ramdisk，使用 BootImageBuilder 构建 boot image..."
                     );
-                    download_and_boot_kernel(&mut transport, &kernel)?;
-                    return handle_boot_response(transport);
+                    let second_bytes = second.as_ref().map(|p| read_file_bytes(p));
+                    let second_data = second_bytes.as_deref().unwrap_or(&[]);
+                    boot_payload = fastboot_protocol::boot_image::BootImageBuilder::new()
+                        .kernel(kernel_data)
+                        .second(second_data.to_vec())
+                        .build();
                 }
             }
 
@@ -2240,6 +2123,22 @@ mod tests {
                 assert_eq!(kernel, "boot.img");
                 assert_eq!(ramdisk.as_deref(), Some("ramdisk.img"));
                 assert_eq!(second.as_deref(), Some("second.img"));
+            }
+            _ => panic!("expected Boot command"),
+        }
+
+        // kernel + ramdisk
+        let cli = Cli::try_parse_from(["fastboot-rs", "boot", "kernel.img", "ramdisk.img"])
+            .expect("boot with kernel and ramdisk should parse");
+        match cli.command {
+            Commands::Boot {
+                ref kernel,
+                ref ramdisk,
+                ref second,
+            } => {
+                assert_eq!(kernel, "kernel.img");
+                assert_eq!(ramdisk.as_deref(), Some("ramdisk.img"));
+                assert!(second.is_none());
             }
             _ => panic!("expected Boot command"),
         }

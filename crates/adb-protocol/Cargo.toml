@@ -26,3 +26,4 @@ zstd = { version = "0.13", features = ["zdict_builder"] }
 rusb = { version = "0.9.4", optional = true }
 rcgen = { version = "0.13", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+ring = "0.17"

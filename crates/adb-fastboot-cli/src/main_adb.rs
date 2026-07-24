@@ -5,7 +5,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use adb_protocol::{
     AdbAuth, AdbMessageHeader, AdbServerTransport, ShellV2Packet, TcpTransport, Transport,
-    TransportError,
+    TransportError, PairingClient,
     ADB_VERSION, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_STLS, A_WRTE, MAX_PAYLOAD_V2,
     build_sync_send_req, build_sync_data_chunk, build_sync_done, SyncMessageHeader,
     SYNC_FAIL, SYNC_OKAY,
@@ -18,16 +18,20 @@ const ADB_SERVER_PORT: u16 = 5037;
 
 #[derive(Parser)]
 #[command(name = "adb-rs", author, version, about = "Rust ADB Command-Line Interface")]
-struct Cli {
+pub struct Cli {
     #[arg(short, long, global = true)]
-    serial: Option<String>,
+    pub serial: Option<String>,
+
+    /// Direct connection to USB device
+    #[arg(short = 'd', global = true)]
+    pub d: bool,
 
     #[command(subcommand)]
-    command: Commands,
+    pub command: Commands,
 }
 
 #[derive(Subcommand)]
-enum Commands {
+pub enum Commands {
     /// List connected devices
     Devices,
     /// Run remote shell command
@@ -94,6 +98,19 @@ enum Commands {
     Jdwp,
     /// Start the ADB server (listens on 127.0.0.1:5037)
     Serve,
+    /// Start the ADB server daemon
+    #[command(name = "start-server")]
+    StartServer,
+    /// Kill the running ADB server daemon
+    #[command(name = "kill-server")]
+    KillServer,
+    /// Pair with wireless device using 6-digit code
+    Pair {
+        /// Target device address (host:port)
+        addr: String,
+        /// 6-digit pairing code (prompted if omitted)
+        code: Option<String>,
+    },
 }
 
 fn resolve_target_addr(serial: Option<&str>, default_port: u16) -> String {
@@ -102,6 +119,65 @@ fn resolve_target_addr(serial: Option<&str>, default_port: u16) -> String {
         Some(s) => format!("{}:{}", s, default_port),
         None => format!("127.0.0.1:{}", default_port),
     }
+}
+
+/// Resolve transport for ADB commands based on CLI parameters (`serial`, `-d`) and device availability.
+///
+/// Dynamic resolution & fallback logic:
+/// 1. If `serial` contains `:` or is explicitly a TCP socket address, use `TcpTransport`.
+/// 2. If `use_usb` (-d) is true:
+///    - If `cfg(feature = "usb")`, open USB device (by `serial` if provided, else first device) via `UsbfsAdbDevice` and wrap in `UsbTransportAdapter`.
+///    - If `cfg(not(feature = "usb"))`, return error indicating USB support is not built in.
+/// 3. If `use_usb` is false and target is not explicitly TCP:
+///    - If `cfg(feature = "usb")`, attempt to open USB device.
+///    - If USB open succeeds, return USB transport adapter.
+///    - If USB open fails or no USB device is present, fall back to `TcpTransport` at `resolve_target_addr(serial, ADBD_PORT)`.
+pub fn open_adb_transport(
+    serial: Option<&str>,
+    use_usb: bool,
+    timeout: Duration,
+) -> Result<Box<dyn Transport>, Box<dyn std::error::Error>> {
+    let is_tcp_spec = serial.map_or(false, |s| s.contains(':'));
+    let addr = resolve_target_addr(serial, ADBD_PORT);
+
+    if is_tcp_spec {
+        let t = TcpTransport::connect_timeout(&addr, timeout)?;
+        return Ok(Box::new(t));
+    }
+
+    if use_usb {
+        #[cfg(feature = "usb")]
+        {
+            let dev = if let Some(s) = serial {
+                adb_protocol::UsbfsAdbDevice::open_by_serial(s)
+            } else {
+                adb_protocol::UsbfsAdbDevice::open_first()
+            }
+            .map_err(|e| format!("Failed to open ADB USB device: {e}"))?;
+            let adapter = adb_protocol::UsbTransportAdapter::new(dev);
+            return Ok(Box::new(adapter));
+        }
+        #[cfg(not(feature = "usb"))]
+        {
+            return Err("USB support is not enabled; rebuild with `--features usb`".into());
+        }
+    }
+
+    #[cfg(feature = "usb")]
+    {
+        let usb_res = if let Some(s) = serial {
+            adb_protocol::UsbfsAdbDevice::open_by_serial(s)
+        } else {
+            adb_protocol::UsbfsAdbDevice::open_first()
+        };
+        if let Ok(dev) = usb_res {
+            let adapter = adb_protocol::UsbTransportAdapter::new(dev);
+            return Ok(Box::new(adapter));
+        }
+    }
+
+    let t = TcpTransport::connect_timeout(&addr, timeout)?;
+    Ok(Box::new(t))
 }
 
 /// Information about the device received in the CNXN response banner.
@@ -415,17 +491,102 @@ fn run_shell(
     stream_shell_v2(transport, local_id, remote_id, capture)
 }
 
-/// Connect to ADB server (port 5037), switch transport, and execute a host command.
+/// Ensure ADB server daemon is running on 127.0.0.1:5037.
+/// If not running, autostarts it by spawning `adb-rs serve` in the background.
+pub fn ensure_server_running() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_server_running_at(ADB_SERVER_PORT)
+}
+
+pub fn ensure_server_running_at(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+
+    let addr = format!("127.0.0.1:{port}");
+    if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)).is_ok() {
+        return Ok(());
+    }
+
+    eprintln!("* daemon not running; starting it now at tcp:{port} *");
+    let exe = std::env::current_exe().unwrap_or_else(|_| "adb-rs".into());
+    let mut child = Command::new(&exe)
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn ADB server daemon: {e}"))?;
+
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(3);
+    while start.elapsed() < timeout {
+        if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(100)).is_ok() {
+            eprintln!("* daemon started successfully *");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(format!("ADB server daemon exited immediately with status: {status}").into());
+    }
+
+    Err(format!("Timeout waiting for ADB server daemon to start at {addr}").into())
+}
+
+/// Kill the running ADB server on 127.0.0.1:5037.
+pub fn kill_server() -> Result<(), Box<dyn std::error::Error>> {
+    kill_server_at(ADB_SERVER_PORT)
+}
+
+pub fn kill_server_at(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    use std::net::TcpStream;
+
+    let addr = format!("127.0.0.1:{port}");
+    let mut transport = match AdbServerTransport::connect_timeout(&addr, Duration::from_secs(1)) {
+        Ok(t) => t,
+        Err(_) => {
+            // Server not running
+            return Ok(());
+        }
+    };
+
+    transport.send_host_request("host:kill")?;
+    transport.read_status()?;
+
+    // Wait for process termination
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(3);
+    while start.elapsed() < timeout {
+        if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(100)).is_err() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    Ok(())
+}
+
+/// Connect to ADB server (port 5037), switch transport if needed, and execute a host command.
 fn host_command(
     serial: Option<&str>,
     request: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let addr = resolve_target_addr(serial, ADB_SERVER_PORT);
-    let mut server = AdbServerTransport::connect_timeout(&addr, Duration::from_secs(3))
-        .map_err(|e| format!("Cannot connect to ADB server at {addr}: {e}"))?;
+    let mut server = match AdbServerTransport::connect_timeout(&addr, Duration::from_secs(1)) {
+        Ok(s) => s,
+        Err(_) => {
+            ensure_server_running()?;
+            AdbServerTransport::connect_timeout(&addr, Duration::from_secs(3))
+                .map_err(|e| format!("Cannot connect to ADB server at {addr}: {e}"))?
+        }
+    };
 
-    // Switch transport to target device
-    server.switch_transport(serial)?;
+    if !request.starts_with("host:forward")
+        && !request.starts_with("host:reverse")
+        && !request.starts_with("host:devices")
+    {
+        server.switch_transport(serial)?;
+    }
 
     // Execute the host command
     let result = server.execute_host_command(request)
@@ -451,30 +612,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
         Commands::Devices => {
             println!("List of devices attached (adb-rs pure rust transport)");
-            match TcpTransport::connect_timeout(&addr, Duration::from_secs(2)) {
-                Ok(transport) => {
-                    match connect_and_handshake_with_tls_upgrade(
-                        transport,
-                        b"host::features=shell_v2,cmd",
-                        default_auth(),
-                    ) {
-                        Ok((device_info, _transport)) => {
-                            println!("{}\tdevice ({})", addr, device_info.banner.trim());
-                        }
-                        Err(e) => {
-                            eprintln!("Error during handshake with {}: {}", addr, e);
-                            std::process::exit(1);
-                        }
+            match host_command(cli.serial.as_deref(), "host:devices-l") {
+                Ok(resp) => {
+                    if !resp.is_empty() {
+                        print!("{resp}");
                     }
                 }
                 Err(e) => {
+                    let direct_addr = resolve_target_addr(cli.serial.as_deref(), ADBD_PORT);
+                    if let Ok(transport) = open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(2)) {
+                        if let Ok((device_info, _)) = connect_and_handshake_with_tls_upgrade(
+                            transport,
+                            b"host::features=shell_v2,cmd",
+                            default_auth(),
+                        ) {
+                            println!("{}\tdevice ({})", direct_addr, device_info.banner.trim());
+                            return Ok(());
+                        }
+                    }
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             }
         }
         Commands::Shell { command } => {
-            let transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
+            let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -498,7 +660,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stream_shell_v2(&mut transport, _lid, remote_id, false)?;
         }
         Commands::Push { local, remote } => {
-            let transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
+            let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -514,7 +676,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[adb-rs] Connected sync transport to {} for push '{}' -> '{}'", addr, local, remote);
         }
         Commands::Pull { remote, local } => {
-            let transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
+            let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -530,7 +692,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[adb-rs] Connected sync transport to {} for pull '{}' -> '{}'", addr, remote, local);
         }
         Commands::Reboot { target } => {
-            let transport: TcpTransport = match TcpTransport::connect_timeout(&addr, Duration::from_secs(3)) {
+            let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -778,7 +940,103 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[adb-rs] Starting ADB server on 127.0.0.1:5037 ...");
             server::run_server();
         }
+
+        Commands::StartServer => {
+            let addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            if std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)).is_ok() {
+                println!("* daemon already running *");
+            } else {
+                ensure_server_running()?;
+            }
+        }
+
+        Commands::KillServer => {
+            kill_server()?;
+        }
+
+        Commands::Pair { addr, code } => {
+            let code_str = match code {
+                Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+                _ => {
+                    print!("Enter 6-digit pairing code: ");
+                    std::io::stdout().flush()?;
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    input.trim().to_string()
+                }
+            };
+
+            let target_addr = if addr.contains(':') {
+                addr.clone()
+            } else {
+                format!("{}:5555", addr)
+            };
+
+            println!("[adb-rs] Connecting to wireless pairing endpoint {}...", target_addr);
+            let mut stream = match std::net::TcpStream::connect_timeout(
+                &target_addr.parse().map_err(|e| format!("Invalid target address {target_addr}: {e}"))?,
+                Duration::from_secs(5),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to connect to {target_addr}: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let mut client = match PairingClient::new(&code_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Pairing failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            println!("[adb-rs] Executing SPA wireless pairing handshake with {}...", target_addr);
+            match client.execute_pairing(&mut stream) {
+                Ok(_) => {
+                    println!("Successfully paired to {target_addr}");
+                }
+                Err(e) => {
+                    eprintln!("Failed to pair with {target_addr}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kill_server_when_not_running() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        assert!(kill_server_at(port).is_ok());
+    }
+
+    #[test]
+    fn test_server_autostart_and_kill() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            server::run_server_with_listener(listener);
+        });
+
+        let addr = format!("127.0.0.1:{port}");
+        assert!(std::net::TcpStream::connect(&addr).is_ok());
+
+        assert!(kill_server_at(port).is_ok());
+
+        handle.join().unwrap();
+
+        assert!(std::net::TcpStream::connect(&addr).is_err());
+    }
 }

@@ -2,6 +2,7 @@ pub mod auth;
 pub mod compress;
 pub mod constants;
 pub mod header;
+pub mod pairing;
 pub mod shell_v2;
 pub mod sync;
 #[cfg(feature = "tls")]
@@ -18,6 +19,10 @@ pub use auth::*;
 pub use compress::*;
 pub use constants::*;
 pub use header::{AdbMessageHeader, AuthType, HeaderError};
+pub use pairing::{
+    decrypt_payload, derive_pairing_key, encrypt_payload, PairingClient, PairingError,
+    PairingResultStatus, PairingState, SpaHeader, SpaMessageType, SpaPacket, SPA_HEADER_SIZE, SPA_MAGIC,
+};
 pub use shell_v2::{ShellV2Error, ShellV2Packet};
 pub use sync::{
     build_recv_v2_req, build_send_v2_req, build_sync_data_block, build_sync_data_chunk,

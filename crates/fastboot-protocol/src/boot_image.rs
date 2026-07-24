@@ -596,6 +596,77 @@ impl BootImage {
 // Build / Parse public API
 // ---------------------------------------------------------------------------
 
+/// Builder for constructing Android boot image payloads in memory.
+#[derive(Debug, Clone)]
+pub struct BootImageBuilder {
+    kernel: Vec<u8>,
+    ramdisk: Vec<u8>,
+    second: Vec<u8>,
+    dtb: Vec<u8>,
+    page_size: u32,
+    header_version: u32,
+}
+
+impl Default for BootImageBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BootImageBuilder {
+    pub fn new() -> Self {
+        Self {
+            kernel: Vec::new(),
+            ramdisk: Vec::new(),
+            second: Vec::new(),
+            dtb: Vec::new(),
+            page_size: DEFAULT_PAGE_SIZE,
+            header_version: 4,
+        }
+    }
+
+    pub fn kernel(mut self, kernel: Vec<u8>) -> Self {
+        self.kernel = kernel;
+        self
+    }
+
+    pub fn ramdisk(mut self, ramdisk: Vec<u8>) -> Self {
+        self.ramdisk = ramdisk;
+        self
+    }
+
+    pub fn second(mut self, second: Vec<u8>) -> Self {
+        self.second = second;
+        self
+    }
+
+    pub fn dtb(mut self, dtb: Vec<u8>) -> Self {
+        self.dtb = dtb;
+        self
+    }
+
+    pub fn page_size(mut self, page_size: u32) -> Self {
+        self.page_size = page_size;
+        self
+    }
+
+    pub fn header_version(mut self, version: u32) -> Self {
+        self.header_version = version;
+        self
+    }
+
+    pub fn build(&self) -> Vec<u8> {
+        build_boot_image(
+            &self.kernel,
+            &self.ramdisk,
+            &self.second,
+            &self.dtb,
+            self.page_size,
+            self.header_version,
+        )
+    }
+}
+
 /// Build a complete boot image from its components.
 ///
 /// `page_size` is only meaningful for v0–v2; v3/v4 use a fixed 4096-byte
@@ -1258,5 +1329,21 @@ mod tests {
         let encoded = hdr.encode();
         let decoded = BootImageHeader::decode(&encoded).unwrap();
         assert_eq!(&decoded.id[..], expected_id);
+    }
+
+    #[test]
+    fn test_boot_image_builder() {
+        let kernel_data = b"KERNEL_DATA".to_vec();
+        let ramdisk_data = b"RAMDISK_DATA".to_vec();
+
+        let image_bytes = BootImageBuilder::new()
+            .kernel(kernel_data.clone())
+            .ramdisk(ramdisk_data.clone())
+            .build();
+
+        assert!(image_bytes.starts_with(&BOOT_MAGIC));
+        let parsed = parse_boot_image(&image_bytes).unwrap();
+        assert_eq!(parsed.kernel, kernel_data);
+        assert_eq!(parsed.ramdisk, ramdisk_data);
     }
 }

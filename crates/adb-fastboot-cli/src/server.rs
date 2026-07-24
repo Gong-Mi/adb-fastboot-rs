@@ -320,19 +320,28 @@ fn usb_device_watcher(_registry: Arc<Mutex<TransportRegistry>>, _running: Arc<At
 // ---------------------------------------------------------------------------
 
 pub fn run_server() -> ! {
-    let running = Arc::new(AtomicBool::new(true));
-    let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+    run_server_on_port(ADB_SERVER_PORT);
+    std::process::exit(0);
+}
 
-    let listener = match TcpListener::bind(format!("127.0.0.1:{ADB_SERVER_PORT}")) {
+pub fn run_server_on_port(port: u16) {
+    let listener = match TcpListener::bind(format!("127.0.0.1:{port}")) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[adb-server] Cannot bind to 127.0.0.1:{ADB_SERVER_PORT}: {e}");
+            eprintln!("[adb-server] Cannot bind to 127.0.0.1:{port}: {e}");
             std::process::exit(1);
         }
     };
+    run_server_with_listener(listener);
+}
 
+pub fn run_server_with_listener(listener: TcpListener) {
+    let running = Arc::new(AtomicBool::new(true));
+    let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(ADB_SERVER_PORT);
     eprintln!(
-        "[adb-server] Listening on 127.0.0.1:{ADB_SERVER_PORT} (version {:08x})",
+        "[adb-server] Listening on 127.0.0.1:{port} (version {:08x})",
         SERVER_VERSION
     );
 
@@ -344,13 +353,10 @@ pub fn run_server() -> ! {
     });
 
     // Accept loop
-    listener.set_nonblocking(false).ok();
-    for stream in listener.incoming() {
-        if !running.load(Ordering::Relaxed) {
-            break;
-        }
-        match stream {
-            Ok(client) => {
+    listener.set_nonblocking(true).ok();
+    while running.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((client, _)) => {
                 let reg = Arc::clone(&registry);
                 let running_flag = Arc::clone(&running);
                 thread::spawn(move || {
@@ -359,12 +365,17 @@ pub fn run_server() -> ! {
                     }
                 });
             }
-            Err(e) => eprintln!("[adb-server] Accept error: {e}"),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("[adb-server] Accept error: {e}");
+                thread::sleep(Duration::from_millis(100));
+            }
         }
     }
 
     eprintln!("[adb-server] Shut down.");
-    std::process::exit(0);
 }
 
 // ---------------------------------------------------------------------------

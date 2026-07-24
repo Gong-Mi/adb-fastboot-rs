@@ -3,6 +3,7 @@ members = [
     "crates/adb-protocol",
     "crates/fastboot-protocol",
     "crates/adb-fastboot-cli",
+    "crates/aidl-rs",
 ]
 resolver = "2"
 

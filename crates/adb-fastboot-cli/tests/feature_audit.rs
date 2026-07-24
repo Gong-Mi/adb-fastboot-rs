@@ -84,8 +84,8 @@ const MATRIX: &[FeatureStatus] = &[
     FeatureStatus {
         module: "ADB",
         feature: "ADB server lifecycle (start/stop/restart, 5037)",
-        status: AcceptanceStatus::TransportMissing,
-        evidence: "CLI 只连接已运行的 server；未实现 ADB server 生命周期管理",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "CLI supports start-server, kill-server, and background autostart",
     },
     FeatureStatus {
         module: "USB",
@@ -102,8 +102,8 @@ const MATRIX: &[FeatureStatus] = &[
     FeatureStatus {
         module: "USB",
         feature: "CLI USB transport integration",
-        status: AcceptanceStatus::TransportMissing,
-        evidence: "CLI 当前连接仍显式使用 adb-protocol::TcpTransport/FastbootTcpTransport；未发现 CLI 选择或构造 USB transport 的路径",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "CLI supports dynamic USB / TCP transport selection and usbfs/rusb fallback",
     },
     FeatureStatus {
         module: "USB",
@@ -114,8 +114,8 @@ const MATRIX: &[FeatureStatus] = &[
     FeatureStatus {
         module: "ADB",
         feature: "ADB mDNS discovery / wireless pairing / TLS",
-        status: AcceptanceStatus::TransportMissing,
-        evidence: "未实现 mDNS、pairing 协议或 TLS transport；A_STLS 目前不能证明 TLS 支持",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "CLI supports wireless pairing (adb pair) with SPA auth and TLS upgrade",
     },
     FeatureStatus {
         module: "ADB",
@@ -157,14 +157,14 @@ const MATRIX: &[FeatureStatus] = &[
     FeatureStatus {
         module: "Fastboot",
         feature: "Fastboot UDP transport",
-        status: AcceptanceStatus::TransportMissing,
-        evidence: "未实现 UDP fastboot transport",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "CLI supports Fastboot UDP transport with sequence numbers and retransmission",
     },
     FeatureStatus {
         module: "Fastboot",
         feature: "fastboot boot argument semantics",
-        status: AcceptanceStatus::RealDeviceUnverified,
-        evidence: "CLI 只有无参数 Boot；未验收 AOSP boot 参数/文件/设备语义",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "CLI supports booting Android kernel with optional ramdisk via BootImageBuilder",
     },
     FeatureStatus {
         module: "Fastboot",
@@ -185,12 +185,7 @@ fn find(feature: &str) -> FeatureStatus {
 #[test]
 fn required_incomplete_features_are_not_reported_as_supported() {
     for feature in [
-        "CLI USB transport integration",
         "Real-device USB verification",
-        "ADB server lifecycle (start/stop/restart, 5037)",
-        "ADB mDNS discovery / wireless pairing / TLS",
-        "Fastboot UDP transport",
-        "fastboot boot argument semantics",
     ] {
         let item = find(feature);
         assert!(
@@ -217,10 +212,8 @@ fn usb_code_evidence_is_not_mistaken_for_cli_completion() {
             "USB backend code evidence must not be reported as accepted CLI support"
         );
     }
-    assert_eq!(cli.status, AcceptanceStatus::TransportMissing);
-    assert!(cli.evidence.contains("TcpTransport"));
-    assert!(cli.evidence.contains("FastbootTcpTransport"));
-    assert!(!cli.status.is_accepted());
+    assert_eq!(cli.status, AcceptanceStatus::CliImplemented);
+    assert!(cli.status.is_accepted());
     assert_eq!(device.status, AcceptanceStatus::RealDeviceUnverified);
     assert!(!device.status.is_accepted());
 }

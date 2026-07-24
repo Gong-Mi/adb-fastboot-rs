@@ -1,0 +1,10 @@
+[package]
+name = "aidl-rs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Android AIDL definition parser and Rust code generator"
+
+[dependencies]
+thiserror = "1.0"

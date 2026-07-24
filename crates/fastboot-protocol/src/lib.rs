@@ -3,6 +3,7 @@ pub mod command;
 pub mod response;
 pub mod sparse;
 pub mod transport;
+pub mod udp;
 #[cfg(feature = "usb")]
 pub mod usb;
 #[cfg(feature = "usb-rusb")]
@@ -10,6 +11,7 @@ pub mod usb_rusb;
 #[cfg(feature = "usb-android")]
 pub mod usb_android;
 
+pub use boot_image::{BootImage, BootImageBuilder, BootImageHeader, build_boot_image};
 pub use command::*;
 pub use response::{FastbootResponse, FastbootResponseError};
 pub use sparse::{
@@ -18,6 +20,7 @@ pub use sparse::{
     SPARSE_HEADER_MAGIC,
 };
 pub use transport::{Connect, FastbootTcpTransport, FastbootTransport, FastbootTransportError};
+pub use udp::{FastbootUdpTransport, UdpHeader};
 #[cfg(feature = "usb")]
 pub use usb::{
     BulkIo, FastbootUsbTransport, UsbDescriptor, UsbEndpointDirection, UsbEndpointInfo,
