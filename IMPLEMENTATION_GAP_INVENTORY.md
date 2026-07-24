@@ -6,7 +6,7 @@ This file separates design/implementation work from device acceptance. Passing u
 
 ## Current count
 
-There are 33 identified design items that are not fully landed in code:
+There are 32 identified design items that are not fully landed in code:
 
 - ADB: 10
 - Fastboot CLI: 16
@@ -37,13 +37,12 @@ The count is an implementation-gap count, not an acceptance score.
 5. AVB footer/vbmeta handling.
 6. `vendor_boot` ramdisk repacking.
 7. Filesystem image generation for `format`.
-8. `continue` command.
-9. `flashall` command.
-10. Complete `update` task orchestration: `fastboot-info.txt`, slots, snapshots, secondary slot.
-11. Fetch offset/size/slot orchestration.
-12. `wipe-super`.
-13. Persistent `connect`/`disconnect` device storage.
-14. Global options such as skip-reboot, skip-secondary, force, slot, disable-verity, and disable-verification.
+8. `flashall` command.
+9. Complete `update` task orchestration: `fastboot-info.txt`, slots, snapshots, secondary slot.
+10. Fetch offset/size/slot orchestration.
+11. `wipe-super`.
+12. Persistent `connect`/`disconnect` device storage.
+13. Global options such as skip-reboot, skip-secondary, force, slot, disable-verity, and disable-verification.
 
 Already landed and therefore not counted as gaps here:
 
@@ -53,6 +52,7 @@ Already landed and therefore not counted as gaps here:
 - GSI command argument wiring
 - `snapshot-update [cancel|merge]`
 - `signature FILE`
+- `continue`
 - flashing action validation
 
 ## Fastboot protocol/image — 5 gaps
@@ -74,15 +74,14 @@ Already landed and therefore not counted as gaps here:
 
 ### Can be implemented now from local source evidence
 
-1. Fastboot `continue`, snapshot-update, and command formatters.
-2. Fastboot global option model and slot helper layer.
-3. Fetch range request and max-fetch-size chunking.
-4. Fastboot `devices -l` output model.
-5. ADB `sendrecv_v2` compressed transfer path.
-6. ADB `A_STLS` state machine boundary and typed fallback behavior.
-7. ADB mDNS record/service parser, without claiming discovery until a backend exists.
-8. AIDL validation improvements.
-9. Fastboot vendor_boot parser/building primitives, before CLI repack integration.
+1. Fastboot global option model and slot helper layer.
+2. Fetch range request and max-fetch-size chunking.
+3. Fastboot `devices -l` output model.
+4. ADB `sendrecv_v2` compressed transfer path.
+5. ADB `A_STLS` state machine boundary and typed fallback behavior.
+6. ADB mDNS record/service parser, without claiming discovery until a backend exists.
+7. AIDL validation improvements.
+8. Fastboot vendor_boot parser/building primitives, before CLI repack integration.
 
 ### Requires a deliberate dependency/architecture decision before construction
 
