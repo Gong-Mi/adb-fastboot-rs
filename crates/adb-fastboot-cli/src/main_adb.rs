@@ -499,6 +499,7 @@ fn stream_shell_v2(
     capture: bool,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
     let mut captured = if capture { Some(Vec::new()) } else { None };
+    let mut exit_code = None;
     loop {
         let (hdr, payload) = match transport.recv_message() {
             Ok(msg) => msg,
@@ -537,10 +538,7 @@ fn stream_shell_v2(
                                     std::io::stderr().flush()?;
                                 }
                                 ShellV2Packet::ExitCode(code) => {
-                                    if code != 0 {
-                                        std::process::exit(code as i32);
-                                    }
-                                    return Ok(captured);
+                                    exit_code = Some(code);
                                 }
                                 _ => {}
                             }
@@ -561,6 +559,13 @@ fn stream_shell_v2(
             A_CLSE => {
                 let ack = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
                 let _ = transport.send_message(&ack, &[]);
+                if let Some(code) = exit_code {
+                    if code != 0 {
+                        return Err(format!("remote shell exited with code {code}").into());
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                    return Ok(captured);
+                }
                 break;
             }
             _ => {}
@@ -732,11 +737,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             };
-            let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+            let (_info, mut transport) = match connect_and_handshake_with_tls_upgrade(
                 transport,
                 b"host::features=shell_v2,cmd",
                 default_auth(),
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(e) if e.to_string().contains("0x45534c43") => {
+                    // adbd may emit CLSE while the previous USB transport is still
+                    // being torn down. Re-enumerate instead of treating that stale
+                    // close packet as a handshake failure.
+                    std::thread::sleep(Duration::from_secs(15));
+                    let retry_transport = open_adb_transport(
+                        cli.serial.as_deref(),
+                        cli.d,
+                        Duration::from_secs(3),
+                    )?;
+                    connect_and_handshake_with_tls_upgrade(
+                        retry_transport,
+                        b"host::features=shell_v2,cmd",
+                        default_auth(),
+                    )?
+                }
+                Err(e) => return Err(e),
+            };
 
             let cmd_str = command.join(" ");
             let dest = if cmd_str.is_empty() {
