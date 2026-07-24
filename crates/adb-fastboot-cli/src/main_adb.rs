@@ -211,8 +211,20 @@ fn load_or_create_auth() -> Result<AdbAuth, Box<dyn std::error::Error>> {
     if private_path.is_file() {
         let pem = std::fs::read_to_string(&private_path)?;
         let private_key = adb_protocol::auth::load_private_key_from_pem(&pem)?;
-        let auth = AdbAuth::new(private_key, "adb-rs@localhost");
-        if !public_path.is_file() {
+        let mut label = "adb-rs@localhost".to_string();
+        let auth = AdbAuth::new(private_key, &label);
+
+        if public_path.is_file() {
+            let public_text = std::fs::read_to_string(&public_path)?;
+            if let Ok((public_key, public_label)) = adb_protocol::auth::parse_adb_public_key_string(&public_text) {
+                if public_key == *auth.public_key() {
+                    label = if public_label.is_empty() { label } else { public_label };
+                }
+            }
+        }
+
+        let auth = AdbAuth::new(auth.private_key().clone(), &label);
+        if !public_path.is_file() || std::fs::read(&public_path)? != auth.build_rsakey_payload()? {
             write_auth_public_key(&auth, &public_path)?;
         }
         return Ok(auth);
