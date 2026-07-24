@@ -1,15 +1,15 @@
 # Implementation Gap Inventory
 
-Baseline: `f556fd9`
+Baseline: `c28f6f6`
 
 This file separates design/implementation work from device acceptance. Passing unit, wire, or fake-peer tests is construction evidence only; it is not real-device acceptance.
 
 ## Current count
 
-There are 32 identified design items that are not fully landed in code:
+There are 31 identified design items that are not fully landed in code:
 
 - ADB: 10
-- Fastboot CLI: 16
+- Fastboot CLI: 12
 - Fastboot protocol/image: 5
 - AIDL: 4
 
@@ -39,10 +39,9 @@ The count is an implementation-gap count, not an acceptance score.
 7. Filesystem image generation for `format`.
 8. `flashall` command.
 9. Complete `update` task orchestration: `fastboot-info.txt`, slots, snapshots, secondary slot.
-10. Fetch offset/size/slot orchestration.
-11. `wipe-super`.
-12. Persistent `connect`/`disconnect` device storage.
-13. Global options such as skip-reboot, skip-secondary, force, slot, disable-verity, and disable-verification.
+10. `wipe-super`.
+11. Persistent `connect`/`disconnect` device storage.
+12. Global options such as skip-reboot, skip-secondary, force, slot, disable-verity, and disable-verification.
 
 Already landed and therefore not counted as gaps here:
 
@@ -52,6 +51,7 @@ Already landed and therefore not counted as gaps here:
 - GSI command argument wiring
 - `snapshot-update [cancel|merge]`
 - `signature FILE`
+- Fastboot fetch offset/size/slot ranges and max-fetch-size chunking
 - `continue`
 - flashing action validation
 
