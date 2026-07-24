@@ -21,8 +21,23 @@ struct Cli {
     #[arg(long, global = true)]
     usb: bool,
 
+    /// Use SLOT for slot-suffixed partitions (`all` and `other` require
+    /// multi-slot/device discovery and are reserved for orchestration).
+    #[arg(long, global = true, value_parser = parse_slot_value)]
+    slot: Option<String>,
+
+    /// Set the active slot after the selected command (`--set-active[=SLOT]`).
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
+    set_active: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+fn parse_slot_value(s: &str) -> Result<String, String> {
+    fastboot_protocol::SlotSelection::parse(Some(s))
+        .map(|_| s.to_string())
+        .map_err(|error| error.to_string())
 }
 
 fn parse_u64(s: &str) -> Result<u64, String> {
@@ -152,9 +167,7 @@ enum Commands {
     Fetch {
         partition: String,
         out_file: String,
-        /// Optional A/B slot (a/b); appended to PARTITION on the wire.
-        #[arg(long)]
-        slot: Option<String>,
+
         /// Starting byte offset (decimal or 0x-prefixed hexadecimal).
         #[arg(long, value_parser = parse_u64)]
         offset: Option<u64>,
@@ -532,18 +545,6 @@ fn handle_boot_response(
     Ok(())
 }
 
-fn fetch_partition_name(partition: &str, slot: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
-    let Some(slot) = slot else { return Ok(partition.to_string()); };
-    let slot = slot.strip_prefix('_').unwrap_or(slot);
-    if slot.is_empty() || !slot.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(format!("invalid fetch slot: {slot}").into());
-    }
-    if partition.ends_with(&format!("_{slot}")) {
-        Ok(partition.to_string())
-    } else {
-        Ok(format!("{partition}_{slot}"))
-    }
-}
 
 fn getvar_value(
     transport: &mut FastbootConnection,
@@ -565,12 +566,12 @@ fn fetch_to_file(
     out_file: &str,
     offset: Option<u64>,
     size: Option<u64>,
-    slot: Option<&str>,
+    slot: &fastboot_protocol::SlotSelection,
 ) -> Result<fastboot_protocol::FastbootResponse, Box<dyn std::error::Error>> {
     if size.is_some() && offset.is_none() {
         return Err("fetch size requires an offset".into());
     }
-    let partition = fetch_partition_name(partition, slot)?;
+    let partition = slot.partition_name(partition)?;
     let max_fetch_size = parse_max_download_size(&getvar_value(transport, "max-fetch-size")?)
         .ok_or("device returned an invalid max-fetch-size")? as u64;
     if max_fetch_size == 0 {
@@ -1269,6 +1270,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let addr = resolve_target_addr(cli.serial.as_deref(), 5554);
     let use_usb = cli.usb;
+    let slot_selection = fastboot_protocol::SlotSelection::parse(cli.slot.as_deref())?;
+    // `--set-active[=SLOT]` is parsed and validated here. Applying it around
+    // flashall/update requires orchestration deliberately outside this slice.
+    if let Some(value) = cli.set_active.as_deref() {
+        let requested = if value.is_empty() { None } else { Some(value) };
+        match fastboot_protocol::SlotSelection::parse(requested)? {
+            fastboot_protocol::SlotSelection::Named(_) | fastboot_protocol::SlotSelection::Current => {}
+            fastboot_protocol::SlotSelection::All | fastboot_protocol::SlotSelection::Other => {
+                return Err("--set-active requires a concrete slot (or no value)".into());
+            }
+        }
+    }
 
     match cli.command {
         Commands::Devices => {
@@ -1363,6 +1376,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[fastboot-rs] Set active slot '{}' response: {:?}", slot, resp);
         }
         Commands::Flash { partition, file } => {
+            let wire_partition = slot_selection.partition_name(&partition)?;
             // Resolve image path: use explicit file if provided, otherwise
             // fall back to ANDROID_PRODUCT_OUT/<partition>.img (AOSP find_item behavior)
             let image_path = match file {
@@ -1535,7 +1549,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(1);
                     }
 
-                    let flash_cmd = fastboot_protocol::flash(&partition);
+                    let flash_cmd = fastboot_protocol::flash(&wire_partition);
                     transport.send_cmd(&flash_cmd)?;
                     let flash_resp = transport.recv_response()?;
                     println!(
@@ -1608,13 +1622,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Step 3: Send flash command
-                let flash_cmd = fastboot_protocol::flash(&partition);
+                let flash_cmd = fastboot_protocol::flash(&wire_partition);
                 transport.send_cmd(&flash_cmd)?;
                 let flash_resp = transport.recv_response()?;
                 println!("[fastboot-rs] Flash response for partition '{}': {:?}", partition, flash_resp);
             }
         }
         Commands::Erase { partition } => {
+            let wire_partition = slot_selection.partition_name(&partition)?;
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1622,7 +1637,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             };
-            let cmd = format!("erase:{}", partition);
+            let cmd = format!("erase:{}", wire_partition);
             transport.send_cmd(&cmd)?;
             let resp = transport.recv_response()?;
             println!("[fastboot-rs] Erase response: {:?}", resp);
@@ -1764,6 +1779,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ramdisk,
             second,
         } => {
+            let wire_partition = slot_selection.partition_name(&partition)?;
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1816,7 +1832,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // download + flash 流程
-            download_and_flash_payload(&mut transport, &boot_payload, &partition)?;
+            download_and_flash_payload(&mut transport, &boot_payload, &wire_partition)?;
 
             // 读取 flash 响应
             let flash_resp = transport.recv_response()?;
@@ -1842,7 +1858,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Fetch { partition, out_file, offset, size, slot } => {
+        Commands::Fetch { partition, out_file, offset, size } => {
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1856,7 +1872,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &out_file,
                 offset,
                 size,
-                slot.as_deref(),
+                &slot_selection,
             )?;
             println!(
                 "[fastboot-rs] Fetched partition '{}' to '{}': {:?}",
@@ -1937,6 +1953,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Format { partition, partition_type } => {
+            let wire_partition = slot_selection.partition_name(&partition)?;
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1945,8 +1962,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let cmd = match &partition_type {
-                Some(pt) => format!("format:{}:{}", pt, partition),
-                None => format!("format:{}", partition),
+                Some(pt) => format!("format:{}:{}", pt, wire_partition),
+                None => format!("format:{}", wire_partition),
             };
             transport.send_cmd(&cmd)?;
             let resp = transport.recv_response()?;
@@ -2288,6 +2305,28 @@ mod tests {
             let cli = Cli::try_parse_from(args).expect("--usb should be a global option");
             assert!(cli.usb);
             assert!(matches!(cli.command, Commands::Getvar { ref variable } if variable == "version"));
+        }
+    }
+
+    #[test]
+    fn cli_accepts_global_aosp_slot_options() {
+        let cli = Cli::try_parse_from([
+            "fastboot-rs", "--slot", "b", "--set-active=b", "erase", "userdata",
+        ])
+        .expect("global slot options should parse before a command");
+        assert_eq!(cli.slot.as_deref(), Some("b"));
+        assert_eq!(cli.set_active.as_deref(), Some("b"));
+
+        let cli = Cli::try_parse_from(["fastboot-rs", "getvar", "all", "--slot", "other"])
+            .expect("global slot option should parse after a command");
+        assert_eq!(cli.slot.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn cli_rejects_malformed_slot_values() {
+        for value in ["_a", "A", "a1", ""] {
+            let cli = Cli::try_parse_from(["fastboot-rs", "--slot", value, "erase", "userdata"]);
+            assert!(cli.is_err(), "slot value {value:?} must be rejected");
         }
     }
 

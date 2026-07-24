@@ -1,5 +1,7 @@
 pub mod boot_image;
+pub mod vendor_boot;
 pub mod command;
+pub mod slot;
 pub mod response;
 pub mod sparse;
 pub mod transport;
@@ -13,6 +15,7 @@ pub mod usb_android;
 
 pub use boot_image::{BootImage, BootImageBuilder, BootImageHeader, build_boot_image};
 pub use command::*;
+pub use slot::{SlotError, SlotSelection};
 pub use response::{FastbootResponse, FastbootResponseError};
 pub use sparse::{
     SparseChunk, SparseChunkBuilder, SparseChunkHeader, SparseError, SparseFile, SparseHeader,
