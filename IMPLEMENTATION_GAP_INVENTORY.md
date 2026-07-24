@@ -1,21 +1,21 @@
 # Implementation Gap Inventory
 
-Baseline: `c28f6f6`
+Baseline: `0e5e263`
 
 This file separates design/implementation work from device acceptance. Passing unit, wire, or fake-peer tests is construction evidence only; it is not real-device acceptance.
 
 ## Current count
 
-There are 31 identified design items that are not fully landed in code:
+There are 30 identified design items that are not fully landed in code:
 
-- ADB: 10
+- ADB: 9
 - Fastboot CLI: 12
 - Fastboot protocol/image: 5
 - AIDL: 4
 
 The count is an implementation-gap count, not an acceptance score.
 
-## ADB — 10 gaps
+## ADB — 9 gaps
 
 1. Complete `A_STLS` upgrade state machine.
 2. TLS transport integration and plaintext fallback state handling.
@@ -24,11 +24,10 @@ The count is an implementation-gap count, not an acceptance score.
 5. mDNS discovery (`_adb-tls-pairing`, `_adb-tls-connect`).
 6. ADB server USB watcher and hotplug lifecycle.
 7. Complete USB claim/reset/permission lifecycle.
-8. Actual `sendrecv_v2` compressed transfer path, not only packet structures/flags.
-9. `exec-out`, PTY, and transport-feature parity.
-10. Install/uninstall host workflows.
+8. `exec-out`, PTY, and transport-feature parity.
+9. Install/uninstall host workflows.
 
-## Fastboot CLI — 16 gaps
+## Fastboot CLI — 12 gaps
 
 1. `devices -l` and network-device listing.
 2. Slot management and global slot options.
@@ -77,11 +76,10 @@ Already landed and therefore not counted as gaps here:
 1. Fastboot global option model and slot helper layer.
 2. Fetch range request and max-fetch-size chunking.
 3. Fastboot `devices -l` output model.
-4. ADB `sendrecv_v2` compressed transfer path.
-5. ADB `A_STLS` state machine boundary and typed fallback behavior.
-6. ADB mDNS record/service parser, without claiming discovery until a backend exists.
-7. AIDL validation improvements.
-8. Fastboot vendor_boot parser/building primitives, before CLI repack integration.
+4. ADB `A_STLS` state machine boundary and typed fallback behavior.
+5. ADB mDNS record/service parser, without claiming discovery until a backend exists.
+6. AIDL validation improvements.
+7. Fastboot vendor_boot parser/building primitives, before CLI repack integration.
 
 ### Requires a deliberate dependency/architecture decision before construction
 
