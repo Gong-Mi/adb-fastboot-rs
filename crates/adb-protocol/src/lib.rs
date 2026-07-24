@@ -1,12 +1,16 @@
 pub mod auth;
 pub mod compress;
 pub mod constants;
+pub mod crypto;
 pub mod header;
 pub mod mdns;
 pub mod pairing;
+pub mod pairing_auth;
+pub mod pairing_connection;
 pub mod shell_v2;
 pub mod stls;
 pub mod sync;
+pub mod sysdeps;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod transport;
