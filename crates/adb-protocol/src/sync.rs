@@ -11,6 +11,8 @@ pub enum SyncProtocolError {
     InvalidPath(String),
     #[error("Invalid message structure or size overflow: {0}")]
     InvalidMessage(String),
+    #[error("Unsupported sendrecv_v2 compression flags: 0x{0:08x}")]
+    UnsupportedCompression(u32),
 }
 
 /// Helper function to validate path inputs for ADB SYNC requests.
@@ -352,6 +354,93 @@ pub fn build_sync_data_block(
     Ok(())
 }
 
+fn compression_from_v2_flags(flags: u32) -> Result<crate::compress::CompressionType, SyncProtocolError> {
+    let codec_flags = crate::constants::SYNC_FLAG_BROTLI
+        | crate::constants::SYNC_FLAG_LZ4
+        | crate::constants::SYNC_FLAG_ZSTD;
+    let unknown = flags & !(codec_flags | crate::constants::SYNC_FLAG_DRY_RUN);
+    let selected = flags & codec_flags;
+    if unknown != 0 || selected.count_ones() > 1 {
+        return Err(SyncProtocolError::UnsupportedCompression(flags));
+    }
+    crate::compress::CompressionType::from_flag(selected)
+        .map_err(|_| SyncProtocolError::UnsupportedCompression(flags))
+}
+
+/// Encoder for the sendrecv_v2 setup and compressed DATA frames.
+#[derive(Debug, Clone)]
+pub struct SyncV2Encoder {
+    compression: crate::compress::CompressionType,
+    setup: Vec<u8>,
+}
+
+impl SyncV2Encoder {
+    pub fn new_send(path: &str, mode: u32, flags: u32) -> Result<Self, SyncProtocolError> {
+        let compression = compression_from_v2_flags(flags)?;
+        let mut setup = Vec::new();
+        build_send_v2_req(path, mode, flags, &mut setup)?;
+        Ok(Self { compression, setup })
+    }
+
+    pub fn new_recv(path: &str, flags: u32) -> Result<Self, SyncProtocolError> {
+        let compression = compression_from_v2_flags(flags)?;
+        let mut setup = Vec::new();
+        build_recv_v2_req(path, flags, &mut setup)?;
+        Ok(Self { compression, setup })
+    }
+
+    pub fn encode_setup(&self, out: &mut Vec<u8>) -> Result<(), SyncProtocolError> {
+        out.extend_from_slice(&self.setup);
+        Ok(())
+    }
+
+    pub fn encode_data(&self, data: &[u8], out: &mut Vec<u8>) -> Result<(), SyncProtocolError> {
+        for chunk in data.chunks(crate::constants::SYNC_DATA_MAX) {
+            let compressed = crate::compress::compress(self.compression, chunk)
+                .map_err(|e| SyncProtocolError::InvalidMessage(e.to_string()))?;
+            build_sync_data_block(&compressed, out)?;
+        }
+        Ok(())
+    }
+}
+
+/// Decoder for one or more sendrecv_v2 compressed DATA frames.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncV2Decoder {
+    compression: crate::compress::CompressionType,
+}
+
+impl SyncV2Decoder {
+    pub fn new(flags: u32) -> Result<Self, SyncProtocolError> {
+        Ok(Self { compression: compression_from_v2_flags(flags)? })
+    }
+
+    pub fn decode_data_frame(&self, frame: &[u8]) -> Result<Vec<u8>, SyncProtocolError> {
+        let header = SyncMessageHeader::decode(frame)?;
+        if header.id != crate::constants::SYNC_DATA {
+            return Err(SyncProtocolError::InvalidMessage(
+                "sendrecv_v2 frame is not SYNC_DATA".to_string(),
+            ));
+        }
+        let length = usize::try_from(header.length).map_err(|_| {
+            SyncProtocolError::InvalidMessage("DATA length conversion failed".to_string())
+        })?;
+        if length > crate::constants::MAX_PAYLOAD_V2 as usize || frame.len() != 8 + length {
+            return Err(SyncProtocolError::InvalidMessage(
+                "DATA frame length does not match its payload".to_string(),
+            ));
+        }
+        let decoded = crate::compress::decompress(self.compression, &frame[8..])
+            .map_err(|e| SyncProtocolError::InvalidMessage(e.to_string()))?;
+        if decoded.len() > crate::constants::SYNC_DATA_MAX {
+            return Err(SyncProtocolError::InvalidMessage(
+                "decompressed DATA exceeds SYNC_DATA_MAX".to_string(),
+            ));
+        }
+        Ok(decoded)
+    }
+}
+
 /// ADB DENT (directory entry) response struct (20 bytes header + namelen bytes name)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncDentResponse {
@@ -640,6 +729,56 @@ mod tests {
 
         let err = SyncDentResponse::decode(&buf);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_sendrecv_v2_compressed_data_is_framed_and_roundtrips() {
+        let payload = vec![b'a'; crate::constants::SYNC_DATA_MAX + 17];
+        let encoder = SyncV2Encoder::new_send(
+            "/data/local/tmp/test.bin",
+            0o100644,
+            crate::constants::SYNC_FLAG_ZSTD,
+        )
+        .unwrap();
+        let mut setup = Vec::new();
+        encoder.encode_setup(&mut setup).unwrap();
+        let setup_header = SyncMessageHeader::decode(&setup).unwrap();
+        assert_eq!(setup_header.id, crate::constants::SYNC_SEND_V2);
+        assert_eq!(LittleEndian::read_u32(&setup[8 + setup_header.length as usize + 8..]), crate::constants::SYNC_FLAG_ZSTD);
+
+        let mut framed = Vec::new();
+        encoder.encode_data(&payload, &mut framed).unwrap();
+        let decoder = SyncV2Decoder::new(crate::constants::SYNC_FLAG_ZSTD).unwrap();
+        let mut decoded = Vec::new();
+        let mut cursor = framed.as_slice();
+        while !cursor.is_empty() {
+            let header = SyncMessageHeader::decode(cursor).unwrap();
+            let frame_len = 8 + header.length as usize;
+            decoded.extend_from_slice(&decoder.decode_data_frame(&cursor[..frame_len]).unwrap());
+            cursor = &cursor[frame_len..];
+        }
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_sendrecv_v2_rejects_unsupported_or_malformed_frames() {
+        assert!(matches!(
+            SyncV2Decoder::new(crate::constants::SYNC_FLAG_LZ4 | crate::constants::SYNC_FLAG_ZSTD),
+            Err(SyncProtocolError::UnsupportedCompression(_))
+        ));
+        let decoder = SyncV2Decoder::new(crate::constants::SYNC_FLAG_NONE).unwrap();
+        let mut frame = Vec::new();
+        build_sync_data_block(b"payload", &mut frame).unwrap();
+        frame[4] = 0xff;
+        assert!(matches!(
+            decoder.decode_data_frame(&frame),
+            Err(SyncProtocolError::InvalidMessage(_))
+        ));
+        frame[4..8].copy_from_slice(&999u32.to_le_bytes());
+        assert!(matches!(
+            decoder.decode_data_frame(&frame),
+            Err(SyncProtocolError::InvalidMessage(_))
+        ));
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub use sync::{
     build_sync_done, build_sync_done_u64, build_sync_list_req, build_sync_recv_req,
     build_sync_send_req, build_sync_stat_req, saturating_mtime_u32, SyncDentResponse,
     SyncDentV2Response, SyncMessageHeader, SyncProtocolError, SyncStatResponse, SyncStatV2Response,
+    SyncV2Decoder, SyncV2Encoder,
 };
 pub use transport::{AdbServerTransport, Connect, TcpTransport, Transport, TransportError};
 #[cfg(feature = "tls")]
