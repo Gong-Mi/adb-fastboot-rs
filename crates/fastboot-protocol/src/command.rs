@@ -68,6 +68,14 @@ pub fn resize_logical_partition(partition: &str, size: u64) -> String {
     format!("resize-logical-partition:{}:{}", partition, size)
 }
 
+/// Formats a snapshot-update command for Fastboot.
+///
+/// AOSP sends `snapshot-update:<command>`, where the command may be empty,
+/// `cancel`, or `merge`.
+pub fn snapshot_update(command: Option<&str>) -> String {
+    format!("snapshot-update:{}", command.unwrap_or(""))
+}
+
 /// Formats a `boot` command for Fastboot.
 ///
 
@@ -141,6 +149,13 @@ mod tests {
             resize_logical_partition("system_a", 2097152),
             "resize-logical-partition:system_a:2097152"
         );
+    }
+
+    #[test]
+    fn test_snapshot_update() {
+        assert_eq!(snapshot_update(None), "snapshot-update:");
+        assert_eq!(snapshot_update(Some("cancel")), "snapshot-update:cancel");
+        assert_eq!(snapshot_update(Some("merge")), "snapshot-update:merge");
     }
 
     #[test]

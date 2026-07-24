@@ -154,6 +154,11 @@ enum Commands {
     },
     /// Continue booting after flash operations (re-send to device)
     Continue,
+    /// Send a snapshot update command (cancel or merge).
+    SnapshotUpdate {
+        #[arg(value_parser = ["cancel", "merge"])]
+        action: Option<String>,
+    },
     /// Shut down the device (sends reboot-shutdown)
     Shutdown,
     /// Format a partition (sends format:<partition> or format:<partition_type>:<partition>)
@@ -1769,6 +1774,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::SnapshotUpdate { action } => {
+            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let cmd = fastboot_protocol::snapshot_update(action.as_deref());
+            transport.send_cmd(&cmd)?;
+            let response = recv_and_print_info(&mut transport)?;
+            match response {
+                fastboot_protocol::FastbootResponse::Fail(reason) => {
+                    return Err(format!("{} failed: {}", cmd, reason).into());
+                }
+                other => println!("[fastboot-rs] Snapshot update response: {:?}", other),
+            }
+        }
         Commands::Format { partition, partition_type } => {
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
@@ -2262,6 +2285,14 @@ mod tests {
             };
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn snapshot_update_accepts_only_aosp_actions() {
+        assert!(Cli::try_parse_from(["fastboot-rs", "snapshot-update"]).is_ok());
+        assert!(Cli::try_parse_from(["fastboot-rs", "snapshot-update", "cancel"]).is_ok());
+        assert!(Cli::try_parse_from(["fastboot-rs", "snapshot-update", "merge"]).is_ok());
+        assert!(Cli::try_parse_from(["fastboot-rs", "snapshot-update", "bad"]).is_err());
     }
 
     #[test]
