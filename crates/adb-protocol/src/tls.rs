@@ -166,18 +166,6 @@ pub fn create_server_config(
 // TLS handshake
 // ---------------------------------------------------------------------------
 
-/// Perform a TLS 1.3 client handshake over the given stream.
-///
-/// # Parameters
-/// - `stream`: any `Read + Write` transport (e.g. `TcpStream`).
-/// - `config`: the client config from [`create_tls_config`].
-/// - `server_name`: the SNI hostname (use `"adb"` unless you have a specific
-///   need; this affects certificate verification, which is accept-any in our
-///   config).
-///
-/// # Returns
-/// A [`TlsStream`] wrapping the original stream with TLS encryption.
-///
 /// Export the 64-byte AOSP pairing secret after a completed TLS 1.3 handshake.
 /// AOSP uses exporter label `adb-label`, no context, and 64 bytes.
 pub fn export_pairing_key_material(connection: &rustls::ClientConnection) -> Result<[u8; 64], TlsError> {
@@ -186,17 +174,42 @@ pub fn export_pairing_key_material(connection: &rustls::ClientConnection) -> Res
     Ok(output)
 }
 
-/// # Errors
-/// Returns [`TlsError::Handshake`] if the server name is invalid or the
-/// TLS handshake fails.
+/// Perform a TLS 1.3 client handshake over the given stream.
+///
+/// Unlike [`perform_tls_handshake`], this function drives the handshake to
+/// completion before returning. This is required before using the TLS exporter
+/// for ADB pairing; exporting from a merely-constructed `ClientConnection`
+/// would not produce the AOSP `adb-label` secret for an established channel.
+///
+/// Returns the encrypted stream and the 64-byte AOSP pairing exporter output.
+pub fn perform_tls_handshake_with_pairing_export<IO: Read + Write>(
+    stream: IO,
+    config: Arc<rustls::ClientConfig>,
+    server_name: &str,
+) -> Result<(TlsStream<rustls::ClientConnection, IO>, [u8; 64]), TlsError> {
+    let server_name = ServerName::try_from(server_name.to_string())
+        .map_err(|_| TlsError::Handshake(format!("invalid server name: {server_name}")))?;
+    let mut connection = rustls::ClientConnection::new(config, server_name)?;
+    let mut io = stream;
+    while connection.is_handshaking() {
+        connection.complete_io(&mut io)?;
+    }
+    let exported = export_pairing_key_material(&connection)?;
+    Ok((rustls::StreamOwned::new(connection, io), exported))
+}
+
+/// Construct a TLS client stream. The handshake is driven lazily by the first
+/// read/write, matching `rustls::StreamOwned` semantics.
+///
+/// Use [`perform_tls_handshake_with_pairing_export`] when the caller needs the
+/// AOSP pairing exporter immediately after the handshake.
 pub fn perform_tls_handshake<IO: Read + Write>(
     stream: IO,
     config: Arc<rustls::ClientConfig>,
     server_name: &str,
 ) -> Result<TlsStream<rustls::ClientConnection, IO>, TlsError> {
-    let server_name =
-        ServerName::try_from(server_name.to_string()).map_err(|_| TlsError::Handshake(format!("invalid server name: {server_name}")))?;
-
+    let server_name = ServerName::try_from(server_name.to_string())
+        .map_err(|_| TlsError::Handshake(format!("invalid server name: {server_name}")))?;
     let connection = rustls::ClientConnection::new(config, server_name)?;
     Ok(rustls::StreamOwned::new(connection, stream))
 }
@@ -391,7 +404,10 @@ mod tests {
         // -- Client side --
         let client_cfg = create_tls_config(cert_der, key_der).unwrap();
         let stream = TcpStream::connect(server_addr).expect("client connect");
-        let mut tls_stream = perform_tls_handshake(stream, client_cfg, "adb").expect("client handshake");
+        let (mut tls_stream, pairing_export) =
+            perform_tls_handshake_with_pairing_export(stream, client_cfg, "adb")
+                .expect("client handshake");
+        assert!(pairing_export.iter().any(|byte| *byte != 0));
 
         // Send a message
         let msg = b"hello from A_STLS";
