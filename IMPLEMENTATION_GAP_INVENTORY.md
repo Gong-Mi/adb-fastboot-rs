@@ -85,11 +85,14 @@ Already landed and therefore not counted as gaps here:
 
 ### Requires a deliberate dependency/architecture decision before construction
 
+Any C/C++ fallback must be vendored into this repository, including all required public/private headers and build metadata. A system-preinstalled library or header is not an acceptable final dependency. The vendored component must record its upstream source, exact version/commit, license, patches, and reproducible build command.
+
 1. SPAKE2: use a verified BoringSSL FFI/backend or port the exact primitive; do not invent a compatible-looking implementation.
 2. mDNS discovery: choose and integrate a real Android-compatible DNS-SD backend.
 3. USB daemon watcher: choose the Termux/usbfs/rusb ownership and hotplug model.
-4. AVB and filesystem generation: decide whether to bind AOSP libraries or implement compatible Rust components.
-5. Full `flashall`/`update`: build the AOSP-like task and slot orchestration layer first.
+4. AVB: vendor the AOSP C implementation with headers and build metadata, or implement a compatible Rust component.
+5. Filesystem generation: vendor the required C/C++ tools/library with headers, or invoke a repository-owned tool; do not rely on an untracked system binary.
+6. Full `flashall`/`update`: build the AOSP-like task and slot orchestration layer first.
 
 ## Acceptance is intentionally separate
 
