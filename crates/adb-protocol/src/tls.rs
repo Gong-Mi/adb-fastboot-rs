@@ -178,6 +178,14 @@ pub fn create_server_config(
 /// # Returns
 /// A [`TlsStream`] wrapping the original stream with TLS encryption.
 ///
+/// Export the 64-byte AOSP pairing secret after a completed TLS 1.3 handshake.
+/// AOSP uses exporter label `adb-label`, no context, and 64 bytes.
+pub fn export_pairing_key_material(connection: &rustls::ClientConnection) -> Result<[u8; 64], TlsError> {
+    let mut output = [0u8; 64];
+    connection.export_keying_material(&mut output, b"adb-label", None)?;
+    Ok(output)
+}
+
 /// # Errors
 /// Returns [`TlsError::Handshake`] if the server name is invalid or the
 /// TLS handshake fails.

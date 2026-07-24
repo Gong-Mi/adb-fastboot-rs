@@ -583,61 +583,13 @@ fn test_adb_sync_list_dent_wire_sequence() {
 }
 
 #[test]
-fn test_adb_spa_pairing_wire_handshake() {
-    use adb_protocol::pairing::{
-        decrypt_payload, derive_pairing_key, PairingClient, PairingResultStatus, SpaMessageType,
-        SpaPacket,
-    };
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let server_thread = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
-        let server_salt = [0x55u8; 16];
-
-        // 1. Read Client Init
-        let client_init = SpaPacket::read_from(&mut socket).unwrap();
-        assert_eq!(client_init.header.msg_type, SpaMessageType::Init);
-        let client_salt = &client_init.payload[..16];
-
-        // 2. Send Server Init
-        let mut server_init_payload = Vec::new();
-        server_init_payload.extend_from_slice(&server_salt);
-        server_init_payload.extend_from_slice(b"adb-device-mock");
-        let server_init = SpaPacket::new(SpaMessageType::Init, 0, server_init_payload).unwrap();
-        server_init.write_to(&mut socket).unwrap();
-
-        // 3. Read Client Exchange
-        let client_exchange = SpaPacket::read_from(&mut socket).unwrap();
-        assert_eq!(client_exchange.header.msg_type, SpaMessageType::Exchange);
-        assert_eq!(client_exchange.header.flags, 1);
-
-        // Derive key on server side
-        let mut combined_salt = Vec::new();
-        combined_salt.extend_from_slice(client_salt);
-        combined_salt.extend_from_slice(&server_salt);
-        let (server_key, _) = derive_pairing_key("123456", &combined_salt).unwrap();
-
-        let decrypted = decrypt_payload(&server_key, &client_exchange.payload).unwrap();
-        assert_eq!(decrypted, b"ADB_SPA_PAIRING_REQUEST:OK");
-
-        // 4. Send Server Result (Success)
-        let server_result = SpaPacket::new(
-            SpaMessageType::Result,
-            0,
-            vec![PairingResultStatus::Success as u8],
-        )
-        .unwrap();
-        server_result.write_to(&mut socket).unwrap();
-    });
-
-    let mut stream = std::net::TcpStream::connect(addr).unwrap();
-    let mut client = PairingClient::new("123456").unwrap();
-    client.execute_pairing(&mut stream).unwrap();
-
-    assert!(client.is_paired());
-    server_thread.join().unwrap();
+fn test_aosp_pairing_is_explicitly_unsupported_until_spake2_backend_exists() {
+    let mut client = adb_protocol::PairingClient::new("123456").unwrap();
+    let mut io = std::io::Cursor::new(Vec::<u8>::new());
+    assert_eq!(
+        client.execute_pairing(&mut io),
+        Err(adb_protocol::PairingError::UnsupportedSpake2)
+    );
 }
 
 #[test]

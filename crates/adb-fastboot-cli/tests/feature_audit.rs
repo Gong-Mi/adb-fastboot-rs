@@ -114,8 +114,8 @@ const MATRIX: &[FeatureStatus] = &[
     FeatureStatus {
         module: "ADB",
         feature: "ADB mDNS discovery / wireless pairing / TLS",
-        status: AcceptanceStatus::CliImplemented,
-        evidence: "CLI supports wireless pairing (adb pair) with SPA auth and TLS upgrade",
+        status: AcceptanceStatus::TransportMissing,
+        evidence: "AOSP 6-byte framing and AES sequence cipher are implemented/tested; exact BoringSSL Curve25519 SPAKE2, TLS pairing wiring, and certificate persistence are deliberately unsupported",
     },
     FeatureStatus {
         module: "ADB",

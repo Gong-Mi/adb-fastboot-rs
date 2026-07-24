@@ -5,7 +5,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use adb_protocol::{
     AdbAuth, AdbMessageHeader, AdbServerTransport, ShellV2Packet, TcpTransport, Transport,
-    TransportError, PairingClient,
+    TransportError,
     ADB_VERSION, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_STLS, A_WRTE, MAX_PAYLOAD_V2,
     build_sync_send_req, build_sync_data_chunk, build_sync_done, SyncMessageHeader,
     SYNC_FAIL, SYNC_OKAY,
@@ -954,54 +954,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             kill_server()?;
         }
 
-        Commands::Pair { addr, code } => {
-            let code_str = match code {
-                Some(c) if !c.trim().is_empty() => c.trim().to_string(),
-                _ => {
-                    print!("Enter 6-digit pairing code: ");
-                    std::io::stdout().flush()?;
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input)?;
-                    input.trim().to_string()
-                }
-            };
-
-            let target_addr = if addr.contains(':') {
-                addr.clone()
-            } else {
-                format!("{}:5555", addr)
-            };
-
-            println!("[adb-rs] Connecting to wireless pairing endpoint {}...", target_addr);
-            let mut stream = match std::net::TcpStream::connect_timeout(
-                &target_addr.parse().map_err(|e| format!("Invalid target address {target_addr}: {e}"))?,
-                Duration::from_secs(5),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Failed to connect to {target_addr}: {e}");
-                    std::process::exit(1);
-                }
-            };
-
-            let mut client = match PairingClient::new(&code_str) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Pairing failed: {e}");
-                    std::process::exit(1);
-                }
-            };
-
-            println!("[adb-rs] Executing SPA wireless pairing handshake with {}...", target_addr);
-            match client.execute_pairing(&mut stream) {
-                Ok(_) => {
-                    println!("Successfully paired to {target_addr}");
-                }
-                Err(e) => {
-                    eprintln!("Failed to pair with {target_addr}: {e}");
-                    std::process::exit(1);
-                }
-            }
+        Commands::Pair { addr, code: _ } => {
+            let target_addr = if addr.contains(':') { addr.clone() } else { format!("{addr}:5555") };
+            eprintln!("Cannot pair with {target_addr}: AOSP pairing requires TLS 1.3 exporter + BoringSSL Curve25519 SPAKE2 and certificate persistence; this build refuses plaintext and the former custom SPAP protocol.");
+            std::process::exit(1);
         }
     }
 

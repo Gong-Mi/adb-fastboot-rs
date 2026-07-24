@@ -20,8 +20,8 @@ pub use compress::*;
 pub use constants::*;
 pub use header::{AdbMessageHeader, AuthType, HeaderError};
 pub use pairing::{
-    decrypt_payload, derive_pairing_key, encrypt_payload, PairingClient, PairingError,
-    PairingResultStatus, PairingState, SpaHeader, SpaMessageType, SpaPacket, SPA_HEADER_SIZE, SPA_MAGIC,
+    validate_pairing_code, PairingCipher, PairingClient, PairingError, PairingPacket,
+    PairingPacketType, MAX_PAIRING_PAYLOAD, PAIRING_HEADER_SIZE, PAIRING_VERSION,
 };
 pub use shell_v2::{ShellV2Error, ShellV2Packet};
 pub use sync::{
