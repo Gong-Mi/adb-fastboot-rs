@@ -55,6 +55,7 @@ Already landed and therefore not counted as gaps here:
 - flashing action validation
 - Fastboot `devices -l` output formatting
 - `VendorBootBuilder` v3/v4 header, ramdisk table, and bootconfig image repacking primitives
+- ADB mDNS service type and TXT record DNS-SD parser (`_adb._tcp`, `_adb-tls-connect._tcp`, `_adb-tls-pairing._tcp`)
 
 ## Fastboot protocol/image — 5 gaps
 

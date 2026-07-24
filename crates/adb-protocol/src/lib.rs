@@ -2,6 +2,7 @@ pub mod auth;
 pub mod compress;
 pub mod constants;
 pub mod header;
+pub mod mdns;
 pub mod pairing;
 pub mod shell_v2;
 pub mod stls;
@@ -20,6 +21,7 @@ pub use auth::*;
 pub use compress::*;
 pub use constants::*;
 pub use header::{AdbMessageHeader, AuthType, HeaderError};
+pub use mdns::{parse_txt_record, AdbMdnsService, AdbMdnsServiceType, MdnsError};
 pub use pairing::{
     validate_pairing_code, PairingCipher, PairingClient, PairingError, PairingPacket,
     PairingPacketType, MAX_PAIRING_PAYLOAD, PAIRING_HEADER_SIZE, PAIRING_VERSION,
