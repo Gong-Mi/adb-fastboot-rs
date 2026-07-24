@@ -365,3 +365,20 @@ impl TransportRegistry {
         Ok(arc_t)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transport_selection_accepts_only_aosp_online_states() {
+        assert!(is_usable_state(DeviceState::Device));
+        assert!(is_usable_state(DeviceState::Recovery));
+        assert!(is_usable_state(DeviceState::Sideload));
+        assert!(is_usable_state(DeviceState::Bootloader));
+        assert!(!is_usable_state(DeviceState::Offline));
+        assert!(!is_usable_state(DeviceState::Authorizing));
+        assert!(!is_usable_state(DeviceState::Connecting));
+        assert!(!is_usable_state(DeviceState::NoPerm));
+    }
+}

@@ -17,6 +17,7 @@ path = "src/main_fastboot.rs"
 [features]
 default = []
 usb = ["adb-protocol/usb-android", "fastboot-protocol/usb-android"]
+usb-rusb = ["adb-protocol/usb-rusb"]
 tls = ["adb-protocol/tls"]
 
 [dependencies]

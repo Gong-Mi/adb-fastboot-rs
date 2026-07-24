@@ -8,11 +8,6 @@
 //! - forward.rs → adb_listeners.cpp (forward/reverse)
 //! - watcher.rs → USB device watcher (usb.cpp)
 
-// Include old monolithic server content (tests kept here for now).
-#[path = "old.rs"]
-mod old;
-
-// New sub-modules
 pub mod runner;
 pub mod handler;
 pub mod models;
@@ -29,6 +24,3 @@ pub(crate) use bridge::*;
 pub(crate) use forward::*;
 pub(crate) use transport::*;
 pub(crate) use watcher::*;
-
-// Re-export old.rs items too (tests and any remaining public items).
-pub(crate) use old::*;

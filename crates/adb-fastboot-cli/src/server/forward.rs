@@ -538,3 +538,63 @@ pub(crate) fn handle_reverse(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use adb_protocol::{AdbMessageHeader, ADB_VERSION, A_CNXN, MAX_PAYLOAD_V2};
+
+    use super::*;
+    use crate::server::models::TransportRegistry;
+
+    #[test]
+    fn test_parse_spec_pair() {
+        assert_eq!(
+            parse_spec_pair("tcp:8080;tcp:9000"),
+            Some(("tcp:8080", "tcp:9000"))
+        );
+        assert_eq!(
+            parse_spec_pair("tcp:8080:tcp:9000"),
+            Some(("tcp:8080", "tcp:9000"))
+        );
+        assert_eq!(
+            parse_spec_pair("localabstract:foo;tcp:9000"),
+            Some(("localabstract:foo", "tcp:9000"))
+        );
+        assert_eq!(
+            parse_spec_pair("localabstract:foo:tcp:9000"),
+            Some(("localabstract:foo", "tcp:9000"))
+        );
+        assert_eq!(parse_spec_pair("invalid"), None);
+    }
+
+    #[test]
+    fn test_registry_forward_management() {
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        {
+            let mut reg = registry.lock().unwrap();
+            let res = reg.add_forward(&registry, "tcp:0", "tcp:9000", false).unwrap();
+            assert!(!res.is_empty());
+            assert!(reg.list_forwards().contains("tcp:9000"));
+
+            let res_dup = reg.add_forward(&registry, &format!("tcp:{res}"), "tcp:9000", true);
+            assert!(res_dup.is_err());
+
+            assert!(reg.remove_forward(&format!("tcp:{res}")));
+            assert!(reg.list_forwards().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_registry_reverse_management() {
+        let mut reg = TransportRegistry::new();
+        assert!(reg.add_reverse("tcp:8080", "tcp:9000", false).is_ok());
+        assert!(reg.list_reverses().contains("tcp:8080 tcp:9000"));
+
+        assert!(reg.add_reverse("tcp:8080", "tcp:9000", true).is_err());
+
+        assert!(reg.remove_reverse("tcp:8080"));
+        assert!(reg.list_reverses().is_empty());
+    }
+}
