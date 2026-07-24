@@ -715,9 +715,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let request = if *list {
                 "host:forward:list".to_string()
             } else if let Some(rm) = remove {
-                format!("host:forward:remove:{rm}")
+                format!("host:forward:killforward:{rm}")
             } else if *remove_all {
-                "host:forward:remove-all".to_string()
+                "host:forward:killforward-all".to_string()
             } else if let (Some(loc), Some(rem)) = (local, remote) {
                 if *no_rebind {
                     format!("host:forward:norebind:{loc};{rem}")
@@ -746,14 +746,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let request = if *list {
                 "host:reverse:list".to_string()
             } else if let Some(rm) = remove {
-                format!("host:reverse:remove:{rm}")
+                format!("host:reverse:killreverse:{rm}")
             } else if *remove_all {
-                "host:reverse:remove-all".to_string()
+                "host:reverse:killreverse-all".to_string()
             } else if let (Some(rem), Some(loc)) = (remote, local) {
                 if *no_rebind {
-                    format!("host:reverse:norebind:{rem}:{loc}")
+                    format!("host:reverse:norebind:{rem};{loc}")
                 } else {
-                    format!("host:reverse:{rem}:{loc}")
+                    format!("host:reverse:{rem};{loc}")
                 }
             } else {
                 eprintln!("error: specify --list, --remove, --remove-all, or REMOTE LOCAL");

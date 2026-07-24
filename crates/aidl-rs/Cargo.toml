@@ -8,3 +8,8 @@ description = "Android AIDL definition parser and Rust code generator"
 
 [dependencies]
 thiserror = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+
+[[bin]]
+name = "aidl-rs"
+path = "src/main.rs"

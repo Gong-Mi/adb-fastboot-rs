@@ -639,3 +639,121 @@ fn test_adb_spa_pairing_wire_handshake() {
     assert!(client.is_paired());
     server_thread.join().unwrap();
 }
+
+#[test]
+fn test_adb_server_forward_wire_sequence() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_thread = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+
+        // 1. host:forward:list (empty)
+        let mut len_buf = [0u8; 4];
+        socket.read_exact(&mut len_buf).unwrap();
+        let len = usize::from_str_radix(std::str::from_utf8(&len_buf).unwrap(), 16).unwrap();
+        let mut req_buf = vec![0u8; len];
+        socket.read_exact(&mut req_buf).unwrap();
+        assert_eq!(&req_buf, b"host:forward:list");
+        socket.write_all(b"OKAY0000").unwrap();
+
+        // 2. host:forward:tcp:8080;tcp:9000
+        socket.read_exact(&mut len_buf).unwrap();
+        let len = usize::from_str_radix(std::str::from_utf8(&len_buf).unwrap(), 16).unwrap();
+        let mut req_buf = vec![0u8; len];
+        socket.read_exact(&mut req_buf).unwrap();
+        assert_eq!(&req_buf, b"host:forward:tcp:8080;tcp:9000");
+        socket.write_all(b"OKAY0000").unwrap();
+
+        // 3. host:forward:killforward:tcp:8080
+        socket.read_exact(&mut len_buf).unwrap();
+        let len = usize::from_str_radix(std::str::from_utf8(&len_buf).unwrap(), 16).unwrap();
+        let mut req_buf = vec![0u8; len];
+        socket.read_exact(&mut req_buf).unwrap();
+        assert_eq!(&req_buf, b"host:forward:killforward:tcp:8080");
+        socket.write_all(b"OKAY0000").unwrap();
+
+        // 4. host:forward:killforward-all
+        socket.read_exact(&mut len_buf).unwrap();
+        let len = usize::from_str_radix(std::str::from_utf8(&len_buf).unwrap(), 16).unwrap();
+        let mut req_buf = vec![0u8; len];
+        socket.read_exact(&mut req_buf).unwrap();
+        assert_eq!(&req_buf, b"host:forward:killforward-all");
+        socket.write_all(b"OKAY0000").unwrap();
+    });
+
+    let mut transport = adb_protocol::AdbServerTransport::connect(addr.to_string()).unwrap();
+
+    let list1 = transport.execute_host_command("host:forward:list").unwrap();
+    assert_eq!(list1, "");
+
+    let fwd_resp = transport.execute_host_command("host:forward:tcp:8080;tcp:9000").unwrap();
+    assert_eq!(fwd_resp, "");
+
+    let rm_resp = transport.execute_host_command("host:forward:killforward:tcp:8080").unwrap();
+    assert_eq!(rm_resp, "");
+
+    let rm_all_resp = transport.execute_host_command("host:forward:killforward-all").unwrap();
+    assert_eq!(rm_all_resp, "");
+
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn test_adb_server_reverse_wire_sequence() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_thread = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+
+        // 1. host:reverse:list
+        let mut len_buf = [0u8; 4];
+        socket.read_exact(&mut len_buf).unwrap();
+        let len = usize::from_str_radix(std::str::from_utf8(&len_buf).unwrap(), 16).unwrap();
+        let mut req_buf = vec![0u8; len];
+        socket.read_exact(&mut req_buf).unwrap();
+        assert_eq!(&req_buf, b"host:reverse:list");
+        socket.write_all(b"OKAY0000").unwrap();
+
+        // 2. host:reverse:tcp:8080;tcp:9000
+        socket.read_exact(&mut len_buf).unwrap();
+        let len = usize::from_str_radix(std::str::from_utf8(&len_buf).unwrap(), 16).unwrap();
+        let mut req_buf = vec![0u8; len];
+        socket.read_exact(&mut req_buf).unwrap();
+        assert_eq!(&req_buf, b"host:reverse:tcp:8080;tcp:9000");
+        socket.write_all(b"OKAY0000").unwrap();
+
+        // 3. host:reverse:killreverse:tcp:8080
+        socket.read_exact(&mut len_buf).unwrap();
+        let len = usize::from_str_radix(std::str::from_utf8(&len_buf).unwrap(), 16).unwrap();
+        let mut req_buf = vec![0u8; len];
+        socket.read_exact(&mut req_buf).unwrap();
+        assert_eq!(&req_buf, b"host:reverse:killreverse:tcp:8080");
+        socket.write_all(b"OKAY0000").unwrap();
+
+        // 4. host:reverse:killreverse-all
+        socket.read_exact(&mut len_buf).unwrap();
+        let len = usize::from_str_radix(std::str::from_utf8(&len_buf).unwrap(), 16).unwrap();
+        let mut req_buf = vec![0u8; len];
+        socket.read_exact(&mut req_buf).unwrap();
+        assert_eq!(&req_buf, b"host:reverse:killreverse-all");
+        socket.write_all(b"OKAY0000").unwrap();
+    });
+
+    let mut transport = adb_protocol::AdbServerTransport::connect(addr.to_string()).unwrap();
+
+    let list1 = transport.execute_host_command("host:reverse:list").unwrap();
+    assert_eq!(list1, "");
+
+    let rev_resp = transport.execute_host_command("host:reverse:tcp:8080;tcp:9000").unwrap();
+    assert_eq!(rev_resp, "");
+
+    let rm_resp = transport.execute_host_command("host:reverse:killreverse:tcp:8080").unwrap();
+    assert_eq!(rm_resp, "");
+
+    let rm_all_resp = transport.execute_host_command("host:reverse:killreverse-all").unwrap();
+    assert_eq!(rm_all_resp, "");
+
+    server_thread.join().unwrap();
+}
