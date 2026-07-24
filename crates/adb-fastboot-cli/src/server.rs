@@ -95,6 +95,7 @@ enum DeviceOrigin {
 #[derive(Debug, Clone)]
 struct DeviceEntry {
     serial: String,
+    transport_id: u64,
     state: DeviceState,
     origin: DeviceOrigin,
     product: Option<String>,
@@ -111,6 +112,7 @@ struct TransportRegistry {
     devices: Vec<DeviceEntry>,
     forwards: Vec<ForwardRule>,
     reverses: Vec<ReverseRule>,
+    next_id: u64,
     /// Authenticated USB transports keyed by serial number.
     /// Established on first client use, reused by subsequent clients.
     #[cfg(feature = "usb")]
@@ -157,6 +159,7 @@ impl TransportRegistry {
             devices: Vec::new(),
             forwards: Vec::new(),
             reverses: Vec::new(),
+            next_id: 1,
             #[cfg(feature = "usb")]
             usb_auth: std::collections::HashMap::new(),
         };
@@ -176,6 +179,11 @@ impl TransportRegistry {
                     if !self.devices.iter().any(|d| d.serial == serial) {
                         self.devices.push(DeviceEntry {
                             serial: serial.clone(),
+                            transport_id: {
+                                let id = self.next_id;
+                                self.next_id += 1;
+                                id
+                            },
                             state: DeviceState::Device,
                             origin: DeviceOrigin::Usb,
                             product: None,
@@ -223,6 +231,10 @@ impl TransportRegistry {
         out
     }
 
+    fn find_by_transport_id(&self, id: u64) -> Option<&DeviceEntry> {
+        self.devices.iter().find(|d| d.transport_id == id)
+    }
+
     fn find_by_serial(&self, serial: &str) -> Option<&DeviceEntry> {
         self.devices.iter().find(|d| d.serial == serial)
     }
@@ -236,6 +248,11 @@ impl TransportRegistry {
             existing.state = DeviceState::Device;
         } else {
             self.devices.push(DeviceEntry {
+                transport_id: {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    id
+                },
                 serial,
                 state: DeviceState::Device,
                 origin: DeviceOrigin::Tcp { addr },
@@ -709,14 +726,33 @@ fn handle_client(
         let cmd = String::from_utf8(cmd_buf)
             .map_err(|_| "Command is not valid UTF-8".to_string())?;
 
-        let is_transport_cmd = cmd.starts_with("host:transport:");
+        let is_transport_cmd = cmd.starts_with("host:transport:")
+            || cmd.starts_with("host:tport:")
+            || cmd.starts_with("host:transport-id:");
 
         dispatch_host_service(&mut client, &cmd, registry, running)?;
 
         if is_transport_cmd {
             // dispatch_host_service already sent OKAY — now enter bridge mode.
             // Move client into the bridge (this function is the last use).
-            let serial = cmd["host:transport:".len()..].to_string();
+            let serial: String = if cmd.starts_with("host:transport:") {
+                cmd["host:transport:".len()..].to_string()
+            } else if cmd.starts_with("host:tport:serial:") {
+                cmd["host:tport:serial:".len()..].to_string()
+            } else if cmd.starts_with("host:transport-id:") {
+                let id_str = &cmd["host:transport-id:".len()..];
+                let tid: u64 = id_str.parse().map_err(|_| format!("invalid transport id: {id_str}"))?;
+                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                reg.find_by_transport_id(tid)
+                    .map(|d| d.serial.clone())
+                    .ok_or_else(|| format!("transport id {tid} not found"))?
+            } else {
+                // host:tport: or host:tport:any — find any device
+                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                reg.find_any_device()
+                    .map(|d| d.serial.clone())
+                    .ok_or_else(|| "no devices available".to_string())?
+            };
             let _ = bridge_to_device(client, serial, registry)?;
             // bridge always returns at this point, but in case of false…
             return Ok(());
@@ -914,6 +950,99 @@ fn dispatch_host_service(
                 ok_empty(client)
             } else {
                 fail(client, "no devices available")
+            }
+        }
+
+        // -- host:tport:serial:<serial> (AOSP v2, returns transport_id) -------
+        c if c.starts_with("host:tport:serial:") => {
+            let serial = &c["host:tport:serial:".len()..];
+            let device = {
+                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                reg.find_by_serial(serial).cloned()
+            };
+            match device {
+                Some(dev) if is_usable_state(dev.state) => {
+                    let tid = dev.transport_id;
+                    ok_empty(client)?;
+                    let tid_bytes = tid.to_le_bytes();
+                    client
+                        .write_all(&tid_bytes)
+                        .and_then(|_| client.flush())
+                        .map_err(|e| format!("write transport_id failed: {e}"))
+                }
+                Some(_) => fail(client, &format!("device '{serial}' is offline")),
+                None => fail(client, &format!("device '{serial}' not found")),
+            }
+        }
+
+        // -- host:tport: / host:tport:any (AOSP v2 transport-any) --------------
+        "host:tport:" | "host:tport:any" => {
+            let device = {
+                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                reg.find_any_device().cloned()
+            };
+            match device {
+                Some(dev) => {
+                    let tid = dev.transport_id;
+                    ok_empty(client)?;
+                    let tid_bytes = tid.to_le_bytes();
+                    client
+                        .write_all(&tid_bytes)
+                        .and_then(|_| client.flush())
+                        .map_err(|e| format!("write transport_id failed: {e}"))
+                }
+                None => fail(client, "no devices available"),
+            }
+        }
+
+        // -- host:transport-id:<id> (select by transport_id) -------------------
+        c if c.starts_with("host:transport-id:") => {
+            let id_str = &c["host:transport-id:".len()..];
+            let tid: u64 = match id_str.parse() {
+                Ok(id) => id,
+                Err(_) => return fail(client, "invalid transport id"),
+            };
+            let exists = {
+                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                reg.find_by_transport_id(tid)
+                    .map(|d| is_usable_state(d.state))
+                    .unwrap_or(false)
+            };
+            if exists {
+                ok_empty(client)
+            } else {
+                fail(client, &format!("transport id {tid} not found"))
+            }
+        }
+
+        // -- host-serial:<serial>:<service> (serial-qualified commands) --------
+        // Commands like host-serial:<serial>:features
+        c if c.starts_with("host-serial:") && c.contains(":features") => {
+            // Strip "host-serial:" prefix, split on first ':' to get serial + service
+            let rest = &c["host-serial:".len()..];
+            if let Some((serial, service)) = rest.split_once(':') {
+                if service == "features" {
+                    let features = {
+                        let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                        reg.find_by_serial(serial)
+                            .and_then(|d| d.transport_features.as_deref())
+                            .and_then(|banner| {
+                                // Parse CNXN banner for features=...
+                                banner.split(';')
+                                    .find_map(|part| part.strip_prefix("features="))
+                            })
+                            .map(|s| s.to_string())
+                    };
+                    if let Some(feat) = features {
+                        ok_str(client, &feat)
+                    } else {
+                        fail(client, &format!("device '{serial}' not found or no features"))
+                    }
+                } else {
+                    fail(client, &format!("unsupported host-serial service: {service}"))
+                }
+            } else {
+                fail(client, "invalid host-serial format")
             }
         }
 
@@ -1936,6 +2065,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(TransportRegistry::new()));
         registry.lock().unwrap().devices.push(DeviceEntry {
             serial: "test-device".to_string(),
+            transport_id: 1,
             state: DeviceState::Device,
             origin: DeviceOrigin::Tcp {
                 addr: "127.0.0.1:5555".parse().unwrap(),

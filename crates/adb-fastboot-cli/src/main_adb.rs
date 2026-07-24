@@ -39,6 +39,13 @@ pub enum Commands {
     Shell {
         command: Vec<String>,
     },
+    /// Run remote shell command and return raw stdout (no ShellV2 framing).
+    /// Uses the 'exec:' service which provides raw Unix stdout without
+    /// ShellV2 packet headers or stderr multiplexing.
+    #[command(name = "exec-out")]
+    ExecOut {
+        command: Vec<String>,
+    },
     /// Push local file to device
     Push {
         local: String,
@@ -110,6 +117,18 @@ pub enum Commands {
     ForkServer {
         #[arg(long = "reply-fd")]
         reply_fd: i32,
+    },
+    /// Connect to a device via TCP/IP
+    Connect {
+        /// Device address (host:port)
+        host: String,
+        /// Optional port (defaults to 5555)
+        port: Option<u16>,
+    },
+    /// Disconnect from one or all TCP devices
+    Disconnect {
+        /// Optional target device address to disconnect (disconnects all if omitted)
+        target: Option<String>,
     },
     /// Pair with wireless device using 6-digit code
     Pair {
@@ -801,6 +820,99 @@ fn run_shell(
     stream_shell_v2(transport, local_id, remote_id, capture)
 }
 
+/// Stream raw exec: service output to stdout.
+///
+/// Unlike `shell,v2,raw:` which uses ShellV2 framing, the `exec:` service
+/// provides raw Unix stdout bytes directly in WRTE payloads with no framing.
+/// There is no stderr or exit code — just pure process stdout piped through
+/// as raw WRTE payloads until A_CLSE.
+fn stream_exec_out_raw(
+    transport: &mut dyn Transport,
+    local_id: u32,
+    mut remote_id: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let (hdr, payload) = match transport.recv_message() {
+            Ok(msg) => msg,
+            Err(TransportError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => {
+                eprintln!("Error: Stream error: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        match hdr.command {
+            A_OKAY => {
+                remote_id = hdr.arg0;
+            }
+            A_WRTE => {
+                let ack = AdbMessageHeader::new(A_OKAY, local_id, remote_id, &[]);
+                let _ = transport.send_message(&ack, &[]);
+
+                // Raw bytes — write directly to stdout without ShellV2 parsing
+                std::io::stdout().write_all(&payload)?;
+                std::io::stdout().flush()?;
+            }
+            A_CLSE => {
+                let ack = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
+                let _ = transport.send_message(&ack, &[]);
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Open exec: service and stream raw output to stdout.
+fn run_exec_out(
+    transport: &mut dyn Transport,
+    cmd: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dest = format!("exec:{cmd}");
+    let (local_id, remote_id) = open_service(transport, &dest, 1)?;
+    stream_exec_out_raw(transport, local_id, remote_id)
+}
+
+/// Stream raw bytes from ADB server forwarding mode to stdout.
+///
+/// After `send_host_request("exec:<cmd>")` + `read_status()` OKAY,
+/// the server enters raw forwarding mode, passing WRTE payloads as
+/// raw bytes (no ADB WRTE framing). Unlike shell v2, `exec:` does
+/// NOT wrap output in ShellV2 packets — it's pure Unix stdout.
+fn stream_raw_server(
+    transport: &mut dyn Transport,
+    _capture: bool,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let n = match transport.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.kind() == std::io::ErrorKind::ConnectionReset
+                {
+                    break;
+                }
+                return Err(e.into());
+            }
+        };
+
+        std::io::stdout().write_all(&buf[..n])?;
+        std::io::stdout().flush()?;
+    }
+
+    Ok(None)
+}
+
 /// Ensure ADB server daemon is running on 127.0.0.1:5037.
 /// If not running, autostarts it by spawning `adb-rs serve` in the background.
 pub fn ensure_server_running() -> Result<(), Box<dyn std::error::Error>> {
@@ -997,7 +1109,9 @@ fn host_command(
         }
     };
 
-    if !request.starts_with("host:forward")
+    if !request.starts_with("host:connect")
+        && !request.starts_with("host:disconnect")
+        && !request.starts_with("host:forward")
         && !request.starts_with("host:reverse")
         && !request.starts_with("host:devices")
     {
@@ -1111,6 +1225,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let (_lid, remote_id) = open_service(&mut transport, &shell_service, 1)?;
             stream_shell_v2(&mut transport, _lid, remote_id, false)?;
+        }
+        Commands::ExecOut { command } => {
+            let cmd_str = command.join(" ");
+
+            // Priority 1: ADB server (port 5037) — same pattern as shell.
+            let exec_service = format!("exec:{cmd_str}");
+            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+                if server.switch_transport(cli.serial.as_deref()).is_ok() {
+                    // Send exec service via host service protocol
+                    server.send_host_request(&exec_service)?;
+                    server.read_status()?; // OKAY -> server created A_OPEN, device OK'd
+                    // Raw forwarding mode — exec: outputs raw bytes, no ShellV2 framing
+                    stream_raw_server(&mut server, false)?;
+                    return Ok(());
+                }
+            }
+
+            // Priority 2: direct USB/TCP transport — full CNXN/AUTH handshake.
+            let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let (_info, mut transport) = match connect_and_handshake_with_tls_upgrade(
+                transport,
+                b"host::features=shell_v2,cmd",
+                default_auth(),
+            ) {
+                Ok(result) => result,
+                Err(e) if e.to_string().contains("0x45534c43") => {
+                    std::thread::sleep(Duration::from_secs(15));
+                    let retry_transport = open_adb_transport(
+                        cli.serial.as_deref(),
+                        cli.d,
+                        Duration::from_secs(3),
+                    )?;
+                    connect_and_handshake_with_tls_upgrade(
+                        retry_transport,
+                        b"host::features=shell_v2,cmd",
+                        default_auth(),
+                    )?
+                }
+                Err(e) => return Err(e),
+            };
+
+            run_exec_out(&mut transport, &cmd_str)?;
         }
         Commands::Push { local, remote } => {
             let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
@@ -1409,6 +1572,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::ForkServer { reply_fd } => {
             server::run_server_fork(Some(*reply_fd));
+        }
+
+        Commands::Connect { host, port } => {
+            let port = port.unwrap_or(5555);
+            let request = format!("host:connect:{}:{}", host, port);
+
+            match host_command(cli.serial.as_deref(), &request) {
+                Ok(resp) => {
+                    let trimmed = resp.trim();
+                    if !trimmed.is_empty() {
+                        println!("{trimmed}");
+                    } else {
+                        println!("connected to {}:{}", host, port);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::Disconnect { target } => {
+            let request = match target {
+                Some(t) => format!("host:disconnect:{}", t),
+                None => "host:disconnect".to_string(),
+            };
+
+            match host_command(cli.serial.as_deref(), &request) {
+                Ok(resp) => {
+                    let trimmed = resp.trim();
+                    if !trimmed.is_empty() {
+                        println!("{trimmed}");
+                    } else {
+                        match target {
+                            Some(t) => println!("disconnected {}", t),
+                            None => println!("disconnected everything"),
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Pair { addr, code } => {
