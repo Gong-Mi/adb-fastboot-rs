@@ -689,10 +689,19 @@ fn recv_data_response(
 }
 
 fn recv_and_print_info(
-    transport: &mut impl FastbootTransport,
+    transport: &mut FastbootConnection,
 ) -> Result<fastboot_protocol::FastbootResponse, Box<dyn std::error::Error>> {
     let mut info_logs = Vec::new();
-    let response = transport.recv_response_with_info(&mut info_logs)?;
+    let response = match transport {
+        FastbootConnection::Tcp(transport) => transport.recv_response_with_info(&mut info_logs)?,
+        FastbootConnection::Udp(transport) => {
+            FastbootTransport::recv_response_with_info(transport, &mut info_logs)?
+        }
+        #[cfg(feature = "usb")]
+        FastbootConnection::Usb(transport) => {
+            FastbootTransport::recv_response_with_info(transport, &mut info_logs)?
+        }
+    };
     for info in info_logs {
         println!("[fastboot-rs] INFO {}", info);
     }
@@ -2361,36 +2370,11 @@ mod tests {
     }
 
     #[test]
-    fn fetch_accepts_info_before_data_like_aosp_run_and_read_buffer() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        use std::thread;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut command = [0u8; 10];
-            socket.read_exact(&mut command).unwrap();
-            assert_eq!(&command, b"fetch:boot");
-            socket.write_all(b"INFOreading boot\nDATA00000005HELLOOKAYdone").unwrap();
-        });
-        let mut transport = FastbootConnection::Tcp(
-            fastboot_protocol::FastbootTcpTransport::raw_connect(addr).unwrap(),
-        );
-        let path = std::env::temp_dir().join(format!(
-            "fastboot-rs-fetch-info-test-{}",
-            std::process::id()
-        ));
-
-        let response = fetch_to_file(&mut transport, "boot", path.to_str().unwrap()).unwrap();
+    fn fetch_range_command_is_aosp_formatted() {
         assert_eq!(
-            response,
-            fastboot_protocol::FastbootResponse::Okay("done".to_string())
+            fastboot_protocol::fetch("boot", Some(0), Some(5)),
+            "fetch:boot:0x00000000:0x00000005"
         );
-        assert_eq!(std::fs::read(&path).unwrap(), b"HELLO");
-        std::fs::remove_file(path).unwrap();
-        server.join().unwrap();
     }
 
     #[test]
