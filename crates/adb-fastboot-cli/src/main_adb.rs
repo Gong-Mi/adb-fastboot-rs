@@ -15,6 +15,9 @@ use adb_protocol::{
 mod server;
 mod client;
 
+use client::{protocol, shell, exec_out, server_cmds, host_command};
+use client::server_cmds::{ensure_server_running, ensure_server_running_at, kill_server, kill_server_at};
+
 const ADBD_PORT: u16 = 5555;
 const ADB_SERVER_PORT: u16 = 5037;
 
@@ -565,554 +568,7 @@ fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     .into())
 }
 
-/// Open an adbd service (shell:, sync:, reboot:, etc.) via A_OPEN.
-/// Returns (local_id, remote_id) after A_OKAY.
-fn open_service(
-    transport: &mut dyn Transport,
-    dest: &str,
-    local_id: u32,
-) -> Result<(u32, u32), Box<dyn std::error::Error>> {
-    let open_hdr = AdbMessageHeader::new(A_OPEN, local_id, 0, dest.as_bytes());
-    transport.send_message(&open_hdr, dest.as_bytes())?;
-
-    // Read until we get A_OKAY with our local_id
-    loop {
-        let (hdr, _) = transport.recv_message()?;
-        match hdr.command {
-            A_OKAY => {
-                return Ok((local_id, hdr.arg0));
-            }
-            A_CLSE => {
-                return Err(format!("Service '{}' closed immediately", dest).into());
-            }
-            _ => {
-                // Keep reading
-            }
-        }
-    }
-}
-
-/// Send a WRTE frame and wait for OKAY ack
-fn send_wrte(transport: &mut dyn Transport, local_id: u32, remote_id: u32, payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let wrte_hdr = AdbMessageHeader::new(A_WRTE, local_id, remote_id, payload);
-    transport.send_message(&wrte_hdr, payload)?;
-    // Wait for OKAY ack
-    loop {
-        let (hdr, _) = transport.recv_message()?;
-        match hdr.command {
-            A_OKAY => return Ok(()),
-            A_WRTE => {
-                // Device sent data; ack it
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                // Don't consume it, let caller handle — but for sync we don't expect this
-            }
-            A_CLSE => return Err("Connection closed by peer".into()),
-            _ => {}
-        }
-    }
-}
-
-/// Read WRTE frames until CLSE or EOF. Returns collected payload bytes.
-#[allow(dead_code)]
-fn recv_wrte_all(transport: &mut dyn Transport, local_id: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut collected = Vec::new();
-    loop {
-        let (hdr, payload) = transport.recv_message()?;
-        match hdr.command {
-            A_WRTE => {
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                collected.extend_from_slice(&payload);
-            }
-            A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                break;
-            }
-            A_OKAY => {}
-            _ => break,
-        }
-    }
-    Ok(collected)
-}
-
-/// Read a sync response (expects OKAY or FAIL in SyncMessageHeader format).
-fn recv_sync_response(transport: &mut dyn Transport, local_id: u32, _remote_id: u32) -> Result<(), String> {
-    loop {
-        let (hdr, payload) = match transport.recv_message() {
-            Ok(m) => m,
-            Err(e) => return Err(format!("recv sync response error: {e}")),
-        };
-        match hdr.command {
-            A_OKAY => {
-                // This is ack for our WRTE, keep reading
-            }
-            A_WRTE => {
-                // Ack the WRTE
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-
-                // Parse sync header
-                if payload.len() < 8 {
-                    return Err("Sync response too short".to_string());
-                }
-                let sync_hdr = match SyncMessageHeader::decode(&payload) {
-                    Ok(h) => h,
-                    Err(e) => return Err(format!("Bad sync header: {e}")),
-                };
-                match sync_hdr.id {
-                    SYNC_OKAY => return Ok(()),
-                    SYNC_FAIL => {
-                        let msg = String::from_utf8_lossy(&payload[8..]).to_string();
-                        return Err(format!("Sync FAIL: {}", msg));
-                    }
-                    other => {
-                        return Err(format!("Unexpected sync response id {:#x}", other));
-                    }
-                }
-            }
-            A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                return Err("Sync connection closed".to_string());
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Stream shell output (Shell v2 packets) to stdout/stderr until exit or CLSE.
-fn stream_shell_v2(
-    transport: &mut dyn Transport,
-    local_id: u32,
-    mut remote_id: u32,
-    capture: bool,
-) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    let mut captured = if capture { Some(Vec::new()) } else { None };
-    let mut exit_code = None;
-    loop {
-        let (hdr, payload) = match transport.recv_message() {
-            Ok(msg) => msg,
-            Err(TransportError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => {
-                eprintln!("Error: Stream error: {}", e);
-                std::process::exit(1);
-            }
-        };
-
-        match hdr.command {
-            A_OKAY => {
-                remote_id = hdr.arg0;
-            }
-            A_WRTE => {
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, remote_id, &[]);
-                let _ = transport.send_message(&ack, &[]);
-
-                let mut rest = payload.as_slice();
-                while !rest.is_empty() {
-                    match ShellV2Packet::parse(rest) {
-                        Ok((pkt, consumed)) => {
-                            match pkt {
-                                ShellV2Packet::Stdout(data) => {
-                                    if let Some(ref mut buf) = captured {
-                                        buf.extend_from_slice(data);
-                                    }
-                                    std::io::stdout().write_all(data)?;
-                                    std::io::stdout().flush()?;
-                                }
-                                ShellV2Packet::Stderr(data) => {
-                                    if let Some(ref mut buf) = captured {
-                                        buf.extend_from_slice(data);
-                                    }
-                                    std::io::stderr().write_all(data)?;
-                                    std::io::stderr().flush()?;
-                                }
-                                ShellV2Packet::ExitCode(code) => {
-                                    exit_code = Some(code);
-                                }
-                                _ => {}
-                            }
-                            rest = &rest[consumed..];
-                        }
-                        Err(_) => {
-                            // Raw bytes (non-shell v2 format)
-                            if let Some(ref mut buf) = captured {
-                                buf.extend_from_slice(rest);
-                            }
-                            std::io::stdout().write_all(rest)?;
-                            std::io::stdout().flush()?;
-                            break;
-                        }
-                    }
-                }
-            }
-            A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                if let Some(code) = exit_code {
-                    if code != 0 {
-                        return Err(format!("remote shell exited with code {code}").into());
-                    }
-                    std::thread::sleep(Duration::from_millis(500));
-                    return Ok(captured);
-                }
-                break;
-            }
-            _ => {}
-        }
-    }
-    Ok(captured)
-}
-
-/// Stream shell output via ADB server forwarding mode.
-///
-/// After `send_host_request("shell,v2,raw:...")` + `read_status()` OKAY,
-/// the server returns the shell output as a raw byte stream (no ADB
-/// WRTE framing), followed by a CLSE or connection close.
-///
-/// The server sends the full ShellV2 packet stream as raw bytes;
-/// we parse and strip the ShellV2 framing to produce clean stdout.
-fn stream_shell_v2_server(
-    transport: &mut dyn Transport,
-    capture: bool,
-) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    let mut captured = if capture { Some(Vec::new()) } else { None };
-    let mut buf = [0u8; 8192];
-    let mut remainder = Vec::new();
-
-    loop {
-        let n = match transport.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::UnexpectedEof
-                    || e.kind() == std::io::ErrorKind::ConnectionReset
-                {
-                    break;
-                }
-                return Err(e.into());
-            }
-        };
-
-        remainder.extend_from_slice(&buf[..n]);
-
-        // Parse ShellV2 packets from the accumulated buffer
-        while !remainder.is_empty() {
-            match ShellV2Packet::parse(&remainder) {
-                Ok((pkt, consumed)) => {
-                    match pkt {
-                        ShellV2Packet::Stdout(data) | ShellV2Packet::Stderr(data) => {
-                            if let Some(ref mut buf) = captured {
-                                buf.extend_from_slice(data);
-                            }
-                            std::io::stdout().write_all(data)?;
-                            std::io::stdout().flush()?;
-                        }
-                        ShellV2Packet::ExitCode(_) => {
-                            // Don't print exit codes to stdout
-                        }
-                        _ => {}
-                    }
-                    remainder.drain(..consumed);
-                }
-                Err(_) => {
-                    // Incomplete packet — wait for more data
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(captured)
-}
-
-/// Open shell connection and stream output to stdout.
-fn run_shell(
-    transport: &mut dyn Transport,
-    cmd: &str,
-    capture: bool,
-) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    let dest = format!("shell,v2,raw:{cmd}");
-    let (local_id, remote_id) = open_service(transport, &dest, 1)?;
-    stream_shell_v2(transport, local_id, remote_id, capture)
-}
-
-/// Stream raw exec: service output to stdout.
-///
-/// Unlike `shell,v2,raw:` which uses ShellV2 framing, the `exec:` service
-/// provides raw Unix stdout bytes directly in WRTE payloads with no framing.
-/// There is no stderr or exit code — just pure process stdout piped through
-/// as raw WRTE payloads until A_CLSE.
-fn stream_exec_out_raw(
-    transport: &mut dyn Transport,
-    local_id: u32,
-    mut remote_id: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        let (hdr, payload) = match transport.recv_message() {
-            Ok(msg) => msg,
-            Err(TransportError::Io(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(e) => {
-                eprintln!("Error: Stream error: {}", e);
-                std::process::exit(1);
-            }
-        };
-
-        match hdr.command {
-            A_OKAY => {
-                remote_id = hdr.arg0;
-            }
-            A_WRTE => {
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, remote_id, &[]);
-                let _ = transport.send_message(&ack, &[]);
-
-                // Raw bytes — write directly to stdout without ShellV2 parsing
-                std::io::stdout().write_all(&payload)?;
-                std::io::stdout().flush()?;
-            }
-            A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                break;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-/// Open exec: service and stream raw output to stdout.
-fn run_exec_out(
-    transport: &mut dyn Transport,
-    cmd: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let dest = format!("exec:{cmd}");
-    let (local_id, remote_id) = open_service(transport, &dest, 1)?;
-    stream_exec_out_raw(transport, local_id, remote_id)
-}
-
-/// Stream raw bytes from ADB server forwarding mode to stdout.
-///
-/// After `send_host_request("exec:<cmd>")` + `read_status()` OKAY,
-/// the server enters raw forwarding mode, passing WRTE payloads as
-/// raw bytes (no ADB WRTE framing). Unlike shell v2, `exec:` does
-/// NOT wrap output in ShellV2 packets — it's pure Unix stdout.
-fn stream_raw_server(
-    transport: &mut dyn Transport,
-    _capture: bool,
-) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    let mut buf = [0u8; 8192];
-
-    loop {
-        let n = match transport.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::UnexpectedEof
-                    || e.kind() == std::io::ErrorKind::ConnectionReset
-                {
-                    break;
-                }
-                return Err(e.into());
-            }
-        };
-
-        std::io::stdout().write_all(&buf[..n])?;
-        std::io::stdout().flush()?;
-    }
-
-    Ok(None)
-}
-
-/// Ensure ADB server daemon is running on 127.0.0.1:5037.
-/// If not running, autostarts it by spawning `adb-rs serve` in the background.
-pub fn ensure_server_running() -> Result<(), Box<dyn std::error::Error>> {
-    ensure_server_running_at(ADB_SERVER_PORT)
-}
-
-pub fn ensure_server_running_at(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    use std::net::TcpStream;
-
-    let addr = format!("127.0.0.1:{port}");
-    if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)).is_ok() {
-        return Ok(());
-    }
-
-    eprintln!("* daemon not running; starting it now at tcp:{port} *");
-
-    // AOSP fork-server protocol:
-    //   pipe() → fork() → child exec's "adb -L tcp:5037 fork-server server --reply-fd N"
-    //   → parent reads "OK\n" from pipe → server is ready.
-    //
-    // The pipe fd is passed as --reply-fd. The server clears CLOEXEC on it
-    // so the child process inherits the write end across exec().
-    let exe = std::env::current_exe().map_err(|e| format!("Cannot get executable path: {e}"))?;
-    let exe_cstr = std::ffi::CString::new(exe.to_str().ok_or("Executable path is not valid UTF-8")?)
-        .map_err(|_| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Executable path contains null byte")))?;
-
-    let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
-    let rc = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
-    if rc != 0 {
-        return Err(format!("pipe() failed: errno={}", unsafe { *libc::__errno() }).into());
-    }
-    let pipe_read = pipe_fds[0];
-    let pipe_write = pipe_fds[1];
-
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        let _ = unsafe { libc::close(pipe_read) };
-        let _ = unsafe { libc::close(pipe_write) };
-        return Err(format!("fork() failed: errno={}", unsafe { *libc::__errno() }).into());
-    }
-
-    if pid == 0 {
-        // ---- child process ----
-        unsafe {
-            libc::close(pipe_read);
-        }
-        // Clear CLOEXEC so pipe_write survives exec()
-        unsafe {
-            libc::fcntl(pipe_write, libc::F_SETFD, 0);
-        }
-
-        // argv: adb-rs fork-server --reply-fd N
-        let fork_server = std::ffi::CString::new("fork-server").unwrap();
-        let reply_fd_arg = std::ffi::CString::new("--reply-fd").unwrap();
-        let reply_fd_str = std::ffi::CString::new(pipe_write.to_string()).unwrap();
-
-        // Build null-terminated argv array
-        let mut raw_args: Vec<*const libc::c_char> = Vec::with_capacity(5);
-        raw_args.push(exe_cstr.as_ptr());
-        raw_args.push(fork_server.as_ptr());
-        raw_args.push(reply_fd_arg.as_ptr());
-        raw_args.push(reply_fd_str.as_ptr());
-        raw_args.push(std::ptr::null::<libc::c_char>());
-
-        unsafe {
-            libc::execv(exe_cstr.as_ptr(), raw_args.as_ptr());
-        }
-        // execv only returns on error
-        unsafe {
-            libc::_exit(127);
-        }
-    }
-
-    // ---- parent process ----
-    unsafe {
-        libc::close(pipe_write);
-    }
-
-    // Wait for "OK\n" (3 bytes) from the server
-    let mut ok_buf = [0u8; 3];
-    let mut total_read = 0;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-
-    loop {
-        if total_read >= 3 {
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            // Timeout — server failed to start
-            unsafe {
-                libc::close(pipe_read);
-            }
-            // Try to reap the child
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-                let mut status: libc::c_int = 0;
-                libc::waitpid(pid, &mut status, 0);
-            }
-            return Err("Timeout waiting for ADB server to start".into());
-        }
-
-        let n = unsafe {
-            libc::read(
-                pipe_read,
-                ok_buf[total_read..].as_mut_ptr() as *mut libc::c_void,
-                3 - total_read,
-            )
-        };
-        if n > 0 {
-            total_read += n as usize;
-        } else if n == 0 {
-            // EOF without OK — server exited
-            break;
-        } else {
-            let err = unsafe { *libc::__errno() };
-            if err == libc::EINTR {
-                continue;
-            }
-            // EAGAIN/EWOULDBLOCK — retry
-            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            break;
-        }
-    }
-
-    unsafe {
-        libc::close(pipe_read);
-    }
-
-    if &ok_buf == b"OK\n" {
-        eprintln!("* daemon started successfully *");
-        Ok(())
-    } else {
-        // Server exited before sending OK
-        let mut status: libc::c_int = 0;
-        unsafe {
-            libc::waitpid(pid, &mut status, 0);
-        }
-        Err(format!(
-            "ADB server daemon exited with status {}",
-            status
-        )
-        .into())
-    }
-}
-
-/// Kill the running ADB server on 127.0.0.1:5037.
-pub fn kill_server() -> Result<(), Box<dyn std::error::Error>> {
-    kill_server_at(ADB_SERVER_PORT)
-}
-
-pub fn kill_server_at(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    use std::net::TcpStream;
-
-    let addr = format!("127.0.0.1:{port}");
-    let mut transport = match AdbServerTransport::connect_timeout(&addr, Duration::from_secs(1)) {
-        Ok(t) => t,
-        Err(_) => {
-            // Server not running
-            return Ok(());
-        }
-    };
-
-    transport.send_host_request("host:kill")?;
-    transport.read_status()?;
-
-    // Wait for process termination
-    let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(3);
-    while start.elapsed() < timeout {
-        if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(100)).is_err() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    Ok(())
-}
+/// Connect to ADB server (port 5037), switch transport if needed, and execute a host command.
 
 /// Connect to ADB server (port 5037), switch transport if needed, and execute a host command.
 fn host_command(
@@ -1142,17 +598,6 @@ fn host_command(
     let result = server.execute_host_command(request)
         .map_err(|e| format!("ADB host command failed: {e}"))?;
     Ok(result)
-}
-
-/// Connect to adbd, handshake, run shell, return captured output.
-#[allow(dead_code)]
-fn shell_over_adbd(cmd: &str, addr: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let transport = TcpTransport::connect_timeout(addr, Duration::from_secs(3))
-        .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-    let (_info, mut transport) =
-        connect_and_handshake_with_tls_upgrade(transport, b"host::features=shell_v2,cmd", default_auth())?;
-    let captured = run_shell(&mut transport, cmd, true)?;
-    Ok(captured.unwrap_or_default())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1208,7 +653,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     server.send_host_request(&shell_service)?;
                     server.read_status()?; // OKAY -> server created A_OPEN, device OK'd
                     // Now in raw forwarding mode — stream shell output
-                    stream_shell_v2_server(&mut server, false)?;
+                    shell::stream_shell_v2_server(&mut server, false)?;
                     return Ok(());
                 }
             }
@@ -1243,8 +688,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => return Err(e),
             };
 
-            let (_lid, remote_id) = open_service(&mut transport, &shell_service, 1)?;
-            stream_shell_v2(&mut transport, _lid, remote_id, false)?;
+            let (_lid, remote_id) = protocol::open_service(&mut transport, &shell_service, 1)?;
+            shell::stream_shell_v2(&mut transport, _lid, remote_id, false)?;
         }
         Commands::ExecOut { command } => {
             let cmd_str = command.join(" ");
@@ -1258,7 +703,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     server.send_host_request(&exec_service)?;
                     server.read_status()?; // OKAY -> server created A_OPEN, device OK'd
                     // Raw forwarding mode — exec: outputs raw bytes, no ShellV2 framing
-                    stream_raw_server(&mut server, false)?;
+                    exec_out::stream_raw_server(&mut server, false)?;
                     return Ok(());
                 }
             }
@@ -1293,7 +738,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => return Err(e),
             };
 
-            run_exec_out(&mut transport, &cmd_str)?;
+            exec_out::run_exec_out(&mut transport, &cmd_str)?;
         }
         Commands::Push { local, remote } => {
             let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
@@ -1431,7 +876,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
 
             // Open sync: service
-            let (local_id, remote_id) = open_service(&mut transport, "sync:", 1)?;
+            let (local_id, remote_id) = protocol::open_service(&mut transport, "sync:", 1)?;
 
             // Build SEND request
             let mut send_buf = Vec::new();
@@ -1440,10 +885,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[adb-rs] Pushing {file_name} ({} bytes) to {remote_apk} ...", apk_data.len());
 
             // Send SEND request
-            send_wrte(&mut transport, local_id, remote_id, &send_buf)?;
+            protocol::send_wrte(&mut transport, local_id, remote_id, &send_buf)?;
 
             // Expect SYNC_OKAY
-            recv_sync_response(&mut transport, local_id, remote_id)?;
+            protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
 
             // Send DATA chunks (max 64KB each)
             const MAX_CHUNK: usize = 64 * 1024;
@@ -1451,17 +896,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut data_buf = Vec::new();
                 build_sync_data_chunk(chunk, &mut data_buf)
                     .map_err(|e| format!("Build DATA chunk failed: {e}"))?;
-                send_wrte(&mut transport, local_id, remote_id, &data_buf)?;
+                protocol::send_wrte(&mut transport, local_id, remote_id, &data_buf)?;
             }
 
             // Send DONE
             let mut done_buf = Vec::new();
             build_sync_done(0xFFFF_FFFF, &mut done_buf) // use max mtime
                 .map_err(|e| format!("Build DONE failed: {e}"))?;
-            send_wrte(&mut transport, local_id, remote_id, &done_buf)?;
+            protocol::send_wrte(&mut transport, local_id, remote_id, &done_buf)?;
 
             // Expect SYNC_OKAY or SYNC_FAIL
-            recv_sync_response(&mut transport, local_id, remote_id)?;
+            protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
 
             // Close sync connection
             let clse_hdr = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
@@ -1473,7 +918,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Run pm install via shell
             let install_cmd = format!("pm install -r \"{remote_apk}\"");
-            let result = run_shell(&mut transport, &install_cmd, true)?;
+            let result = shell::run_shell(&mut transport, &install_cmd, true)?;
             let output = result.unwrap_or_default();
             let output_str = String::from_utf8_lossy(&output).trim().to_string();
 
@@ -1486,7 +931,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Clean up temp APK
-            let _ = run_shell(&mut transport, &format!("rm -f \"{remote_apk}\""), false);
+            let _ = shell::run_shell(&mut transport, &format!("rm -f \"{remote_apk}\""), false);
         }
 
         Commands::Uninstall { package } => {
@@ -1499,7 +944,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
 
             let cmd = format!("pm uninstall {package}");
-            let result = run_shell(&mut transport, &cmd, true)?;
+            let result = shell::run_shell(&mut transport, &cmd, true)?;
             let output = result.unwrap_or_default();
             let output_str = String::from_utf8_lossy(&output).trim().to_string();
 
@@ -1527,8 +972,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("logcat {}", args.join(" "))
             };
             let dest = format!("shell,v2,raw:{logcat_cmd}");
-            let (local_id, remote_id) = open_service(&mut transport, &dest, 1)?;
-            stream_shell_v2(&mut transport, local_id, remote_id, false)?;
+            let (local_id, remote_id) = protocol::open_service(&mut transport, &dest, 1)?;
+            shell::stream_shell_v2(&mut transport, local_id, remote_id, false)?;
         }
 
         Commands::Bugreport { output } => {
@@ -1542,8 +987,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let dest = "shell,v2,raw:bugreport".to_string();
             println!("[adb-rs] Capturing bugreport from {addr} ...");
-            let (local_id, remote_id) = open_service(&mut transport, &dest, 1)?;
-            let captured = stream_shell_v2(&mut transport, local_id, remote_id, true)?;
+            let (local_id, remote_id) = protocol::open_service(&mut transport, &dest, 1)?;
+            let captured = shell::stream_shell_v2(&mut transport, local_id, remote_id, true)?;
             let data = captured.unwrap_or_default();
 
             let out_path = output.as_deref().unwrap_or("bugreport.zip");
