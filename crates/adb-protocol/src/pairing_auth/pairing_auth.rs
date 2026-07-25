@@ -464,6 +464,7 @@ impl ExtendedPoint {
 // X25519 Montgomery ladder
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn x25519_ladder(scalar: &[u8; 32], point_u: &[u8; 32]) -> [u8; 32] {
     let mut k = *scalar;
     k[0] &= 248;

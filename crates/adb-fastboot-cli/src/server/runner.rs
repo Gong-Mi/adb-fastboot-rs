@@ -14,8 +14,10 @@ use crate::server::watcher::usb_device_watcher;
 
 pub fn run_server() -> ! {
     run_server_fork(None, ADB_SERVER_PORT);
-    // unreachable after run_server_fork calls process::exit
-    std::process::exit(0);
+    #[allow(unreachable_code)]
+    {
+        std::process::exit(0);
+    }
 }
 
 /// Start the ADB server in fork-server mode.

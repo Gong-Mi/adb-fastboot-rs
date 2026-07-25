@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -2004,6 +2005,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        #[allow(unreachable_patterns)]
         _ => todo!("command not yet implemented"),
     }
 

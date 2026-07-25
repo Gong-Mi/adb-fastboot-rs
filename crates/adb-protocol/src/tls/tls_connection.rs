@@ -63,6 +63,7 @@ pub enum TlsError {
 /// # Errors
 /// - `io::ErrorKind::UnexpectedEof` if fewer bytes than `buf.len()` are available.
 /// - Any other `io::Error` from the underlying reader.
+#[allow(non_snake_case)]
 pub fn ReadFully<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < buf.len() {
@@ -86,6 +87,7 @@ pub fn ReadFully<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
 /// # Errors
 /// - `io::ErrorKind::WriteZero` if the writer accepts zero bytes.
 /// - Any other `io::Error` from the underlying writer.
+#[allow(non_snake_case)]
 pub fn WriteFully<W: Write>(writer: &mut W, data: &[u8]) -> io::Result<()> {
     writer.write_all(data)
 }
@@ -187,6 +189,7 @@ impl<IO: Read + Write> TlsConnection<IO> {
     /// Read exactly `buf.len()` bytes, retrying on partial reads.
     ///
     /// Delegates to [`ReadFully`] on the inner TLS stream.
+    #[allow(non_snake_case)]
     pub fn ReadFully(&mut self, buf: &mut [u8]) -> io::Result<()> {
         match self {
             TlsConnection::Client(ref mut s) => ReadFully(s, buf),
@@ -197,6 +200,7 @@ impl<IO: Read + Write> TlsConnection<IO> {
     /// Write all bytes from `data`, retrying on partial writes.
     ///
     /// Delegates to [`WriteFully`] on the inner TLS stream.
+    #[allow(non_snake_case)]
     pub fn WriteFully(&mut self, data: &[u8]) -> io::Result<()> {
         match self {
             TlsConnection::Client(ref mut s) => WriteFully(s, data),

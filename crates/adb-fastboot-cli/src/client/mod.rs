@@ -1,4 +1,5 @@
 //! Client-side ADB protocol helpers.
+#![allow(dead_code, unused_variables)]
 //!
 //! Maps to AOSP `vendor/adb/client/`:
 //! - adb_client.cpp        → transport, protocol, host_command

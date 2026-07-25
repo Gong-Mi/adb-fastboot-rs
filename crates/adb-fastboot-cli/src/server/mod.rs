@@ -1,4 +1,5 @@
 //! ADB Server — maps to AOSP `vendor/adb/` (top-level .cpp files).
+#![allow(dead_code)]
 //!
 //! Module structure mirrors AOSP source layout:
 //! - runner.rs  → adb.cpp (run_server, launch_server)
