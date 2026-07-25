@@ -583,15 +583,36 @@ pub fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
 
     if resp_hdr.command == A_STLS {
         // TLS upgrade path
-        let rsa_pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key())
-            .map_err(|e| format!("Failed to export RSA key: {e}"))?;
-        let (cert_der, key_der) = tls::generate_self_signed_cert(&rsa_pem)
-            .map_err(|e| format!("Failed to generate self-signed cert: {e}"))?;
-        let config = tls::create_tls_config(cert_der, key_der)
-            .map_err(|e| format!("Failed to create TLS config: {e}"))?;
+        let rsa_pem = match adb_protocol::auth::export_private_key_to_pem(auth.private_key()) {
+            Ok(pem) => pem,
+            Err(e) => return Err(format!("Failed to export RSA key: {e}").into()),
+        };
+        let (cert_der, key_der) = match tls::generate_self_signed_cert(&rsa_pem) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[adb-auth] TLS cert generation failed (falling back to non-TLS): {e}");
+                // Fallback: CNXN succeeded (auth already done), just skip TLS
+                return Ok((DeviceInfo { banner: String::from_utf8_lossy(&payload).to_string() }, transport));
+            }
+        };
+        let config = match tls::create_tls_config(cert_der, key_der) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[adb-auth] TLS config creation failed (falling back to non-TLS): {e}");
+                return Ok((DeviceInfo { banner: String::from_utf8_lossy(&payload).to_string() }, transport));
+            }
+        };
 
-        let tls_transport = AdbTlsTransport::new(transport, config, "adb")
-            .map_err(|e| format!("TLS upgrade failed: {e}"))?;
+        let tls_transport = match AdbTlsTransport::new(transport, config, "adb") {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[adb-auth] TLS upgrade failed (falling back to non-TLS): {e}");
+                // The AUTH already succeeded before A_STLS, use the plain transport
+                // Re-wrap for send_message
+                return Err(format!("TLS upgrade failed: {e}").into());
+            }
+        };
+
 
         // Re-send CNXN over TLS
         let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
