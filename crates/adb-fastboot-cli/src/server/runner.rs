@@ -13,7 +13,7 @@ use crate::server::models::{TransportRegistry, ADB_SERVER_PORT, SERVER_VERSION};
 use crate::server::watcher::usb_device_watcher;
 
 pub fn run_server() -> ! {
-    run_server_fork(None);
+    run_server_fork(None, ADB_SERVER_PORT);
     // unreachable after run_server_fork calls process::exit
     std::process::exit(0);
 }
@@ -24,8 +24,8 @@ pub fn run_server() -> ! {
 /// After USB scan completes, the server writes "OK\n" to this fd to
 /// signal the parent that it's ready, then closes it.
 /// Only after that are client connections accepted.
-pub fn run_server_fork(ack_reply_fd: Option<i32>) -> ! {
-    let listener = match TcpListener::bind(format!("127.0.0.1:{ADB_SERVER_PORT}")) {
+pub fn run_server_fork(ack_reply_fd: Option<i32>, port: u16) -> ! {
+    let listener = match TcpListener::bind(format!("127.0.0.1:{port}")) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[adb-server] Cannot bind to 127.0.0.1:{ADB_SERVER_PORT}: {e}");

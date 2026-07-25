@@ -23,6 +23,16 @@ use client::transport::resolve_target_addr;
 pub const ADBD_PORT: u16 = 5555;
 pub const ADB_SERVER_PORT: u16 = 5037;
 
+/// Parse `tcp:host:port` or `tcp:port` from the `-L` argument. Returns port only.
+fn parse_server_addr(addr: &str) -> Option<u16> {
+    let rest = addr.strip_prefix("tcp:")?;
+    if let Some((_host, port_str)) = rest.rsplit_once(':') {
+        port_str.parse().ok()
+    } else {
+        rest.parse().ok()
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "adb-rs", author, version, about = "Rust ADB Command-Line Interface")]
 pub struct Cli {
@@ -33,8 +43,22 @@ pub struct Cli {
     #[arg(short = 'd', global = true)]
     pub d: bool,
 
+    /// Transport address (-L tcp:localhost:5037)
+    #[arg(short = 'L', long = "listen", global = true)]
+    pub transport: Option<String>,
+
+    /// Server port (-P 5037)
+    #[arg(short = 'P', global = true)]
+    pub port: Option<u16>,
+
     #[command(subcommand)]
     pub command: Commands,
+}
+
+#[derive(Subcommand)]
+pub enum MdnsCommands {
+    /// Check mDNS availability
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -112,14 +136,26 @@ pub enum Commands {
     Usb,
     /// Show log output from device
     Logcat {
+        #[arg(default_value = "logcat", trailing_var_arg = true)]
         args: Vec<String>,
     },
     /// Generate a bugreport and save to file
     Bugreport {
-        output: Option<String>,
+        path: Option<String>,
     },
     /// List JDWP PIDs (uses ADB server on port 5037)
     Jdwp,
+    /// mDNS service operations
+    #[command(name = "mdns", subcommand)]
+    Mdns(MdnsCommands),
+    /// Emulator console commands
+    #[command(name = "emu")]
+    Emu {
+        args: Vec<String>,
+    },
+    /// Print version information
+    #[command(name = "version")]
+    Version,
     /// Get device state: offline, device, recovery, etc.
     #[command(name = "get-state")]
     GetState,
@@ -140,6 +176,9 @@ pub enum Commands {
     /// Internal: fork-server mode (started by the adb client)
     #[command(name = "fork-server", hide = true)]
     ForkServer {
+        /// Mode argument — AOSP passes "server" here (ignored)
+        mode: Option<String>,
+
         #[arg(long = "reply-fd")]
         reply_fd: i32,
     },
@@ -926,7 +965,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             shell::stream_shell_v2(&mut transport, local_id, remote_id, false)?;
         }
 
-        Commands::Bugreport { output } => {
+        Commands::Bugreport { path } => {
             let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
             let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
@@ -941,7 +980,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let captured = shell::stream_shell_v2(&mut transport, local_id, remote_id, true)?;
             let data = captured.unwrap_or_default();
 
-            let out_path = output.as_deref().unwrap_or("bugreport.zip");
+            let out_path = path.as_deref().unwrap_or("bugreport.zip");
             std::fs::write(out_path, &data)
                 .map_err(|e| format!("Failed to write bugreport to {out_path}: {e}"))?;
             println!("[adb-rs] Bugreport saved to {out_path} ({} bytes)", data.len());
@@ -965,6 +1004,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        Commands::Mdns(MdnsCommands::Check) => {
+            // Return nothing to indicate mDNS is not available via CLI
+            println!("");
+        }
+
+        Commands::Emu { args } => {
+            let cmd = args.join(" ");
+            let resp = host_command(cli.serial.as_deref(), &format!("host:emu:{}", cmd))?;
+            println!("{}", resp.trim());
+        }
+
+        Commands::Version => {
+            println!("Android Debug Bridge version {}", env!("CARGO_PKG_VERSION"));
+            println!("Revision {}-android", &env!("CARGO_PKG_VERSION")[..12.min(env!("CARGO_PKG_VERSION").len())]);
         }
 
         Commands::GetState => {
@@ -1015,8 +1070,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             kill_server()?;
         }
 
-        Commands::ForkServer { reply_fd } => {
-            server::run_server_fork(Some(*reply_fd));
+        Commands::ForkServer { mode: _, reply_fd } => {
+            let addr = cli.transport.as_deref().unwrap_or("tcp:127.0.0.1:5037");
+            let port = parse_server_addr(addr).unwrap_or(ADB_SERVER_PORT);
+            server::run_server_fork(Some(*reply_fd), port);
         }
 
         Commands::Connect { host, port } => {
