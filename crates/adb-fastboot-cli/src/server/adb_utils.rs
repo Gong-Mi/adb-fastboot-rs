@@ -171,6 +171,37 @@ pub fn get_log_file_path() -> PathBuf {
     PathBuf::from(format!("{}/adb.{}.log", tmp_dir, unsafe { libc::getuid() }))
 }
 
+/// Parse an unsigned 32-bit integer from a string, supporting trailing text.
+///
+/// Returns `(value, remaining)` on success, where `remaining` is the text
+/// after the parsed integer.  Returns `None` if the string doesn't start
+/// with a valid non-negative integer, or if the value overflows `u32`.
+///
+/// Mirrors AOSP `ParseUint()` in `adb_utils.h`.
+pub fn parse_uint(s: &str) -> Option<(u32, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() || !s.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    let mut value = 0u64;
+    let mut consumed = 0usize;
+    for &b in s.as_bytes() {
+        if !b.is_ascii_digit() { break; }
+        value = value.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+        if value > u32::MAX as u64 {
+            // Check if this would overflow u32 with more digits
+            return None;
+        }
+        consumed += 1;
+    }
+    // Also reject if with leading zero it overflows
+    let trimmed = &s[..consumed];
+    // Verify no overflow for the exact parsed value
+    let val: u64 = trimmed.parse().ok()?;
+    if val > u32::MAX as u64 { return None; }
+    Some((val as u32, &s[consumed..]))
+}
+
 // ---------------------------------------------------------------------------
 // Shell argument escaping (AOSP: escape_arg, implemented as QuoteArgument)
 // ---------------------------------------------------------------------------
@@ -310,6 +341,32 @@ mod tests {
         assert!(forward_targets_are_valid("tcp:-1", "tcp:5555").is_err());
         assert!(forward_targets_are_valid("tcp:0", "tcp:0").is_err());
         assert!(forward_targets_are_valid("local:/tmp/sock", "tcp:5555").is_ok());
+        // Source port cannot be negative
+        assert!(forward_targets_are_valid("tcp:-1", "tcp:9000").is_err());
+        // Source port can be 0
+        assert!(forward_targets_are_valid("tcp:0", "tcp:9000").is_ok());
+        assert!(forward_targets_are_valid("tcp:8000", "tcp:9000").is_ok());
+        // Destination port must be >0
+        assert!(forward_targets_are_valid("tcp:8000", "tcp:-1").is_err());
+        assert!(forward_targets_are_valid("tcp:8000", "tcp:0").is_err());
+        // Non-numeric
+        assert!(forward_targets_are_valid("tcp:", "tcp:9000").is_err());
+        assert!(forward_targets_are_valid("tcp:a", "tcp:9000").is_err());
+        assert!(forward_targets_are_valid("tcp:8000", "tcp:").is_err());
+        assert!(forward_targets_are_valid("tcp:8000", "tcp:a").is_err());
+    }
+
+    #[test]
+    fn test_parse_uint() {
+        assert_eq!(parse_uint(""), None);
+        assert_eq!(parse_uint("foo"), None);
+        assert_eq!(parse_uint("foo123"), None);
+        assert_eq!(parse_uint("-1"), None);
+        assert_eq!(parse_uint("123"), Some((123, "")));
+        assert_eq!(parse_uint("9999999999999999999999999"), None);
+        assert_eq!(parse_uint(&u32::MAX.to_string()), Some((u32::MAX, "")));
+        assert_eq!(parse_uint(&format!("0{}", u32::MAX)), Some((u32::MAX, "")));
+        assert_eq!(parse_uint("123abc"), Some((123, "abc")));
     }
 
     #[test]
