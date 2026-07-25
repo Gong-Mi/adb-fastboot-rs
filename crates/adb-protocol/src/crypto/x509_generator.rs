@@ -1,7 +1,9 @@
 //! X.509 certificate generation from RSA 2048 private keys,
 //! mirroring AOSP `vendor/adb/crypto/x509_generator.cpp`.
 
-use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose,
+};
 use thiserror::Error;
 
 /// Errors that can occur during X.509 certificate generation.
@@ -35,14 +37,21 @@ pub fn generate_self_signed_cert(
         .map_err(|e| CertError::InvalidPrivateKey(e.to_string()))?;
 
     let mut params = CertificateParams::new(vec!["adb".to_string()])?;
+
+    // Match AOSP's x509_generator.cpp: CA:TRUE, keyCertSign, 10-year validity
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(rcgen::DnType::CountryName, "US");
+    params.distinguished_name.push(rcgen::DnType::OrganizationName, "Android");
+    params.distinguished_name.push(rcgen::DnType::CommonName, "Adb");
+
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
         KeyUsagePurpose::DigitalSignature,
-        KeyUsagePurpose::KeyEncipherment,
     ];
-    params.extended_key_usages = vec![
-        ExtendedKeyUsagePurpose::ServerAuth,
-        ExtendedKeyUsagePurpose::ClientAuth,
-    ];
+    // AOSP does NOT set extendedKeyUsage for ADB TLS certs
+    params.extended_key_usages = vec![];
     let cert = params.self_signed(&key_pair)?;
 
     let cert_der = cert.der().to_vec();
