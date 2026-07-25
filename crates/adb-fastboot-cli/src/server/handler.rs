@@ -1,6 +1,11 @@
 //! ADB Client handler — host service dispatch loop.
 //!
 //! Mirrors AOSP `sockets.cpp` → handle_client, smart_socket.
+//!
+//! The main entry point [`handle_client`] delegates to [`run_smart_socket_loop`]
+//! which implements the full asocket state machine (hex-length prefix parsing,
+//! host service dispatch, transport selection, and device service bridging).
+//! [`dispatch_host_service`] remains here for reuse by the smart socket module.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -9,77 +14,26 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::server::bridge::bridge_to_device;
 use crate::server::forward::{handle_forward, handle_reverse};
 use crate::server::models::{
     is_usable_state, DeviceOrigin, TransportRegistry, SERVER_VERSION,
 };
+use crate::server::smart_socket;
 
 // ---------------------------------------------------------------------------
 // Client handler
 // ---------------------------------------------------------------------------
 
 pub(crate) fn handle_client(
-    mut client: TcpStream,
+    client: TcpStream,
     registry: &Arc<Mutex<TransportRegistry>>,
     running: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let _ = client.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = client.set_nodelay(true);
 
-    loop {
-        let mut len_buf = [0u8; 4];
-        if client.read_exact(&mut len_buf).is_err() {
-            return Ok(());
-        }
-        let len_str =
-            std::str::from_utf8(&len_buf).map_err(|_| "Invalid UTF-8 in length prefix".to_string())?;
-        let cmd_len = usize::from_str_radix(len_str, 16)
-            .map_err(|_| format!("Invalid hex length: {len_str}"))?;
-
-        if cmd_len == 0 || cmd_len > 4096 {
-            return Err(format!("Invalid command length: {cmd_len}"));
-        }
-
-        let mut cmd_buf = vec![0u8; cmd_len];
-        client
-            .read_exact(&mut cmd_buf)
-            .map_err(|e| format!("Failed to read command: {e}"))?;
-        let cmd = String::from_utf8(cmd_buf)
-            .map_err(|_| "Command is not valid UTF-8".to_string())?;
-
-        let is_transport_cmd = cmd.starts_with("host:transport:")
-            || cmd.starts_with("host:tport:")
-            || cmd.starts_with("host:transport-id:");
-
-        dispatch_host_service(&mut client, &cmd, registry, running)?;
-
-        if is_transport_cmd {
-            // dispatch_host_service already sent OKAY — now enter bridge mode.
-            // Move client into the bridge (this function is the last use).
-            let serial: String = if cmd.starts_with("host:transport:") {
-                cmd["host:transport:".len()..].to_string()
-            } else if cmd.starts_with("host:tport:serial:") {
-                cmd["host:tport:serial:".len()..].to_string()
-            } else if cmd.starts_with("host:transport-id:") {
-                let id_str = &cmd["host:transport-id:".len()..];
-                let tid: u64 = id_str.parse().map_err(|_| format!("invalid transport id: {id_str}"))?;
-                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-                reg.find_by_transport_id(tid)
-                    .map(|d| d.serial.clone())
-                    .ok_or_else(|| format!("transport id {tid} not found"))?
-            } else {
-                // host:tport: or host:tport:any — find any device
-                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-                reg.find_any_device()
-                    .map(|d| d.serial.clone())
-                    .ok_or_else(|| "no devices available".to_string())?
-            };
-            let _ = bridge_to_device(client, serial, registry)?;
-            // bridge always returns at this point, but in case of false…
-            return Ok(());
-        }
-    }
+    // Delegate to the smart socket state machine.
+    smart_socket::run_smart_socket_loop(client, registry, running)
 }
 
 // ---------------------------------------------------------------------------

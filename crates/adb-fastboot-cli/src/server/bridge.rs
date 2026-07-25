@@ -76,7 +76,7 @@ pub(crate) fn bridge_to_device(
 ///
 /// TCP devices may require AUTH (same as USB).  This function sends A_CNXN,
 /// then loops on A_AUTH until A_CNXN is received or auth fails.
-fn tcp_auth_handshake(
+pub(crate) fn tcp_auth_handshake(
     mut transport: Box<dyn Transport>,
     _serial: &str,
 ) -> Result<Box<dyn Transport>, String> {

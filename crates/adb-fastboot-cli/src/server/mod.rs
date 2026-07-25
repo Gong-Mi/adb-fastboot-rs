@@ -23,6 +23,7 @@ pub mod handler;
 pub mod models;
 pub mod runner;
 pub mod services;
+pub mod smart_socket;
 pub mod socket_spec;
 pub mod sysdeps_posix_network;
 pub mod sysdeps_unix;
