@@ -553,6 +553,60 @@ fn peek_dns_record(data: &[u8], offset: usize) -> Result<(DnsRecordPeek, usize),
     Ok((DnsRecordPeek { consumed, len_diff }, rdlength))
 }
 
+// ---------------------------------------------------------------------------
+// mDNS service name validation (RFC 6335)
+// ---------------------------------------------------------------------------
+
+/// ADB mDNS service type identifiers (AOSP: `adb_mdns.h`).
+pub const ADB_MDNS_SERVICE_TYPE: &str = "adb";
+pub const ADB_MDNS_TLS_PAIRING_TYPE: &str = "adb-tls-pairing";
+pub const ADB_MDNS_TLS_CONNECT_TYPE: &str = "adb-tls-connect";
+
+/// Validate an mDNS service name per [RFC 6335](https://www.rfc-editor.org/rfc/rfc6335).
+///
+/// Rules:
+/// - 1–15 characters long
+/// - Only letters, digits, hyphens
+/// - Must begin and end with letter or digit
+/// - No consecutive hyphens
+/// - At least one letter
+///
+/// Mirrors AOSP `mdns_test.cpp` → `isValidMdnsServiceName()`.
+pub fn is_valid_mdns_service_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 15 {
+        return false;
+    }
+
+    let bytes = name.as_bytes();
+    let mut has_letter = false;
+    let mut saw_hyphen = false;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'-' => {
+                // Cannot be at beginning or end
+                if i == 0 || i == bytes.len() - 1 {
+                    return false;
+                }
+                if saw_hyphen {
+                    return false; // consecutive hyphens
+                }
+                saw_hyphen = true;
+            }
+            b'a'..=b'z' | b'A'..=b'Z' => {
+                saw_hyphen = false;
+                has_letter = true;
+            }
+            b'0'..=b'9' => {
+                saw_hyphen = false;
+            }
+            _ => return false, // invalid character
+        }
+    }
+
+    has_letter
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +640,51 @@ mod tests {
         encode_dns_name(&mut buf, name);
         let decoded = decode_dns_name(&buf, 0).unwrap();
         assert_eq!(decoded, "_adb-tls-connect._tcp.local.");
+    }
+
+    // -- RFC 6335 service name validation -----------------------------------
+
+    #[test]
+    fn test_is_valid_mdns_service_name_too_long() {
+        assert!(!is_valid_mdns_service_name("abcd1234abcd1234"));
+    }
+
+    #[test]
+    fn test_is_valid_mdns_service_name_invalid_chars() {
+        assert!(!is_valid_mdns_service_name("a*a"));
+        assert!(!is_valid_mdns_service_name("a_a"));
+        assert!(!is_valid_mdns_service_name("_a"));
+    }
+
+    #[test]
+    fn test_is_valid_mdns_service_name_edge_cases() {
+        assert!(!is_valid_mdns_service_name(""));
+        assert!(!is_valid_mdns_service_name("-"));
+        assert!(!is_valid_mdns_service_name("-a"));
+        assert!(!is_valid_mdns_service_name("-1"));
+        assert!(!is_valid_mdns_service_name("a-"));
+        assert!(!is_valid_mdns_service_name("1-"));
+        assert!(!is_valid_mdns_service_name("a--a"));
+        assert!(!is_valid_mdns_service_name("1"));
+        assert!(!is_valid_mdns_service_name("12"));
+        assert!(!is_valid_mdns_service_name("1-2"));
+    }
+
+    #[test]
+    fn test_is_valid_mdns_service_name_valid() {
+        assert!(is_valid_mdns_service_name("a"));
+        assert!(is_valid_mdns_service_name("a1"));
+        assert!(is_valid_mdns_service_name("1A"));
+        assert!(is_valid_mdns_service_name("aZ"));
+        assert!(is_valid_mdns_service_name("a-Z"));
+        assert!(is_valid_mdns_service_name("a-b-Z"));
+        assert!(is_valid_mdns_service_name("abc-def-123-456"));
+    }
+
+    #[test]
+    fn test_adb_mdns_service_names_valid() {
+        assert!(is_valid_mdns_service_name(ADB_MDNS_SERVICE_TYPE));
+        assert!(is_valid_mdns_service_name(ADB_MDNS_TLS_PAIRING_TYPE));
+        assert!(is_valid_mdns_service_name(ADB_MDNS_TLS_CONNECT_TYPE));
     }
 }
