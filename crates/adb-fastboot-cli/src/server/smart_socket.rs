@@ -441,17 +441,17 @@ fn extract_serial_from_transport_cmd(
         Ok(cmd["host:transport:".len()..].to_string())
     } else if cmd == "host:transport-any" {
         let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-        reg.find_any_device()
+        reg.find_unique_device()
             .map(|d| d.serial.clone())
-            .ok_or_else(|| "no devices available".to_string())
+            .map_err(str::to_string)
     } else if cmd.starts_with("host:tport:serial:") {
         Ok(cmd["host:tport:serial:".len()..].to_string())
     } else if cmd.starts_with("host:tport:") {
         // host:tport:any or host:tport:
         let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-        reg.find_any_device()
+        reg.find_unique_device()
             .map(|d| d.serial.clone())
-            .ok_or_else(|| "no devices available".to_string())
+            .map_err(str::to_string)
     } else if cmd.starts_with("host:transport-id:") {
         let id_str = &cmd["host:transport-id:".len()..];
         let tid: u64 = id_str.parse().map_err(|_| format!("invalid transport id: {id_str}"))?;
@@ -543,7 +543,6 @@ fn bridge_to_device_with_smart(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -559,7 +558,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (stream, _) = listener.accept().unwrap();
             let mut smart = SmartSocket::new(stream);
             let cmd = smart.read_command().unwrap().unwrap();
             assert_eq!(cmd, "host:version");
@@ -579,7 +578,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (stream, _) = listener.accept().unwrap();
             let mut smart = SmartSocket::new(stream.try_clone().unwrap());
             smart.send_okay().unwrap();
             smart.send_fail("test error").unwrap();

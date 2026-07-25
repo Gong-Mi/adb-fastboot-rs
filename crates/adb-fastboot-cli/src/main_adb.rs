@@ -2015,6 +2015,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::server_cmds::kill_server_at;
 
     #[test]
     fn test_kill_server_when_not_running() {

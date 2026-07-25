@@ -543,8 +543,6 @@ pub(crate) fn handle_reverse(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use adb_protocol::{AdbMessageHeader, ADB_VERSION, A_CNXN, MAX_PAYLOAD_V2};
-
     use super::*;
     use crate::server::models::TransportRegistry;
 

@@ -254,7 +254,6 @@ pub fn print_services() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     #[test]
     fn test_registry_basics() {

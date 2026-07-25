@@ -227,6 +227,20 @@ impl TransportRegistry {
         self.devices.iter().find(|d| is_usable_state(d.state))
     }
 
+    /// Select the sole usable transport, matching AOSP's
+    /// `acquire_one_transport(kTransportAny)`: implicit selection is invalid
+    /// when more than one usable device or emulator is registered.
+    pub(crate) fn find_unique_device(&self) -> Result<&DeviceEntry, &'static str> {
+        let mut matches = self.devices.iter().filter(|d| is_usable_state(d.state));
+        let Some(device) = matches.next() else {
+            return Err("no devices/emulators found");
+        };
+        if matches.next().is_some() {
+            return Err("more than one device/emulator");
+        }
+        Ok(device)
+    }
+
     pub(crate) fn upsert_tcp_device(&mut self, addr: SocketAddr, serial: String) {
         if let Some(existing) = self.devices.iter_mut().find(|d| d.serial == serial) {
             existing.state = DeviceState::Device;
@@ -369,6 +383,25 @@ impl TransportRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_unique_device_rejects_implicit_ambiguous_selection() {
+        let mut registry = TransportRegistry::new();
+        registry.devices.clear();
+        assert!(matches!(
+            registry.find_unique_device(),
+            Err("no devices/emulators found")
+        ));
+
+        registry.upsert_tcp_device("127.0.0.1:5555".parse().unwrap(), "one".to_string());
+        assert_eq!(registry.find_unique_device().unwrap().serial, "one");
+
+        registry.upsert_tcp_device("127.0.0.1:5556".parse().unwrap(), "two".to_string());
+        assert!(matches!(
+            registry.find_unique_device(),
+            Err("more than one device/emulator")
+        ));
+    }
 
     #[test]
     fn test_transport_selection_accepts_only_aosp_online_states() {

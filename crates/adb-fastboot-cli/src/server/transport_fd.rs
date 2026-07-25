@@ -466,7 +466,6 @@ impl Transport for TlsFdConnection {
 mod tests {
     use super::*;
     use adb_protocol::{AdbMessageHeader, A_CNXN, MAX_PAYLOAD_V2};
-    use std::os::unix::io::FromRawFd;
 
     /// Helper: create a connected pair of raw fds (socketpair).
     fn socket_pair() -> (RawFd, RawFd) {

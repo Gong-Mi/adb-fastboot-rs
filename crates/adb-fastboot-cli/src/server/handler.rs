@@ -225,14 +225,13 @@ pub(crate) fn dispatch_host_service(
 
         // -- host:transport-any ---------------------------------------------
         "host:transport-any" => {
-            let exists = {
+            let selection = {
                 let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-                reg.find_any_device().is_some()
+                reg.find_unique_device().map(|_| ())
             };
-            if exists {
-                ok_empty(client)
-            } else {
-                fail(client, "no devices available")
+            match selection {
+                Ok(()) => ok_empty(client),
+                Err(error) => fail(client, error),
             }
         }
 
@@ -260,13 +259,12 @@ pub(crate) fn dispatch_host_service(
 
         // -- host:tport: / host:tport:any (AOSP v2 transport-any) --------------
         "host:tport:" | "host:tport:any" => {
-            let device = {
+            let selection = {
                 let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-                reg.find_any_device().cloned()
+                reg.find_unique_device().map(|dev| dev.transport_id)
             };
-            match device {
-                Some(dev) => {
-                    let tid = dev.transport_id;
+            match selection {
+                Ok(tid) => {
                     ok_empty(client)?;
                     let tid_bytes = tid.to_le_bytes();
                     client
@@ -274,7 +272,7 @@ pub(crate) fn dispatch_host_service(
                         .and_then(|_| client.flush())
                         .map_err(|e| format!("write transport_id failed: {e}"))
                 }
-                None => fail(client, "no devices available"),
+                Err(error) => fail(client, error),
             }
         }
 

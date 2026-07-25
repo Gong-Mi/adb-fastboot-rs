@@ -91,7 +91,6 @@ pub fn adb_poll(fd: RawFd, events: i16, timeout_ms: i32) -> std::io::Result<i32>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     #[test]
     fn test_adb_pipe_roundtrip() {
