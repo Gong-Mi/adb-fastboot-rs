@@ -353,7 +353,7 @@ mod tests {
         let key_bob = bob.process_msg(&msg_alice).unwrap();
 
         assert_eq!(key_alice.len(), 32);
-        assert_eq!(key_alice, key_bob);
+        assert_eq!(key_alice, key_bob, "SPAKE2+ keys do not match — known bug: custom Fe/ExtendedPoint field arithmetic needs replacement with ed25519-dalek");
 
         // Mismatched password
         let mut charlie =

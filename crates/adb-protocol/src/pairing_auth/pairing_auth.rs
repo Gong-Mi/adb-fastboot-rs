@@ -19,7 +19,7 @@ pub enum SpakeRole {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Fe(pub [u64; 4]);
+pub(crate) struct Fe(pub [u64; 4]);
 
 impl Fe {
     pub const ZERO: Fe = Fe([0, 0, 0, 0]);
@@ -129,8 +129,16 @@ impl Fe {
             res[i] = sum2;
             carry = (c1 as u64) + (c2 as u64);
         }
+        if carry > 0 {
+            let mut add_carry = carry * 38;
+            for i in 0..4 {
+                let (sum, c) = res[i].overflowing_add(add_carry);
+                res[i] = sum;
+                add_carry = c as u64;
+            }
+        }
         let mut fe = Fe(res);
-        if carry > 0 || fe.gte_p() {
+        if fe.gte_p() {
             fe.sub_p();
         }
         fe
@@ -161,17 +169,15 @@ impl Fe {
     pub fn mul(&self, rhs: &Self) -> Self {
         let a = self.0;
         let b = rhs.0;
-        let mut w = [0u128; 8];
+        let mut w = [0u64; 8];
         for i in 0..4 {
+            let mut carry = 0u128;
             for j in 0..4 {
-                w[i + j] = w[i + j].wrapping_add((a[i] as u128) * (b[j] as u128));
+                let prod = (a[i] as u128) * (b[j] as u128) + (w[i + j] as u128) + carry;
+                w[i + j] = prod as u64;
+                carry = prod >> 64;
             }
-        }
-        let mut carry = 0u128;
-        for i in 0..8 {
-            w[i] += carry;
-            carry = w[i] >> 64;
-            w[i] &= 0xffff_ffff_ffff_ffff;
+            w[i + 4] = (w[i + 4] as u128 + carry) as u64;
         }
 
         let mut h38 = [0u128; 5];
@@ -192,24 +198,17 @@ impl Fe {
         }
         c_add += h38[4];
 
-        let extra_carry = c_add * 38;
-        let sum = (r[0] as u128) + extra_carry;
-        r[0] = sum as u64;
-        let mut c_prop = sum >> 64;
-        for i in 1..4 {
-            let sum = (r[i] as u128) + c_prop;
-            r[i] = sum as u64;
-            c_prop = sum >> 64;
-        }
-        if c_prop > 0 {
-            let sum = (r[0] as u128) + c_prop * 38;
+        let mut extra_carry = c_add * 38;
+        while extra_carry > 0 {
+            let sum = (r[0] as u128) + extra_carry;
             r[0] = sum as u64;
-            let mut c_prop2 = sum >> 64;
+            let mut c_prop = sum >> 64;
             for i in 1..4 {
-                let sum = (r[i] as u128) + c_prop2;
+                let sum = (r[i] as u128) + c_prop;
                 r[i] = sum as u64;
-                c_prop2 = sum >> 64;
+                c_prop = sum >> 64;
             }
+            extra_carry = c_prop * 38;
         }
 
         let fe = Fe(r);
@@ -249,7 +248,9 @@ impl Fe {
         self.pow2255m21()
     }
 
-    pub fn sqrt(&self) -> Option<Self> {
+    pub fn sqrt_d2(&self) -> Option<Self> {
+        // Compute sqrt(x) where p = 2^255 - 19 ≡ 5 (mod 8)
+        // sqrt = x^{(p+3)/8} = x^{2^252-2}
         let exp: [u64; 4] = [
             0xffff_ffff_ffff_fffeu64,
             0xffff_ffff_ffff_ffffu64,
@@ -271,9 +272,7 @@ impl Fe {
                 bit_count += 1;
             }
         }
-
-        let check = r.square();
-        if check.normalized() == self.normalized() {
+        if r.square().normalized() == self.normalized() {
             return Some(r);
         }
         let sqrt_m1 = Fe::from_bytes(&[
@@ -291,9 +290,9 @@ impl Fe {
 
 fn d_const() -> Fe {
     Fe::from_bytes(&[
-        0xa3, 0x78, 0x6d, 0x83, 0xfe, 0x17, 0x1d, 0xef, 0x6b, 0x22, 0x20, 0x04, 0x23, 0x4c,
-        0x05, 0xa7, 0x21, 0x78, 0xa9, 0xa6, 0x1d, 0x99, 0xe3, 0x04, 0x41, 0x20, 0x65, 0x6f,
-        0x84, 0x3d, 0x06, 0x52,
+        0xa3, 0x78, 0x59, 0x13, 0xca, 0x4d, 0xeb, 0x75, 0xab, 0xd8, 0x41, 0x41, 0x4d, 0x0a,
+        0x70, 0x00, 0x98, 0xe8, 0x79, 0x77, 0x79, 0x40, 0xc7, 0x8c, 0x73, 0xfe, 0x6f, 0x2b,
+        0xee, 0x6c, 0x03, 0x52,
     ])
 }
 
@@ -302,7 +301,7 @@ fn d_const() -> Fe {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExtendedPoint {
+pub(crate) struct ExtendedPoint {
     pub x: Fe,
     pub y: Fe,
     pub z: Fe,
@@ -320,30 +319,30 @@ impl ExtendedPoint {
     }
 
     pub fn base() -> Self {
-        Self {
-            x: Fe([0xc9562d608f25d51au64, 0x692cc7609525a7b2u64, 0xc0a4e231fdd6dc5cu64, 0x216936d3cd6e53feu64]),
-            y: Fe([0x6666666666666658u64, 0x6666666666666666u64, 0x6666666666666666u64, 0x6666666666666666u64]),
-            z: Fe([1, 0, 0, 0]),
-            t: Fe([0x6469cfb87b7a60f9u64, 0x403d528b173efd93u64, 0x19dfa89150073ec3u64, 0x67c2937748d9f1b9u64]),
-        }
+        let bytes = [
+            0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0xe6,
+        ];
+        Self::decode(&bytes).unwrap()
     }
 
     pub fn point_n() -> Self {
-        Self {
-            x: Fe([0x662d5fcf767b93a2u64, 0xe9b9fb6c813d09a0u64, 0x339ec55d7f12e2c0u64, 0x3d35272a2a0a2df3u64]),
-            y: Fe([0x07a8e7de30adf310u64, 0x107246b474feb599u64, 0x0d68af06bddcbd3du64, 0x78c73b69119a3271u64]),
-            z: Fe([1, 0, 0, 0]),
-            t: Fe([0x5f8502d91b8d2777u64, 0x2e06a380eb9b09a1u64, 0x7f4803d151978eb3u64, 0x2287c88b0f80bc4fu64]),
-        }
+        let bytes = [
+            0x10, 0xe3, 0xdf, 0x0a, 0xe3, 0x7d, 0x8e, 0x7a, 0x99, 0xb5, 0xfe, 0x74, 0xb4, 0x46,
+            0x72, 0x10, 0x3d, 0xbd, 0xdc, 0xbd, 0x06, 0xaf, 0x68, 0x0d, 0x71, 0x32, 0x9a, 0x11,
+            0x69, 0x3b, 0xc7, 0x78,
+        ];
+        Self::decode(&bytes).unwrap()
     }
 
     pub fn point_m() -> Self {
-        Self {
-            x: Fe([0x08e1a8bb231f4a97u64, 0x7a56114e9f5e130au64, 0x2cf0d5b7ed27d4eeu64, 0x5a2d04a6012431cfu64]),
-            y: Fe([0xadd9ddf64b7eda5au64, 0x5c6b1c13326d62b6u64, 0x538f47a347e3a151u64, 0x2ed1ee881b44cfcfu64]),
-            z: Fe([1, 0, 0, 0]),
-            t: Fe([0x17ea875d9e51f893u64, 0x4841e21b2d075ba7u64, 0x6e9f5ed20b22a61bu64, 0x116e021a8d0554c2u64]),
-        }
+        let bytes = [
+            0x5a, 0xda, 0x7e, 0x4b, 0xf6, 0xdd, 0xd9, 0xad, 0xb6, 0x62, 0x6d, 0x32, 0x13, 0x1c,
+            0x6b, 0x5c, 0x51, 0xa1, 0xe3, 0x47, 0xa3, 0x47, 0x8f, 0x53, 0xcf, 0xcf, 0x44, 0x1b,
+            0x88, 0xee, 0xd1, 0x2e,
+        ];
+        Self::decode(&bytes).unwrap()
     }
 
     pub fn add(&self, rhs: &Self) -> Self {
@@ -365,26 +364,65 @@ impl ExtendedPoint {
     }
 
     pub fn sub(&self, rhs: &Self) -> Self {
-        let neg_rhs = Self {
-            x: Fe::ZERO.sub(&rhs.x),
-            y: rhs.y,
-            z: rhs.z,
-            t: Fe::ZERO.sub(&rhs.t),
-        };
-        self.add(&neg_rhs)
+        let d = d_const();
+        let a_sub = self.y.sub(&self.x).mul(&rhs.y.add(&rhs.x));
+        let b_sub = self.y.add(&self.x).mul(&rhs.y.sub(&rhs.x));
+        let c = d.mul(&Fe([2, 0, 0, 0])).mul(&self.t).mul(&rhs.t);
+        let d_val = Fe([2, 0, 0, 0]).mul(&self.z).mul(&rhs.z);
+
+        let e_sub = b_sub.sub(&a_sub);
+        let h_sub = b_sub.add(&a_sub);
+        let f_sub = d_val.sub(&c);
+        let g_sub = d_val.add(&c);
+
+        Self {
+            x: e_sub.mul(&g_sub),
+            y: h_sub.mul(&f_sub),
+            z: f_sub.mul(&g_sub),
+            t: e_sub.mul(&h_sub),
+        }
     }
 
     pub fn double(&self) -> Self {
-        self.add(self)
+        let a = self.x.square();
+        let b = self.y.square();
+        let c = Fe([2, 0, 0, 0]).mul(&self.z.square());
+        let h = a.add(&b);
+        let x_plus_y = self.x.add(&self.y);
+        let e = h.sub(&x_plus_y.square());
+        let g = a.sub(&b);
+        let f = g.add(&c);
+        Self {
+            x: e.mul(&f),
+            y: g.mul(&h),
+            z: f.mul(&g),
+            t: e.mul(&h),
+        }
+    }
+
+    pub fn scalar_mul(&self, scalar: &[u8; 32]) -> Self {
+        let mut res = Self::identity();
+        let mut base = *self;
+        for &byte in scalar.iter() {
+            for i in 0..8 {
+                if (byte >> i) & 1 == 1 {
+                    res = res.add(&base);
+                }
+                base = base.double();
+            }
+        }
+        res
     }
 
     pub fn encode(&self) -> [u8; 32] {
         let z_inv = self.z.invert();
         let x = self.x.mul(&z_inv);
         let y = self.y.mul(&z_inv);
-        let mut bytes = y.to_bytes();
+        let bytes = y.to_bytes();
         if x.is_negative() {
-            bytes[31] |= 0x80;
+            let mut b = bytes;
+            b[31] |= 0x80;
+            return b;
         }
         bytes
     }
@@ -403,17 +441,10 @@ impl ExtendedPoint {
         let v_inv = v.invert();
         let x2 = u.mul(&v_inv);
 
-        let mut x = x2.sqrt().or_else(|| {
-            let neg_x2 = Fe::ZERO.sub(&x2);
-            neg_x2.sqrt().map(|r| {
-                let sqrt_m1 = Fe::from_bytes(&[
-                    0xb0, 0xa0, 0x0e, 0x4a, 0x27, 0x1b, 0xe3, 0x3c, 0x80, 0x4c, 0x59, 0x7d, 0x33, 0x7b,
-                    0x6d, 0x19, 0x27, 0x3c, 0x52, 0xa5, 0x59, 0x28, 0x81, 0xa7, 0xb7, 0x44, 0xa1, 0x0f,
-                    0x96, 0x5f, 0x72, 0x2b,
-                ]);
-                r.mul(&sqrt_m1)
-            })
-        }).unwrap_or(Fe::ZERO);
+        let mut x = match x2.sqrt_d2() {
+            Some(x) => x,
+            None => return None,
+        };
 
         if (x.is_negative() as u8) != x_sign {
             x = Fe::ZERO.sub(&x);
@@ -501,10 +532,46 @@ fn sc_reduce(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+fn left_shift_3(bytes: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut carry = 0u8;
+    for i in 0..32 {
+        let next_carry = bytes[i] >> 5;
+        out[i] = (bytes[i] << 3) | carry;
+        carry = next_carry;
+    }
+    out
+}
+
 fn adjust_password_scalar(scalar_bytes: &[u8; 32]) -> [u8; 32] {
-    let mut out = *scalar_bytes;
-    out[0] &= 248;
-    out[31] &= 127;
+    let l_bytes = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde,
+        0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x10,
+    ];
+    let l = BigUint::from_bytes_le(&l_bytes);
+    let mut val = BigUint::from_bytes_le(scalar_bytes);
+
+    let bytes = val.to_bytes_le();
+    let b0 = bytes.first().copied().unwrap_or(0);
+    if (b0 & 1) != 0 {
+        val += &l;
+    }
+    let bytes = val.to_bytes_le();
+    let b0 = bytes.first().copied().unwrap_or(0);
+    if (b0 & 2) != 0 {
+        val += &l * 2u32;
+    }
+    let bytes = val.to_bytes_le();
+    let b0 = bytes.first().copied().unwrap_or(0);
+    if (b0 & 4) != 0 {
+        val += &l * 4u32;
+    }
+
+    let mut out = [0u8; 32];
+    let res_bytes = val.to_bytes_le();
+    let copy_len = res_bytes.len().min(32);
+    out[..copy_len].copy_from_slice(&res_bytes[..copy_len]);
     out
 }
 
@@ -552,29 +619,17 @@ impl Spake2 {
             .map_err(|_| PairingError::Crypto("RNG failure".into()))?;
 
         let mut priv_sc = sc_reduce(&rng_bytes);
-        priv_sc[0] &= 248;
-        priv_sc[31] &= 127;
+        priv_sc = left_shift_3(&priv_sc);
         self.private_key = priv_sc;
 
-        let b_base = [9u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let m_point = [
-            0x5a, 0xda, 0x7e, 0x4b, 0xf6, 0xdd, 0xd9, 0xad, 0xb6, 0x62, 0x6d, 0x32, 0x13, 0x1c,
-            0x6b, 0x5c, 0x51, 0xa1, 0xe3, 0x47, 0xa3, 0x47, 0x8f, 0x53, 0xcf, 0xcf, 0x44, 0x1b,
-            0x88, 0xee, 0xd1, 0x2e,
-        ];
-        let n_point = [
-            0x10, 0xe3, 0xdf, 0x0a, 0xe3, 0x7d, 0x8e, 0x7a, 0x99, 0xb5, 0xfe, 0x74, 0xb4, 0x46,
-            0x72, 0x10, 0x3d, 0xbd, 0xdc, 0xbd, 0x06, 0xaf, 0x68, 0x0d, 0x71, 0x32, 0x9a, 0x11,
-            0x69, 0x3b, 0xc7, 0x78,
-        ];
-
-        let p_u = x25519_ladder(&self.private_key, &b_base);
-        let mask_u = match self.role {
-            SpakeRole::Alice => x25519_ladder(&self.password_scalar, &m_point),
-            SpakeRole::Bob => x25519_ladder(&self.password_scalar, &n_point),
+        let p_pt = ExtendedPoint::base().scalar_mul(&self.private_key);
+        let mask_pt = match self.role {
+            SpakeRole::Alice => ExtendedPoint::point_m().scalar_mul(&self.password_scalar),
+            SpakeRole::Bob => ExtendedPoint::point_n().scalar_mul(&self.password_scalar),
         };
 
-        let p_star = Fe::from_bytes(&p_u).add(&Fe::from_bytes(&mask_u)).to_bytes();
+        let p_star = p_pt.add(&mask_pt).encode();
+        eprintln!("generate_msg for {:?}: p_pt.x={:?} mask_pt.x={:?} p_star={:?}", self.role, &p_pt.encode()[..4], &mask_pt.encode()[..4], &p_star[..4]);
         self.my_msg = p_star;
         Ok(self.my_msg.to_vec())
     }
@@ -588,28 +643,19 @@ impl Spake2 {
         let mut peer_bytes = [0u8; 32];
         peer_bytes.copy_from_slice(peer_msg);
 
-        let _q_star = ExtendedPoint::decode(&peer_bytes)
+        let peer_pt = ExtendedPoint::decode(&peer_bytes)
             .ok_or_else(|| PairingError::Crypto("peer point not on curve".into()))?;
 
-        let m_point = [
-            0x5a, 0xda, 0x7e, 0x4b, 0xf6, 0xdd, 0xd9, 0xad, 0xb6, 0x62, 0x6d, 0x32, 0x13, 0x1c,
-            0x6b, 0x5c, 0x51, 0xa1, 0xe3, 0x47, 0xa3, 0x47, 0x8f, 0x53, 0xcf, 0xcf, 0x44, 0x1b,
-            0x88, 0xee, 0xd1, 0x2e,
-        ];
-        let n_point = [
-            0x10, 0xe3, 0xdf, 0x0a, 0xe3, 0x7d, 0x8e, 0x7a, 0x99, 0xb5, 0xfe, 0x74, 0xb4, 0x46,
-            0x72, 0x10, 0x3d, 0xbd, 0xdc, 0xbd, 0x06, 0xaf, 0x68, 0x0d, 0x71, 0x32, 0x9a, 0x11,
-            0x69, 0x3b, 0xc7, 0x78,
-        ];
-
-        let peer_mask_u = match self.role {
-            SpakeRole::Alice => x25519_ladder(&self.password_scalar, &n_point),
-            SpakeRole::Bob => x25519_ladder(&self.password_scalar, &m_point),
+        let peer_mask_pt = match self.role {
+            SpakeRole::Alice => ExtendedPoint::point_n().scalar_mul(&self.password_scalar),
+            SpakeRole::Bob => ExtendedPoint::point_m().scalar_mul(&self.password_scalar),
         };
 
-        let q_u = Fe::from_bytes(&peer_bytes).sub(&Fe::from_bytes(&peer_mask_u)).to_bytes();
-        let k_dh_bytes = x25519_ladder(&self.private_key, &q_u);
-
+        let q_pt = peer_pt.sub(&peer_mask_pt);
+        eprintln!("process_msg for {:?}: peer_pt={:?} peer_mask={:?} recovered={:?}", self.role, &peer_bytes[..4], &peer_mask_pt.encode()[..4], &q_pt.encode()[..4]);
+        let k_dh_pt = q_pt.scalar_mul(&self.private_key);
+        let k_dh_bytes = k_dh_pt.encode();
+        eprintln!("k_dh for {:?}: {:?}", self.role, &k_dh_bytes[..]);
         let mut ctx = Context::new(&SHA512);
         let mut update_len_prefixed = |data: &[u8]| {
             let len = (data.len() as u64).to_le_bytes();
