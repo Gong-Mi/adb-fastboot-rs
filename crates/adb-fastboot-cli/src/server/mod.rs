@@ -11,7 +11,9 @@
 //! - watcher.rs → USB device watcher (usb.cpp)
 //! - adb_utils.rs → adb_utils.cpp (file/path helpers, shell escaping, logging)
 
+pub mod adb_io;
 pub mod adb_mdns;
+pub mod adb_trace;
 pub mod adb_utils;
 pub mod apacket_reader;
 pub mod bridge;

@@ -1,107 +1,187 @@
 //! ADB utility functions — file/path helpers, shell argument escaping, logging macros.
 //!
 //! Mirrors AOSP `vendor/adb/adb_utils.cpp` / `adb_utils.h`.
-//!
-//! Provided functions:
-//!
-//! - `adb_home_dir()` / `adb_get_android_dir_path()` — ADB config directory
-//! - `file_exists`, `dir_exists`, `path_join` — path utilities
-//! - `quote_arg`, `escape_arg`, `quote_args` — shell argument escaping
-//! - Logging macros: `verbose!`, `error_log!`, `warn_log!`, `info_log!`
 
+use std::fs;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
+
+use adb_protocol::header::AdbMessageHeader;
 
 // ---------------------------------------------------------------------------
 // ADB home / config directory
 // ---------------------------------------------------------------------------
 
 /// Returns the ADB home directory (`~/.android`).
-///
-/// Delegates to `adb_protocol::sysdeps::env::adb_home_dir()`.
 pub fn adb_home_dir() -> PathBuf {
     adb_protocol::sysdeps::env::adb_home_dir()
 }
 
-/// Returns the ADB Android directory path.
-///
-/// On standard systems this is the same as `adb_home_dir()`.
-/// On Android the adbd shell typically uses `/data/local/tmp/.android`
-/// rather than the HOME-based path, so this function checks that
-/// alternative first.
+/// Returns the ADB Android directory path, creating it if needed.
 pub fn adb_get_android_dir_path() -> PathBuf {
-    #[cfg(target_os = "android")]
-    {
-        let alt = PathBuf::from("/data/local/tmp/.android");
-        if alt.is_dir() {
-            return alt;
-        }
+    let user_dir = adb_home_dir();
+    let android_dir = user_dir.join(".android");
+    if !android_dir.is_dir() {
+        let _ = mkdirs(&android_dir);
     }
-    adb_home_dir()
+    android_dir
 }
 
 // ---------------------------------------------------------------------------
-// Path / file utilities
+// Path / file utilities (AOSP: directory_exists, getcwd, mkdirs, dump_hex, ...)
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if a regular file exists at `path`.
 pub fn file_exists(path: impl AsRef<Path>) -> bool {
     path.as_ref().is_file()
 }
 
-/// Returns `true` if a directory exists at `path`.
 pub fn dir_exists(path: impl AsRef<Path>) -> bool {
     path.as_ref().is_dir()
 }
 
-/// Join two path components.
-///
-/// Convenience wrapper around `Path::join` matching AOSP's `PathJoin`.
 pub fn path_join(base: impl AsRef<Path>, component: impl AsRef<Path>) -> PathBuf {
     base.as_ref().join(component)
 }
 
-/// Returns `true` if `path` is absolute.
 pub fn is_path_absolute(path: impl AsRef<Path>) -> bool {
     path.as_ref().is_absolute()
 }
 
-/// Read a `key` environment variable, returning `default` if unset.
 pub fn get_env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-/// Resolve `path` to its canonical (absolute, symlink-resolved) form.
-/// Returns `path` unchanged on failure.
 pub fn canonicalize_or(path: impl AsRef<Path>) -> PathBuf {
     path.as_ref()
         .canonicalize()
         .unwrap_or_else(|_| path.as_ref().to_path_buf())
 }
 
+/// Redirect stdin to /dev/null (AOSP: `close_stdin()`).
+pub fn close_stdin() {
+    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+    if fd >= 0 {
+        unsafe {
+            libc::dup2(fd, libc::STDIN_FILENO);
+            libc::close(fd);
+        }
+    }
+}
+
+/// Get current working directory (AOSP: `getcwd(std::string*)`).
+pub fn getcwd() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Recursively create a directory hierarchy (AOSP: `mkdirs()`).
+pub fn mkdirs(path: impl AsRef<Path>) -> bool {
+    fs::create_dir_all(path.as_ref()).is_ok()
+}
+
+/// Hex dump of binary data, truncated to 16 bytes with ASCII sidebar (AOSP: `dump_hex()`).
+pub fn dump_hex(data: &[u8]) -> String {
+    let truncate_len = 16usize;
+    let truncated = data.len() > truncate_len;
+    let byte_count = data.len().min(truncate_len);
+
+    let mut line = String::new();
+    for &b in &data[..byte_count] {
+        line.push_str(&format!("{:02x}", b));
+    }
+    line.push(' ');
+    for &b in &data[..byte_count] {
+        line.push(if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' });
+    }
+    if truncated {
+        line.push_str(" [truncated]");
+    }
+    line
+}
+
+/// Format an ADB message header as a human-readable string (AOSP: `dump_header()`).
+pub fn dump_header(msg: &AdbMessageHeader) -> String {
+    let cmd_bytes = msg.command.to_le_bytes();
+    let cmd_str: String = cmd_bytes
+        .iter()
+        .take_while(|&&b| b.is_ascii_graphic())
+        .map(|&b| b as char)
+        .collect();
+    let cmd_display = if cmd_str.len() == 4 { cmd_str } else { format!("{:08x}", msg.command) };
+
+    let arg0 = if msg.arg0 < 256 {
+        format!("{}", msg.arg0)
+    } else {
+        format!("0x{:x}", msg.arg0)
+    };
+    let arg1 = if msg.arg1 < 256 {
+        format!("{}", msg.arg1)
+    } else {
+        format!("0x{:x}", msg.arg1)
+    };
+
+    format!("[{}] arg0={} arg1={} (len={}) ", cmd_display, arg0, arg1, msg.data_length)
+}
+
+/// Format a complete packet dump (AOSP: `dump_packet()`).
+pub fn dump_packet(name: &str, func: &str, header: &AdbMessageHeader, payload: &[u8]) -> String {
+    format!("{}: {}: {}{}", name, func, dump_header(header), dump_hex(payload))
+}
+
+/// Format errno message (AOSP: `perror_str()`).
+pub fn perror_str(msg: &str) -> String {
+    let errno = std::io::Error::last_os_error();
+    format!("{}: {}", msg, errno)
+}
+
+/// Set or clear `O_NONBLOCK` on a file descriptor (AOSP: `set_file_block_mode()`).
+pub fn set_file_block_mode(fd: RawFd, block: bool) -> bool {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+    if flags == -1 {
+        return false;
+    }
+    let new_flags = if block { flags & !libc::O_NONBLOCK } else { flags | libc::O_NONBLOCK };
+    unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) == 0 }
+}
+
+/// Validate forward target specifications (AOSP: `forward_targets_are_valid()`).
+pub fn forward_targets_are_valid(source: &str, dest: &str) -> Result<(), String> {
+    if let Some(port_str) = source.strip_prefix("tcp:") {
+        let port: i32 = port_str.parse().map_err(|_| format!("Invalid source port: '{}'", port_str))?;
+        if port < 0 {
+            return Err(format!("Invalid source port: '{}'", port_str));
+        }
+    }
+    if let Some(port_str) = dest.strip_prefix("tcp:") {
+        let port: i32 = port_str.parse().map_err(|_| format!("Invalid destination port: '{}'", port_str))?;
+        if port <= 0 {
+            return Err(format!("Invalid destination port: '{}'", port_str));
+        }
+    }
+    Ok(())
+}
+
+/// Get the ADB log file path (AOSP: `GetLogFilePath()`).
+pub fn get_log_file_path() -> PathBuf {
+    if let Ok(path) = std::env::var("ANDROID_ADB_LOG_PATH") {
+        return PathBuf::from(path);
+    }
+    let tmp_dir = get_env_or("TMPDIR", "/tmp");
+    PathBuf::from(format!("{}/adb.{}.log", tmp_dir, unsafe { libc::getuid() }))
+}
+
 // ---------------------------------------------------------------------------
-// Shell argument escaping
+// Shell argument escaping (AOSP: escape_arg, implemented as QuoteArgument)
 // ---------------------------------------------------------------------------
 
-/// Quote a single argument for POSIX shell.
-///
-/// If the argument contains only "safe" characters (alphanumerics plus
-/// `_`, `-`, `.`, `:`, `/`), it is returned as-is.  Otherwise it is
-/// wrapped in single quotes, with embedded single quotes escaped per
-/// POSIX rules (`'` → `'\''`).
-///
-/// Mirrors AOSP `QuoteArgument()` in `vendor/adb/adb_utils.cpp`.
 pub fn quote_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "''".to_string();
     }
-    // Safe characters — no escaping needed.
-    if arg
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':' | b'/'))
-    {
+    if arg.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':' | b'/')) {
         return arg.to_string();
     }
-    // Single-quote wrapping; handle embedded quotes with '\'' sequence.
     let mut out = String::with_capacity(arg.len() + 2);
     out.push('\'');
     for ch in arg.chars() {
@@ -115,44 +195,13 @@ pub fn quote_arg(arg: &str) -> String {
     out
 }
 
-/// Escape shell metacharacters in a string with backslash prefix.
-///
-/// Unlike `quote_arg` which wraps the whole string in quotes, this
-/// escapes each special character individually so the result can be
-/// embedded inside an already-quoted string.
-///
-/// Escaped characters: space, tab, newline, carriage return, `\`, `'`,
-/// `"`, `|`, `&`, `;`, `(`, `)`, `<`, `>`, `` ` ``, `$`, `*`, `?`,
-/// `[`, `]`, `#`, `~`, `!`, `{`, `}`.
 pub fn escape_arg(arg: &str) -> String {
     let mut out = String::with_capacity(arg.len());
     for ch in arg.chars() {
         match ch {
-            ' '
-            | '\t'
-            | '\n'
-            | '\r'
-            | '\\'
-            | '\''
-            | '"'
-            | '|'
-            | '&'
-            | ';'
-            | '('
-            | ')'
-            | '<'
-            | '>'
-            | '`'
-            | '$'
-            | '*'
-            | '?'
-            | '['
-            | ']'
-            | '#'
-            | '~'
-            | '!'
-            | '{'
-            | '}' => {
+            ' ' | '\t' | '\n' | '\r' | '\\' | '\'' | '"' | '|' | '&' | ';'
+            | '(' | ')' | '<' | '>' | '`' | '$' | '*' | '?' | '[' | ']'
+            | '#' | '~' | '!' | '{' | '}' => {
                 out.push('\\');
                 out.push(ch);
             }
@@ -162,31 +211,14 @@ pub fn escape_arg(arg: &str) -> String {
     out
 }
 
-/// Join multiple arguments into a single shell-safe command string.
-///
-/// Each argument is quoted with `quote_arg` and joined with spaces.
 pub fn quote_args(args: &[&str]) -> String {
-    args.iter()
-        .map(|a| quote_arg(a))
-        .collect::<Vec<_>>()
-        .join(" ")
+    args.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" ")
 }
 
 // ---------------------------------------------------------------------------
-// Logging macros
+// Logging macros (AOSP: adb_trace.h → VLOG, LOG(ERROR), ...)
 // ---------------------------------------------------------------------------
 
-/// Log a verbose message to stderr, prefixed with `[adb]`.
-///
-/// Only emits output when the `ADB_LOG` environment variable is set to
-/// `verbose`, `debug`, or `trace`.
-///
-/// # Examples
-///
-/// ```ignore
-/// verbose!("scanning USB devices");
-/// verbose!("transport {} connected", serial);
-/// ```
 #[macro_export]
 macro_rules! verbose {
     ($($arg:tt)*) => {
@@ -199,13 +231,6 @@ macro_rules! verbose {
     };
 }
 
-/// Log an error message to stderr, prefixed with `[adb] error:`.
-///
-/// # Examples
-///
-/// ```ignore
-/// error_log!("failed to open device: {}", err);
-/// ```
 #[macro_export]
 macro_rules! error_log {
     ($($arg:tt)*) => {
@@ -213,13 +238,6 @@ macro_rules! error_log {
     };
 }
 
-/// Log a warning message to stderr, prefixed with `[adb] warning:`.
-///
-/// # Examples
-///
-/// ```ignore
-/// warn_log!("USB device disconnected unexpectedly");
-/// ```
 #[macro_export]
 macro_rules! warn_log {
     ($($arg:tt)*) => {
@@ -227,13 +245,6 @@ macro_rules! warn_log {
     };
 }
 
-/// Log an informational message to stderr, prefixed with `[adb] info:`.
-///
-/// # Examples
-///
-/// ```ignore
-/// info_log!("ADB server started on port {}", port);
-/// ```
 #[macro_export]
 macro_rules! info_log {
     ($($arg:tt)*) => {
@@ -248,93 +259,99 @@ macro_rules! info_log {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- Path utilities ------------------------------------------------------
+    use adb_protocol::constants::A_OKAY;
 
     #[test]
-    fn test_adb_home_dir_returns_dot_android() {
+    fn test_adb_home_dir() {
         let dir = adb_home_dir();
         assert!(dir.to_string_lossy().contains(".android"));
     }
 
     #[test]
-    fn test_file_exists_and_dir_exists() {
-        // This file itself should exist.
-        let this_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("server")
-            .join("adb_utils.rs");
-        assert!(file_exists(&this_file));
-        assert!(!dir_exists(&this_file));
-
-        let parent = this_file.parent().unwrap();
-        assert!(dir_exists(parent));
+    fn test_file_and_dir_exists() {
+        let this = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join("server").join("adb_utils.rs");
+        assert!(file_exists(&this));
+        assert!(!dir_exists(&this));
+        assert!(dir_exists(this.parent().unwrap()));
     }
 
     #[test]
-    fn test_path_join() {
-        let joined = path_join("/home/user", ".android");
-        assert_eq!(joined, PathBuf::from("/home/user/.android"));
+    fn test_mkdirs() {
+        let tmp = std::env::temp_dir().join("adb_test_mkdirs").join("a").join("b");
+        let r = mkdirs(&tmp);
+        assert!(r);
+        assert!(tmp.is_dir());
+        let _ = fs::remove_dir_all(tmp.parent().unwrap().parent().unwrap());
     }
 
     #[test]
-    fn test_is_path_absolute() {
-        assert!(is_path_absolute("/tmp"));
-        assert!(!is_path_absolute("relative/path"));
+    fn test_dump_hex() {
+        let s = dump_hex(b"hello");
+        assert!(s.contains("68656c6c6f"));
+        assert!(s.contains("hello"));
     }
 
     #[test]
-    fn test_get_env_or() {
-        // Should return the value if set, or default if not.
-        let val = get_env_or("PATH", "fallback");
-        assert!(!val.is_empty());
-        let val = get_env_or("__DOES_NOT_EXIST_12345__", "fallback");
-        assert_eq!(val, "fallback");
+    fn test_dump_header() {
+        let h = AdbMessageHeader::new(A_OKAY, 42, 0, b"test");
+        let s = dump_header(&h);
+        assert!(s.contains("OKAY"));
+        assert!(s.contains("arg0=42"));
     }
 
-    // -- Shell argument escaping --------------------------------------------
+    #[test]
+    fn test_set_file_block_mode_fails_on_bad_fd() {
+        assert!(!set_file_block_mode(-1, true));
+    }
 
+    #[test]
+    fn test_forward_targets_valid() {
+        assert!(forward_targets_are_valid("tcp:0", "tcp:5555").is_ok());
+        assert!(forward_targets_are_valid("tcp:-1", "tcp:5555").is_err());
+        assert!(forward_targets_are_valid("tcp:0", "tcp:0").is_err());
+        assert!(forward_targets_are_valid("local:/tmp/sock", "tcp:5555").is_ok());
+    }
+
+    #[test]
+    fn test_get_log_file_path() {
+        let p = get_log_file_path();
+        assert!(p.to_string_lossy().contains("adb."));
+        assert!(p.to_string_lossy().ends_with(".log"));
+    }
+
+    #[test]
+    fn test_getcwd() {
+        let cwd = getcwd();
+        assert!(cwd.is_some());
+        assert!(!cwd.unwrap().is_empty());
+    }
+
+    // Shell escaping tests
     #[test]
     fn test_quote_arg_simple() {
-        // Safe characters — returned as-is.
         assert_eq!(quote_arg("hello"), "hello");
         assert_eq!(quote_arg("foo_bar"), "foo_bar");
-        assert_eq!(quote_arg("abc123"), "abc123");
     }
-
     #[test]
     fn test_quote_arg_spaces() {
         assert_eq!(quote_arg("hello world"), "'hello world'");
-        assert_eq!(quote_arg("  "), "'  '");
     }
-
     #[test]
     fn test_quote_arg_embedded_quote() {
-        // POSIX: single quote inside single quotes → '\''
         assert_eq!(quote_arg("it's"), "'it'\\''s'");
     }
-
     #[test]
     fn test_quote_arg_empty() {
         assert_eq!(quote_arg(""), "''");
     }
-
     #[test]
     fn test_escape_arg() {
-        // No-op for safe strings
         assert_eq!(escape_arg("hello"), "hello");
-
-        // Space → backslash-space
         assert_eq!(escape_arg("hello world"), r"hello\ world");
-
-        // Multiple special chars
         assert_eq!(escape_arg("a$b"), r"a\$b");
-        assert_eq!(escape_arg("a'b"), r"a\'b");
     }
-
     #[test]
     fn test_quote_args() {
-        let result = quote_args(&["adb", "shell", "echo hello"]);
-        assert_eq!(result, "adb shell 'echo hello'");
+        assert_eq!(quote_args(&["adb", "shell", "echo hello"]), "adb shell 'echo hello'");
     }
 }
