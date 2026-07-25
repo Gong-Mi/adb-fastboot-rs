@@ -248,6 +248,9 @@ impl Default for TransportManager {
 ///
 /// Mirrors AOSP `transport.cpp` → `connect_to_remote()`.
 ///
+/// `serial_override` is the human-readable serial (e.g. "localhost:5555").
+/// When empty, `addr.to_string()` is used.
+///
 /// Returns the connected `Box<dyn Transport>` on success.
 pub(crate) fn connect_to_remote(
     addr: SocketAddr,

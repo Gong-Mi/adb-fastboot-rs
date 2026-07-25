@@ -349,12 +349,34 @@ pub(crate) fn dispatch_host_service(
                 .ok_or_else(|| "no address resolved".to_string())?
                 .to_owned();
 
-            let serial = addr.to_string();
+            let serial = target.to_string(); // keep original hostname for matching
 
+            // Check if already connected (using original hostname serial)
+            {
+                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                eprintln!("[adb-debug] checking already: serial={:?}, devices={:?}", 
+                    &serial,
+                    reg.devices.iter().map(|d| &d.serial).collect::<Vec<_>>());
+                if reg.devices.iter().any(|d| d.serial == serial) {
+                    eprintln!("[adb-debug] already connected: {}", &serial);
+                    return ok_str(client, &format!("already connected to {serial}"));
+                }
+            }
+
+            let ip_serial = addr.to_string(); // resolved IP for transport registration
             match crate::server::transport::connect_to_remote(addr, registry) {
                 Ok(t) => {
                     let _ = t; // keep transport alive
-                    eprintln!("[adb-debug] connect_to_remote OK for {}", &serial);
+                    eprintln!("[adb-debug] connect_to_remote OK for {}", &ip_serial);
+                    // Register AND return the original hostname serial
+                    // This makes disconnect by hostname work
+                    {
+                        let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                        if let Some(dev) = reg.devices.iter_mut().find(|d| d.serial == ip_serial) {
+                            dev.serial = serial.clone();
+                            eprintln!("[adb-debug] updated serial: {} -> {}", &ip_serial, &serial);
+                        }
+                    }
                     ok_str(client, &serial)?;
                 }
                 Err(e) => {
