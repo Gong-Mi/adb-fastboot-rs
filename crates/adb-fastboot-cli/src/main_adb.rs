@@ -15,7 +15,7 @@ use adb_protocol::{
 mod server;
 mod client;
 
-use client::{adb_wifi, protocol, shell, exec_out, server_cmds, host_command};
+use client::{adb_wifi, file_sync, protocol, shell, exec_out, server_cmds, host_command};
 use client::server_cmds::{ensure_server_running, ensure_server_running_at, kill_server, kill_server_at};
 use client::host_command::host_command;
 use client::transport::resolve_target_addr;
@@ -703,36 +703,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             exec_out::run_exec_out(&mut transport, &cmd_str)?;
         }
         Commands::Push { local, remote } => {
-            let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
-                Ok(t) => t,
+            let serial = cli.serial.as_deref();
+            match file_sync::push(serial, local, remote) {
+                Ok(()) => {}
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    eprintln!("Error: push failed: {e}");
                     std::process::exit(1);
                 }
-            };
-            let (_info, mut transport) =
-                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
-
-            let sync_dest = b"sync:";
-            let open_hdr = AdbMessageHeader::new(A_OPEN, 1, 0, sync_dest);
-            transport.send_message(&open_hdr, sync_dest)?;
-            println!("[adb-rs] Connected sync transport to {} for push '{}' -> '{}'", addr, local, remote);
+            }
         }
         Commands::Pull { remote, local } => {
-            let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
-                Ok(t) => t,
+            let serial = cli.serial.as_deref();
+            match file_sync::pull(serial, remote, local) {
+                Ok(()) => {}
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    eprintln!("Error: pull failed: {e}");
                     std::process::exit(1);
                 }
-            };
-            let (_info, mut transport) =
-                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
-
-            let sync_dest = b"sync:";
-            let open_hdr = AdbMessageHeader::new(A_OPEN, 1, 0, sync_dest);
-            transport.send_message(&open_hdr, sync_dest)?;
-            println!("[adb-rs] Connected sync transport to {} for pull '{}' -> '{}'", addr, remote, local);
+            }
         }
         Commands::Reboot { target } => {
             let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {

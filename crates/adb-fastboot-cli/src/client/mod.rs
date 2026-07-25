@@ -36,4 +36,5 @@ pub mod incremental;
 pub mod line_printer;
 pub mod transport_emulator;
 pub mod transport_usb;
+pub mod file_sync;
 pub mod usb_libusb;

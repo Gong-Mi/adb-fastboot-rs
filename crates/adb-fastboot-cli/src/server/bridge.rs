@@ -95,25 +95,9 @@ fn smart_socket_bridge(
             continue;
         }
 
-        // --- Device service: A_OPEN + bridge ---
-        let local_id = 1u32;
-        let open_hdr = adb_protocol::AdbMessageHeader::new(
-            adb_protocol::A_OPEN, local_id, 0, cmd.as_bytes());
-        transport.send_message(&open_hdr, cmd.as_bytes())
-            .map_err(|e| format!("A_OPEN failed: {e}"))?;
-
-        let (resp_hdr, _) = transport.recv_message()
-            .map_err(|e| format!("recv after A_OPEN failed: {e}"))?;
-
-        if resp_hdr.command != adb_protocol::A_OKAY {
-            let msg = format!("device rejected service '{}'", cmd);
-            let len_hdr = format!("{:04x}", msg.len());
-            let _ = client.write_all(b"FAIL")
-                .and_then(|_| client.write_all(len_hdr.as_bytes()))
-                .and_then(|_| client.write_all(msg.as_bytes()));
-            return Err(msg);
-        }
-        let remote_id = resp_hdr.arg0;
+        // --- Device service: A_OPEN via services module ---
+        let (local_id, remote_id) = crate::server::services::device_service_to_socket(
+            &cmd, &mut transport)?;
 
         // Send OKAY to client
         client.write_all(b"OKAY")
