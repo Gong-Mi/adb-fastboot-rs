@@ -17,6 +17,7 @@ pub mod adb_trace;
 pub mod adb_utils;
 pub mod apacket_reader;
 pub mod bridge;
+pub mod fdevent;
 pub mod forward;
 pub mod handler;
 pub mod models;
