@@ -65,15 +65,24 @@ pub fn ensure_server_running_at(port: u16) -> Result<(), Box<dyn std::error::Err
             libc::fcntl(pipe_write, libc::F_SETFD, 0);
         }
 
-        // argv: adb-rs fork-server --reply-fd N
+        // argv: adb-rs fork-server server --reply-fd N
+        // The "server" positional arg is required by AOSP protocol.
+        // Also pass -L tcp:127.0.0.1:{port} so the server binds to the
+        // correct port (not just hardcoded 5037).
         let fork_server = std::ffi::CString::new("fork-server").unwrap();
+        let server_mode = std::ffi::CString::new("server").unwrap();
+        let listen_flag = std::ffi::CString::new("-L").unwrap();
+        let listen_addr = std::ffi::CString::new(format!("tcp:127.0.0.1:{port}")).unwrap();
         let reply_fd_arg = std::ffi::CString::new("--reply-fd").unwrap();
         let reply_fd_str = std::ffi::CString::new(pipe_write.to_string()).unwrap();
 
         // Build null-terminated argv array
-        let mut raw_args: Vec<*const libc::c_char> = Vec::with_capacity(5);
+        let mut raw_args: Vec<*const libc::c_char> = Vec::with_capacity(8);
         raw_args.push(exe_cstr.as_ptr());
         raw_args.push(fork_server.as_ptr());
+        raw_args.push(server_mode.as_ptr());
+        raw_args.push(listen_flag.as_ptr());
+        raw_args.push(listen_addr.as_ptr());
         raw_args.push(reply_fd_arg.as_ptr());
         raw_args.push(reply_fd_str.as_ptr());
         raw_args.push(std::ptr::null::<libc::c_char>());
