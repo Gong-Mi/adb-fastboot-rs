@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn test_make_auth_messages() {
         let auth = AdbAuth::generate("user@host").unwrap();
-        let token = b"sample_token_20_bytes";
+        let token = b"sample_token_20_byte";
 
         let (sig_hdr, sig_payload) = auth.make_signature_message(token).unwrap();
         assert_eq!(sig_hdr.command, A_AUTH);
