@@ -453,13 +453,13 @@ mod tests {
             }
         }
 
-        let mut pipe = DuplexPipe {
+        let _pipe = DuplexPipe {
             c2s: Vec::new(),
             s2c: Vec::new(),
         };
-        let mut client = PairingClient::new("123456").unwrap();
+        let _client = PairingClient::new("123456").unwrap();
         let server_info = PeerInfo::from_device_info("DEVICE_123", "Android_Device");
-        let mut server = PairingServer::new("123456", server_info.clone()).unwrap();
+        let _server = PairingServer::new("123456", server_info.clone()).unwrap();
 
         // 1. Client writes Spake2Msg
         let mut spake_client =

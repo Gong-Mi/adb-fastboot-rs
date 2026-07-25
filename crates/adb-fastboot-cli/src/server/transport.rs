@@ -277,7 +277,7 @@ pub(crate) fn connect_to_remote(
     let mut sent_signature = false;
     let mut sent_public_key = false;
 
-    let (resp_hdr, payload) = loop {
+    let (_resp_hdr, payload) = loop {
         let (resp_hdr, payload) = transport
             .recv_message()
             .map_err(|e| format!("CNXN response failed: {e}"))?;
@@ -795,7 +795,7 @@ impl ReconnectHandler {
     pub(crate) fn start(&mut self) {
         let queue = Arc::clone(&self.queue);
         let registry = Arc::clone(&self.registry);
-        let ref_counts = Arc::clone(&self.ref_counts);
+        let _ref_counts = Arc::clone(&self.ref_counts);
         let shutdown = Arc::clone(&self.shutdown);
         let config = self.config.clone();
 
@@ -922,7 +922,7 @@ impl ReconnectHandler {
         config: &ReconnectConfig,
     ) {
         let now = std::time::Instant::now();
-        let mut entries_to_retry: Vec<(usize, ReconnectEntry)> = {
+        let entries_to_retry: Vec<(usize, ReconnectEntry)> = {
             let mut q = queue.lock().expect("reconnect queue lock");
             let mut ready = Vec::new();
             let mut i = 0;

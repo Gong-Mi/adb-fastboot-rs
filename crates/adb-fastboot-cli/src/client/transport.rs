@@ -3,13 +3,12 @@
 
 use std::time::Duration;
 use adb_protocol::{
-    AdbMessageHeader, AdbServerTransport, TcpTransport, Transport, TransportError,
-    ADB_VERSION, A_AUTH, A_AUTH_TOKEN, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_STLS, A_WRTE,
+    AdbMessageHeader, TcpTransport, Transport,
+    ADB_VERSION, A_AUTH, A_AUTH_TOKEN, A_CNXN, A_STLS,
     MAX_PAYLOAD_V2,
 };
 
-use crate::client::auth::{default_auth, persist_adb_pubkey};
-use crate::client::auth;
+use crate::client::auth::persist_adb_pubkey;
 
 const ADBD_PORT: u16 = 5555;
 const ADB_SERVER_PORT: u16 = 5037;

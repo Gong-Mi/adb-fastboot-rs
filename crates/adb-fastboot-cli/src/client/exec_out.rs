@@ -78,7 +78,6 @@ pub fn stream_raw_server(
     transport: &mut dyn Transport,
     _capture: bool,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    use std::io::Read;
 
     let mut buf = [0u8; 8192];
 

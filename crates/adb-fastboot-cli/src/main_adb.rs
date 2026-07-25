@@ -4,19 +4,17 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use clap::{Parser, Subcommand};
 use adb_protocol::{
-    AdbAuth, AdbMessageHeader, AdbServerTransport, ShellV2Packet, TcpTransport, Transport,
-    TransportError,
+    AdbAuth, AdbMessageHeader, AdbServerTransport, TcpTransport, Transport,
     ADB_VERSION, A_AUTH, A_AUTH_TOKEN,
-    A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_STLS, A_WRTE, MAX_PAYLOAD_V2,
-    build_sync_send_req, build_sync_data_chunk, build_sync_done, SyncMessageHeader,
-    SYNC_FAIL, SYNC_OKAY,
+    A_CLSE, A_CNXN, A_OPEN, A_STLS, MAX_PAYLOAD_V2,
+    build_sync_send_req, build_sync_data_chunk, build_sync_done,
 };
 
 mod server;
 mod client;
 
-use client::{adb_wifi, detach, file_sync, protocol, shell, exec_out, server_cmds, host_command};
-use client::server_cmds::{ensure_server_running, ensure_server_running_at, kill_server, kill_server_at};
+use client::{adb_wifi, detach, file_sync, protocol, shell, exec_out};
+use client::server_cmds::{ensure_server_running, kill_server};
 use client::host_command::host_command;
 use client::transport::resolve_target_addr;
 
@@ -504,7 +502,7 @@ pub(crate) fn persist_adb_pubkey(auth: &AdbAuth) -> Result<(), Box<dyn std::erro
     }
 
     // Append: use root if not already root, otherwise write directly
-    use std::io::{Read, Write};
+    use std::io::Write;
     let can_write = std::fs::OpenOptions::new().append(true).open(key_path).is_ok();
     if can_write {
         let mut f = std::fs::OpenOptions::new().append(true).open(key_path)?;

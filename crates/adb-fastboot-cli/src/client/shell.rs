@@ -21,7 +21,7 @@ use super::transport::connect_and_handshake_with_tls_upgrade;
 pub fn stream_shell_v2(
     transport: &mut dyn Transport,
     local_id: u32,
-    mut remote_id: u32,
+    mut _remote_id: u32,
     capture: bool,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
     let mut captured = if capture { Some(Vec::new()) } else { None };
@@ -40,7 +40,7 @@ pub fn stream_shell_v2(
 
         match hdr.command {
             A_OKAY => {
-                remote_id = hdr.arg0;
+                _remote_id = hdr.arg0;
             }
             A_WRTE => {
                 let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
@@ -114,7 +114,6 @@ pub fn stream_shell_v2_server(
     transport: &mut dyn Transport,
     capture: bool,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    use std::io::Read;
 
     let mut captured = if capture { Some(Vec::new()) } else { None };
     let mut buf = [0u8; 8192];

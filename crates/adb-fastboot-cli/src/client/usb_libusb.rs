@@ -14,7 +14,6 @@
 //! Related AOSP files:
 //! - `vendor/adb/client/usb_libusb10.cpp` — libusb 1.0 backend
 
-use std::time::Duration;
 
 #[cfg(feature = "usb-rusb")]
 use adb_protocol::{RusbUsbTransport, UsbTransportAdapter};

@@ -7,7 +7,7 @@
 //! host service dispatch, transport selection, and device service bridging).
 //! [`dispatch_host_service`] remains here for reuse by the smart socket module.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

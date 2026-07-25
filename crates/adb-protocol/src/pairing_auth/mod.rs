@@ -8,7 +8,7 @@ pub use pairing_auth::{Spake2, SpakeRole};
 
 #[cfg(test)]
 mod tests {
-    use super::pairing_auth::{ExtendedPoint, Fe};
+    use super::pairing_auth::ExtendedPoint;
 
     #[test]
     fn test_base_point_encode_decode_roundtrip() {
