@@ -352,15 +352,17 @@ pub(crate) fn dispatch_host_service(
             let serial = addr.to_string();
 
             match crate::server::transport::connect_to_remote(addr, registry) {
-                Ok(_transport) => {
-                    eprintln!("[adb-debug] host:connect OK, sending serial: {:?}", &serial);
-                    ok_str(client, &serial)
+                Ok(t) => {
+                    let _ = t; // keep transport alive
+                    eprintln!("[adb-debug] connect_to_remote OK for {}", &serial);
+                    ok_str(client, &serial)?;
                 }
                 Err(e) => {
-                    eprintln!("[adb-debug] host:connect FAIL: {:?}", &e);
-                    fail(client, &format!("connection failed: {e}"))
+                    eprintln!("[adb-debug] connect_to_remote FAIL: {}", &e);
+                    fail(client, &format!("connection failed: {e}"))?;
                 }
             }
+            Ok(())
         }
 
         // -- host:disconnect / host:disconnect:<serial> --------------------

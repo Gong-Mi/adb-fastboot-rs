@@ -1422,13 +1422,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let request = format!("host:connect:{}:{}", host, port);
 
             match host_command(cli.serial.as_deref(), &request) {
-                Ok(resp) => {
-                    let trimmed = resp.trim();
-                    if !trimmed.is_empty() {
-                        println!("{trimmed}");
-                    } else {
-                        println!("connected to {}:{}", host, port);
-                    }
+                Ok(_resp) => {
+                    println!("connected to {}:{}", host, port);
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
