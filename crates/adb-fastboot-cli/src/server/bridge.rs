@@ -102,6 +102,8 @@ pub(crate) fn tcp_auth_handshake(
     let mut sent_public_key = false;
 
     while resp_hdr.command == A_AUTH {
+        eprintln!("[adb-auth] AUTH loop: resp_hdr.arg0={:#x}, sent_sig={}, sent_key={}",
+            resp_hdr.arg0, sent_signature, sent_public_key);
         if resp_hdr.arg0 != A_AUTH_TOKEN {
             return Err(format!("Unsupported AUTH request type: {}", resp_hdr.arg0));
         }
@@ -114,10 +116,12 @@ pub(crate) fn tcp_auth_handshake(
 
         let (auth_hdr, auth_payload) = if !sent_signature {
             sent_signature = true;
+            eprintln!("[adb-auth] Sending SIGNATURE ({} bytes)", payload.len());
             auth.make_signature_message(&payload)
                 .map_err(|e| format!("signature failed: {e}"))?
         } else if !sent_public_key {
             sent_public_key = true;
+            eprintln!("[adb-auth] Sending RSAKEY");
             auth.make_rsakey_message()
                 .map_err(|e| format!("rsakey failed: {e}"))?
         } else {
@@ -134,6 +138,8 @@ pub(crate) fn tcp_auth_handshake(
         (resp_hdr, payload) = transport
             .recv_message()
             .map_err(|e| format!("AUTH recv failed: {e}"))?;
+        eprintln!("[adb-auth] AUTH response: cmd={:#x} (A_CNXN={:#x}, A_AUTH={:#x})",
+            resp_hdr.command, A_CNXN, A_AUTH);
     }
 
     if resp_hdr.command != A_CNXN {

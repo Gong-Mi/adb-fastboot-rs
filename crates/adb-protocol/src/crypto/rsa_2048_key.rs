@@ -89,7 +89,7 @@ pub fn decode_android_pubkey_binary(buf: &[u8]) -> Result<RsaPublicKey, AuthErro
     Ok(pubkey)
 }
 
-/// Encode RsaPublicKey to ADB public key formatted string: "base64_key user@hostname\0"
+/// Encode RsaPublicKey to ADB public key formatted string: "base64_key user@hostname"
 pub fn encode_adb_public_key_string(
     public_key: &RsaPublicKey,
     label: &str,
@@ -98,8 +98,10 @@ pub fn encode_adb_public_key_string(
     let binary = encode_android_pubkey_binary(public_key)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&binary);
 
+    // AOSP's CalculatePublicKey produces "base64_key user@hostname"
+    // WITHOUT a trailing null byte. adbd may reject extra bytes.
     let label_trimmed = label.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    let result = format!("{} {}\0", b64, label_trimmed).into_bytes();
+    let result = format!("{} {}", b64, label_trimmed).into_bytes();
     Ok(result)
 }
 
