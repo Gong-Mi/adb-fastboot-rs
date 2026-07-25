@@ -108,9 +108,34 @@ fn usb_io_error(error: UsbTransportError) -> IoError {
 
 impl<T: UsbTransport> Read for UsbTransportAdapter<T> {
     fn read(&mut self, buffer: &mut [u8]) -> IoResult<usize> {
-        if buffer.is_empty() { return Ok(0); }
-        self.backend.bulk_read(self.endpoints.bulk_in_endpoint_address, buffer)
-            .map_err(usb_io_error)
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        // AOSP client/transport_usb.cpp reads headers into a max-packet-sized
+        // buffer and rounds payload reads up to the endpoint packet boundary.
+        // usbfs can otherwise report an endpoint protocol/overflow error when a
+        // short caller buffer meets a full USB packet. ADB USB packets may have
+        // a padded tail in that aligned transfer, so only the caller-requested
+        // ADB frame bytes are returned to the framing layer.
+        let packet_size = usize::from(self.endpoints.out_max_packet_size);
+        let transfer_len = buffer
+            .len()
+            .checked_add(packet_size - 1)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "USB read length overflow"))?
+            / packet_size
+            * packet_size;
+        let mut transfer = vec![0u8; transfer_len];
+        let read = self
+            .backend
+            .bulk_read(self.endpoints.bulk_in_endpoint_address, &mut transfer)
+            .map_err(usb_io_error)?;
+        if read < buffer.len() {
+            buffer[..read].copy_from_slice(&transfer[..read]);
+            return Ok(read);
+        }
+        buffer.copy_from_slice(&transfer[..buffer.len()]);
+        Ok(buffer.len())
     }
 }
 
@@ -561,6 +586,7 @@ mod tests {
     struct FakeState {
         input: VecDeque<u8>,
         writes: Vec<Vec<u8>>,
+        read_requests: Vec<usize>,
         read_limit: usize,
         write_limit: usize,
         read_error: Option<UsbTransportError>,
@@ -570,8 +596,8 @@ mod tests {
     impl Default for FakeState {
         fn default() -> Self {
             Self {
-                input: VecDeque::new(), writes: Vec::new(), read_limit: usize::MAX,
-                write_limit: usize::MAX, read_error: None, write_error: None,
+                input: VecDeque::new(), writes: Vec::new(), read_requests: Vec::new(),
+                read_limit: usize::MAX, write_limit: usize::MAX, read_error: None, write_error: None,
             }
         }
     }
@@ -586,6 +612,7 @@ mod tests {
             assert_eq!(endpoint, 0x81);
             let mut state = self.state.lock().unwrap();
             if let Some(error) = state.read_error.take() { return Err(error); }
+            state.read_requests.push(buffer.len());
             let count = buffer.len().min(state.input.len()).min(state.read_limit);
             for byte in buffer.iter_mut().take(count) { *byte = state.input.pop_front().unwrap(); }
             Ok(count)
@@ -619,6 +646,19 @@ mod tests {
     fn rejects_unmatched_adb_candidate_without_fabricating_serial() {
         let candidates = vec![RusbAdbCandidate { serial: None, bus_number: 1, address: 7 }];
         assert!(matches!(select_adb_candidate(&candidates, RusbAdbSelector::Serial("missing")), Err(RusbUsbTransportError::NoMatchingDevice { .. })));
+    }
+
+    #[test]
+    fn adapter_reads_into_packet_aligned_usb_buffer() {
+        let fake = fake();
+        let state = fake.state.clone();
+        state.lock().unwrap().input.extend([0x41, 0x42]);
+        let mut adapter = UsbTransportAdapter::new(fake);
+        let mut output = [0u8; 2];
+
+        assert_eq!(adapter.read(&mut output).unwrap(), 2);
+        assert_eq!(output, [0x41, 0x42]);
+        assert_eq!(state.lock().unwrap().read_requests, vec![64]);
     }
 
     #[test]
