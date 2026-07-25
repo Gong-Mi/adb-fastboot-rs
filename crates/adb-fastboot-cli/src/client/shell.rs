@@ -43,7 +43,7 @@ pub fn stream_shell_v2(
                 remote_id = hdr.arg0;
             }
             A_WRTE => {
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, remote_id, &[]);
+                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
                 let _ = transport.send_message(&ack, &[]);
 
                 let mut rest = payload.as_slice();
@@ -85,7 +85,7 @@ pub fn stream_shell_v2(
                 }
             }
             A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
+                let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
                 let _ = transport.send_message(&ack, &[]);
                 if let Some(code) = exit_code {
                     if code != 0 {
