@@ -1,5 +1,6 @@
 use std::io::{Read, Write, Result as IoResult};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use crate::header::{AdbMessageHeader, HeaderError};
 use thiserror::Error;
@@ -410,6 +411,77 @@ impl Write for AdbTlsTransport {
 
 #[cfg(feature = "tls")]
 impl Transport for AdbTlsTransport {}
+
+// ---------------------------------------------------------------------------
+// SharedTransport — Arc<Mutex<Box<dyn Transport>>> wrapper
+// ---------------------------------------------------------------------------
+
+/// Wraps an `Arc<Mutex<Box<dyn Transport>>>` so it can be used as a
+/// `Transport` by multiple threads.  Each `try_clone_box()` call creates
+/// a new `SharedTransport` sharing the same underlying transport via the
+/// `Arc`, enabling concurrent send/receive from different threads.
+///
+/// Used by the ADB server to cache authenticated USB transports and
+/// reuse them across multiple client bridge connections.
+pub struct SharedTransport(pub Arc<Mutex<Box<dyn Transport>>>);
+
+impl SharedTransport {
+    pub fn new(inner: Arc<Mutex<Box<dyn Transport>>>) -> Self {
+        Self(inner)
+    }
+}
+
+impl Read for SharedTransport {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        let mut guard = self.0.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "transport lock poisoned")
+        })?;
+        guard.read(buf)
+    }
+}
+
+impl Write for SharedTransport {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        let mut guard = self.0.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "transport lock poisoned")
+        })?;
+        guard.write(buf)
+    }
+
+    fn flush(&mut self) -> IoResult<()> {
+        let mut guard = self.0.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "transport lock poisoned")
+        })?;
+        guard.flush()
+    }
+}
+
+impl Transport for SharedTransport {
+    fn flush_payload(&mut self, payload_len: usize) -> Result<(), TransportError> {
+        let mut guard = self.0.lock().map_err(|e| {
+            TransportError::Protocol(format!("transport lock: {e}"))
+        })?;
+        guard.flush_payload(payload_len)
+    }
+
+    fn send_message(&mut self, header: &AdbMessageHeader, payload: &[u8]) -> Result<(), TransportError> {
+        let mut guard = self.0.lock().map_err(|e| {
+            TransportError::Protocol(format!("transport lock: {e}"))
+        })?;
+        guard.send_message(header, payload)
+    }
+
+    fn recv_message(&mut self) -> Result<(AdbMessageHeader, Vec<u8>), TransportError> {
+        let mut guard = self.0.lock().map_err(|e| {
+            TransportError::Protocol(format!("transport lock: {e}"))
+        })?;
+        guard.recv_message()
+    }
+
+    fn try_clone_box(&self) -> Option<Box<dyn Transport>> {
+        Some(Box::new(SharedTransport(Arc::clone(&self.0))))
+    }
+}
 
 #[cfg(test)]
 mod tests {

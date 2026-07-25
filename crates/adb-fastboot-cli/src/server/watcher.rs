@@ -1,4 +1,9 @@
 //! ADB USB device watcher — inotify event-driven, fallback to polling.
+//!
+//! At device discovery time, the watcher opens the USB transport, performs the
+//! full AUTH/CNXN handshake, and caches the authenticated transport in the
+//! registry.  This allows the bridge to reuse the cached transport instead of
+//! opening a new one and re-authenticating on each client connection.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,9 +15,16 @@ use inotify::{Inotify, WatchMask};
 
 use crate::server::models::{TransportRegistry, POLL_INTERVAL};
 
+#[cfg(feature = "usb")]
+use crate::server::models::AuthenticatedUsbTransport;
+
 /// USB device watcher: monitors `/dev/bus/usb` via inotify for create/delete/move
 /// events. Falls back to regular polling (`POLL_INTERVAL`) when inotify is
 /// unavailable (e.g. Android restrictions, kernel without inotify, etc.).
+///
+/// When a new USB device is discovered, the watcher eagerly opens the USB
+/// transport, performs the AUTH/CNXN handshake, and caches the authenticated
+/// transport in the registry's `usb_auth` map for reuse by the bridge.
 #[cfg(feature = "usb")]
 pub(crate) fn usb_device_watcher(registry: Arc<Mutex<TransportRegistry>>, running: Arc<AtomicBool>) {
     // Strategy 1: inotify on /dev/bus/usb — event-driven, no CPU waste
@@ -34,11 +46,13 @@ pub(crate) fn usb_device_watcher(registry: Arc<Mutex<TransportRegistry>>, runnin
                     while running.load(Ordering::Relaxed) {
                         match inotify.read_events_blocking(&mut buffer) {
                             Ok(events) => {
-                                // Any observable change → re-enumerate
+                                // Any observable change → re-enumerate and re-auth
                                 if events.count() > 0 {
                                     if let Ok(mut reg) = registry.lock() {
                                         reg.refresh_usb_devices();
                                     }
+                                    // Eagerly authenticate newly discovered USB devices
+                                    preauth_new_usb_devices(&registry);
                                 }
                             }
                             Err(e) => {
@@ -74,6 +88,75 @@ pub(crate) fn usb_device_watcher(registry: Arc<Mutex<TransportRegistry>>, runnin
         if let Ok(mut reg) = registry.lock() {
             reg.refresh_usb_devices();
         }
+        // Eagerly authenticate newly discovered USB devices
+        preauth_new_usb_devices(&registry);
+    }
+}
+
+/// Iterate USB devices in the registry, and for any that are not yet
+/// authenticated, open the USB transport and perform the AUTH/CNXN handshake.
+///
+/// Authentication is done **outside** the registry lock to avoid holding the
+/// lock during slow USB I/O.  The registry is locked only to read the list of
+/// unauthenticated serials and to store the result.
+#[cfg(feature = "usb")]
+fn preauth_new_usb_devices(registry: &Arc<Mutex<TransportRegistry>>) {
+    use crate::server::transport::connect_usb_device;
+
+    // Collect serials of USB devices that need authentication
+    let todo: Vec<String> = {
+        let reg = match registry.lock() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        reg.devices
+            .iter()
+            .filter(|d| {
+                use crate::server::models::DeviceOrigin;
+                matches!(d.origin, DeviceOrigin::Usb) && !reg.usb_auth.contains_key(&d.serial)
+            })
+            .map(|d| d.serial.clone())
+            .collect()
+    };
+
+    for serial in &todo {
+        eprintln!(
+            "[adb-server] Pre-authenticating USB device '{serial}'..."
+        );
+
+        // Open USB transport and perform AUTH/CNXN (outside the lock)
+        let transport = match connect_usb_device(serial, registry) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "[adb-server] Pre-auth of '{serial}' failed (will retry): {e}"
+                );
+                continue;
+            }
+        };
+
+        // Store the authenticated transport in the registry (brief lock)
+        let arc_t = Arc::new(Mutex::new(transport));
+        let mut reg = match registry.lock() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "[adb-server] Registry lock failed while caching '{serial}': {e}"
+                );
+                continue;
+            }
+        };
+        reg.usb_auth.insert(
+            serial.clone(),
+            AuthenticatedUsbTransport {
+                _serial: serial.clone(),
+                send_transport: Arc::clone(&arc_t),
+            },
+        );
+
+        eprintln!(
+            "[adb-server] USB device '{serial}' pre-authenticated and cached."
+        );
     }
 }
 

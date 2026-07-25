@@ -1,12 +1,23 @@
 //! Transport Bridge — connect client to device after host:transport succeeds.
 //!
 //! Mirrors AOSP `sockets.cpp` → smart_socket_enqueue + connect_to_remote.
+//!
+//! # AUTH/CNXN strategy
+//!
+//! - **USB devices**: pre-authenticated at discovery time (watcher).  The bridge
+//!   reuses the cached authenticated transport from the registry, wrapped in a
+//!   `SharedTransport` so both the reader thread and the writer loop share the
+//!   same underlying `Arc<Mutex<Box<dyn Transport>>>`.
+//! - **TCP devices**: cannot be pre-authenticated because the watcher has no TCP
+//!   visibility.  The bridge opens a fresh TCP connection and does the CNXN
+//!   handshake (including AUTH if the device requests it).
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
+use adb_protocol::{AdbMessageHeader, Transport, A_AUTH, A_AUTH_TOKEN, A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, SharedTransport};
+
 use crate::server::models::{DeviceOrigin, TransportRegistry};
-use crate::server::transport::open_transport_by_origin;
 
 /// Bridge a client TCP connection to an ADB device (TCP or USB).
 ///
@@ -17,14 +28,36 @@ pub(crate) fn bridge_to_device(
     serial: String,
     registry: &Arc<Mutex<TransportRegistry>>,
 ) -> Result<bool, String> {
-    let origin = {
+    let (origin, is_tcp) = {
         let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-        reg.find_by_serial(&serial).map(|d| d.origin)
+        let origin = reg.find_by_serial(&serial).map(|d| d.origin);
+        let is_tcp = matches!(origin, Some(DeviceOrigin::Tcp { .. }));
+        (origin, is_tcp)
     };
 
-    let is_tcp = matches!(origin, Some(DeviceOrigin::Tcp { .. }));
     let origin_ref = origin.as_ref().ok_or_else(|| format!("device '{serial}' not found"))?;
-    let result = smart_socket_bridge(client, open_transport_by_origin(origin_ref, &serial)?, &serial);
+
+    let result = if matches!(origin_ref, DeviceOrigin::Usb) {
+        // --- USB: use authenticated transport from registry ---
+        #[cfg(feature = "usb")]
+        {
+            let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+            let transport_arc = reg.ensure_usb_auth(&serial)?;
+            let shared = Box::new(SharedTransport::new(transport_arc))
+                as Box<dyn Transport>;
+            drop(reg);
+            smart_socket_bridge(client, shared, &serial)
+        }
+        #[cfg(not(feature = "usb"))]
+        {
+            Err("USB transport not supported (compile with --features usb)".to_string())
+        }
+    } else {
+        // --- TCP: open raw transport and authenticate inline ---
+        let transport = crate::server::transport::open_transport_by_origin(origin_ref, &serial)?;
+        let transport = tcp_auth_handshake(transport, &serial)?;
+        smart_socket_bridge(client, transport, &serial)
+    };
 
     // After bridge ends, remove TCP device from registry
     if is_tcp && result.is_ok() {
@@ -37,6 +70,86 @@ pub(crate) fn bridge_to_device(
     }
 
     result
+}
+
+/// Perform CNXN + optional AUTH handshake on a TCP transport.
+///
+/// TCP devices may require AUTH (same as USB).  This function sends A_CNXN,
+/// then loops on A_AUTH until A_CNXN is received or auth fails.
+fn tcp_auth_handshake(
+    mut transport: Box<dyn Transport>,
+    _serial: &str,
+) -> Result<Box<dyn Transport>, String> {
+    let cnxn_payload = b"host::";
+    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
+
+    transport
+        .send_message(&cnxn_hdr, cnxn_payload)
+        .map_err(|e| format!("CNXN send failed: {e}"))?;
+
+    let (mut resp_hdr, mut payload) = transport
+        .recv_message()
+        .map_err(|e| format!("CNXN recv failed: {e}"))?;
+
+    // If device responds with A_CNXN directly (no auth required), we're done.
+    if resp_hdr.command == A_CNXN {
+        return Ok(transport);
+    }
+
+    // Otherwise, handle AUTH loop (same as USB auth).
+    let auth = crate::client::auth::default_auth();
+    let mut sent_signature = false;
+    let mut sent_public_key = false;
+
+    while resp_hdr.command == A_AUTH {
+        if resp_hdr.arg0 != A_AUTH_TOKEN {
+            return Err(format!("Unsupported AUTH request type: {}", resp_hdr.arg0));
+        }
+        if payload.len() != 20 {
+            return Err(format!(
+                "Invalid ADB AUTH token length: {}",
+                payload.len()
+            ));
+        }
+
+        let (auth_hdr, auth_payload) = if !sent_signature {
+            sent_signature = true;
+            auth.make_signature_message(&payload)
+                .map_err(|e| format!("signature failed: {e}"))?
+        } else if !sent_public_key {
+            sent_public_key = true;
+            auth.make_rsakey_message()
+                .map_err(|e| format!("rsakey failed: {e}"))?
+        } else {
+            return Err(
+                "adbd rejected the ADB RSA key after signature and public-key exchange"
+                    .to_string(),
+            );
+        };
+
+        transport
+            .send_message(&auth_hdr, &auth_payload)
+            .map_err(|e| format!("AUTH send failed: {e}"))?;
+
+        (resp_hdr, payload) = transport
+            .recv_message()
+            .map_err(|e| format!("AUTH recv failed: {e}"))?;
+    }
+
+    if resp_hdr.command != A_CNXN {
+        return Err(format!(
+            "Expected A_CNXN after AUTH, got cmd={:#x}",
+            resp_hdr.command
+        ));
+    }
+
+    // Persist public key on Android
+    #[cfg(target_os = "android")]
+    if sent_public_key {
+        let _ = crate::client::auth::persist_adb_pubkey(auth);
+    }
+
+    Ok(transport)
 }
 
 /// Smart socket bridge: reads hex-length prefixed commands from client,

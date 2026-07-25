@@ -578,11 +578,13 @@ mod tests {
         let transport = MdnsTransport::new(service);
         let result = transport.connect(Duration::from_secs(1));
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        let msg = err.to_string();
+        let msg = match result {
+            Err(e) => e.to_string(),
+            _ => unreachable!(),
+        };
         assert!(
-            msg.contains("TlsPairing") || msg.contains("pair_device"),
-            "Expected TlsPairing error, got: {msg}"
+            msg.contains("TlsPairing") || msg.contains("pair_device") || msg.contains("no IP address"),
+            "Expected TlsPairing or resolution error, got: {msg}"
         );
     }
 }

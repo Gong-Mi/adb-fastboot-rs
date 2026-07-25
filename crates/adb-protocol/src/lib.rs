@@ -39,7 +39,7 @@ pub use sync::{
     SyncDentV2Response, SyncMessageHeader, SyncProtocolError, SyncStatResponse, SyncStatV2Response,
     SyncV2Decoder, SyncV2Encoder,
 };
-pub use transport::{AdbServerTransport, Connect, TcpTransport, Transport, TransportError};
+pub use transport::{AdbServerTransport, Connect, SharedTransport, TcpTransport, Transport, TransportError};
 #[cfg(feature = "tls")]
 pub use transport::AdbTlsTransport;
 #[cfg(any(feature = "usb", feature = "usb-rusb"))]
