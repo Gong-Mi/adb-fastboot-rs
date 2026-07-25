@@ -401,24 +401,33 @@ pub(crate) fn run_smart_socket_loop(
             None => return Ok(()), // clean disconnect
         };
 
-        let is_transport_cmd = cmd.starts_with("host:transport:")
+        let is_host_cmd = cmd.starts_with("host:");
+        let is_transport_cmd = is_host_cmd && (cmd.starts_with("host:transport:")
             || cmd.starts_with("host:tport:")
-            || cmd.starts_with("host:transport-id:");
+            || cmd.starts_with("host:transport-id:"));
 
-        // Dispatch host services
-        crate::server::handler::dispatch_host_service(
-            &mut smart.stream,
-            &cmd,
-            registry,
-            running,
-        )?;
+        // Only dispatch host:* commands to the host service handler.
+        // Non-host commands (e.g. shell,v2,raw:...) will be handled
+        // after a transport is selected in bridge mode.
+        if is_host_cmd {
+            crate::server::handler::dispatch_host_service(
+                &mut smart.stream,
+                &cmd,
+                registry,
+                running,
+            )?;
 
-        if is_transport_cmd {
-            // Transport selected — enter bridge mode.
-            let serial = extract_serial_from_transport_cmd(&cmd, registry)?;
-            return bridge_to_device_with_smart(client, &serial, registry);
+            if is_transport_cmd {
+                // Transport selected — enter bridge mode.
+                let serial = extract_serial_from_transport_cmd(&cmd, registry)?;
+                return bridge_to_device_with_smart(client, &serial, registry);
+            }
+        } else {
+            // Non-host command (e.g. shell,v2,raw:...) with no transport selected
+            smart.send_fail(&format!("device service requires transport selection first: {cmd}"))?;
+            return Ok(());
         }
-    }
+    } // end loop
 }
 
 /// Extract the device serial from a transport-selection command.
