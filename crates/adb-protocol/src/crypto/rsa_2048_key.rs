@@ -98,10 +98,11 @@ pub fn encode_adb_public_key_string(
     let binary = encode_android_pubkey_binary(public_key)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&binary);
 
-    // AOSP's CalculatePublicKey produces "base64_key user@hostname"
-    // WITHOUT a trailing null byte. adbd may reject extra bytes.
+    // CalculatePublicKey returns the text without a NUL, but AOSP client/auth.cpp
+    // send_auth_publickey() transmits key.size() + 1: adbd expects a C string.
     let label_trimmed = label.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    let result = format!("{} {}", b64, label_trimmed).into_bytes();
+    let mut result = format!("{} {}", b64, label_trimmed).into_bytes();
+    result.push(0);
     Ok(result)
 }
 

@@ -4,7 +4,7 @@
 //! and the `AdbAuth` convenience wrapper.
 
 use rsa::pkcs1v15::{SigningKey, VerifyingKey};
-use rsa::signature::{SignatureEncoding, Signer, Verifier};
+use rsa::signature::{hazmat::{PrehashSigner, PrehashVerifier}, SignatureEncoding};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use sha1::Sha1;
 
@@ -47,23 +47,33 @@ pub fn generate_rsa_key() -> Result<RsaPrivateKey, AuthError> {
     Ok(private_key)
 }
 
-/// Sign ADB token (typically 20 bytes) using RSA private key (PKCS#1 v1.5 + SHA-1)
+/// Sign ADB's 20-byte token as the already-computed SHA-1 digest expected by
+/// AOSP's RSA_sign(NID_sha1, token, 20, ...). The token is random data; it
+/// must be encoded directly in DigestInfo, not hashed again.
 pub fn sign_token(private_key: &RsaPrivateKey, token: &[u8]) -> Result<Vec<u8>, AuthError> {
+    if token.len() != 20 {
+        return Err(AuthError::InvalidTokenLength { expected: 20, got: token.len() });
+    }
     let signer = SigningKey::<Sha1>::new(private_key.clone());
-    let signature = signer.sign(token);
+    let signature = signer.sign_prehash(token)
+        .map_err(|e| AuthError::InvalidPublicKeyFormat(format!("RSA prehash signing failed: {e}")))?;
     Ok(signature.to_vec())
 }
 
-/// Verify signature against ADB token using RSA public key
+/// Verify an ADB token signature using the same prehash convention as adbd's
+/// RSA_verify(NID_sha1, token, 20, ...).
 pub fn verify_token_signature(
     public_key: &RsaPublicKey,
     token: &[u8],
     signature: &[u8],
 ) -> Result<bool, AuthError> {
+    if token.len() != 20 {
+        return Err(AuthError::InvalidTokenLength { expected: 20, got: token.len() });
+    }
     let verifying_key = VerifyingKey::<Sha1>::new(public_key.clone());
     let sig = rsa::pkcs1v15::Signature::try_from(signature)
         .map_err(|_| AuthError::InvalidPublicKeyFormat("Invalid signature length".to_string()))?;
-    Ok(verifying_key.verify(token, &sig).is_ok())
+    Ok(verifying_key.verify_prehash(token, &sig).is_ok())
 }
 
 /// Load RsaPrivateKey from PEM encoded string
