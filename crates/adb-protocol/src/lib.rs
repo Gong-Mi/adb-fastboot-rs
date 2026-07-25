@@ -7,6 +7,7 @@ pub mod mdns;
 pub mod pairing;
 pub mod pairing_auth;
 pub mod pairing_connection;
+pub mod proto;
 pub mod shell_v2;
 pub mod stls;
 pub mod sync;
