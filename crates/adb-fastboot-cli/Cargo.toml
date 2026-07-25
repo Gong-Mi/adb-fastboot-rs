@@ -18,7 +18,7 @@ path = "src/main_fastboot.rs"
 default = []
 usb = ["adb-protocol/usb-android", "fastboot-protocol/usb-android"]
 usb-rusb = ["adb-protocol/usb-rusb"]
-tls = ["adb-protocol/tls"]
+tls = ["adb-protocol/tls", "dep:rustls"]
 
 [dependencies]
 adb-protocol = { path = "../adb-protocol" }
@@ -29,3 +29,4 @@ libc = "0.2"
 byteorder = "1.5"
 inotify = "0.11"
 zip = { version = "2" }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }

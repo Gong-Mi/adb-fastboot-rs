@@ -22,7 +22,9 @@ pub mod handler;
 pub mod models;
 pub mod runner;
 pub mod services;
+pub mod socket_spec;
 pub mod transport;
+pub mod transport_fd;
 pub mod types;
 pub mod watcher;
 

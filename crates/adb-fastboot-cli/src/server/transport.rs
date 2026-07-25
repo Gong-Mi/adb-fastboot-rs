@@ -612,6 +612,337 @@ pub(crate) fn refresh_usb_devices(manager: &TransportManager) {
 }
 
 // ---------------------------------------------------------------------------
+// ReconnectHandler — reconnect queue + background retry thread
+// ---------------------------------------------------------------------------
+
+/// Configuration for reconnection behaviour.
+///
+/// Mirrors AOSP's retry parameters in `BlockingConnectionAdapter` and
+/// `transport.cpp` transport lifecycle.
+#[derive(Debug, Clone)]
+pub(crate) struct ReconnectConfig {
+    /// Maximum number of reconnect attempts (0 = unlimited).
+    pub max_retries: u32,
+    /// Initial delay between retry attempts (seconds).
+    pub base_delay_secs: u64,
+    /// Maximum delay between retry attempts (seconds).
+    pub max_delay_secs: u64,
+    /// Polling interval for the background retry thread (seconds).
+    pub poll_interval_secs: u64,
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 5,
+            base_delay_secs: 1,
+            max_delay_secs: 30,
+            poll_interval_secs: 1,
+        }
+    }
+}
+
+impl ReconnectConfig {
+    /// Calculate the next retry delay with exponential backoff.
+    pub(crate) fn next_delay(&self, attempt: u32) -> Duration {
+        let secs = self
+            .base_delay_secs
+            .saturating_mul(2u64.saturating_pow(attempt))
+            .min(self.max_delay_secs);
+        Duration::from_secs(secs)
+    }
+}
+
+/// An entry in the reconnect queue.
+#[derive(Debug, Clone)]
+struct ReconnectEntry {
+    /// Device serial (also used as the connect endpoint for TCP).
+    serial: String,
+    /// Socket address to reconnect to.
+    addr: SocketAddr,
+    /// Number of failed reconnection attempts so far.
+    retry_count: u32,
+    /// Maximum retries before giving up (0 = unlimited).
+    max_retries: u32,
+    /// When the next attempt should be made.
+    next_attempt: std::time::Instant,
+    /// Whether this entry has been kicked (removed from the queue).
+    kicked: bool,
+}
+
+/// Manages reconnection of TCP ADB transports.
+///
+/// Mirrors AOSP `BlockingConnectionAdapter` + transport lifecycle logic in
+/// `transport.cpp`.  Maintains a queue of TCP endpoints to retry, runs a
+/// background thread that periodically attempts connections, and provides
+/// `kick_transport()` / `transport_unref()` for lifecycle management.
+///
+/// # Lifecycle
+///
+/// 1. **Add** — `add_transport()` enqueues a new TCP endpoint.
+/// 2. **Retry** — the background thread attempts reconnection with
+///    exponential backoff.  On success, the device is registered via
+///    `TransportManager`.
+/// 3. **Kick** — `kick_transport()` marks the transport for removal and
+///    triggers immediate disconnect.  The entry is removed from the queue
+///    on the next poll cycle.
+/// 4. **Unref** — `transport_unref()` decrements the reference count.
+///    When the count reaches zero, the transport is removed from the queue.
+/// 5. **Stop** — drops the `ReconnectHandler` or calls `stop()` to join
+///    the background thread.
+pub(crate) struct ReconnectHandler {
+    /// Transport registry to register reconnected devices in.
+    registry: Arc<Mutex<TransportRegistry>>,
+    /// Reconnect queue.
+    queue: Arc<Mutex<Vec<ReconnectEntry>>>,
+    /// Reference counts keyed by serial.
+    ref_counts: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    /// Shutdown signal for the background thread.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Configuration.
+    config: ReconnectConfig,
+    /// Handle to the background retry thread.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ReconnectHandler {
+    /// Create a new `ReconnectHandler` without starting the background thread.
+    pub(crate) fn new(registry: Arc<Mutex<TransportRegistry>>) -> Self {
+        Self {
+            registry,
+            queue: Arc::new(Mutex::new(Vec::new())),
+            ref_counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            config: ReconnectConfig::default(),
+            thread: None,
+        }
+    }
+
+    /// Create a new `ReconnectHandler` with custom configuration.
+    pub(crate) fn with_config(
+        registry: Arc<Mutex<TransportRegistry>>,
+        config: ReconnectConfig,
+    ) -> Self {
+        Self {
+            registry,
+            queue: Arc::new(Mutex::new(Vec::new())),
+            ref_counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            config,
+            thread: None,
+        }
+    }
+
+    /// Start the background reconnect thread.
+    ///
+    /// The thread polls the queue at `config.poll_interval_secs` intervals,
+    /// attempting reconnection for entries whose `next_attempt` has elapsed.
+    pub(crate) fn start(&mut self) {
+        let queue = Arc::clone(&self.queue);
+        let registry = Arc::clone(&self.registry);
+        let ref_counts = Arc::clone(&self.ref_counts);
+        let shutdown = Arc::clone(&self.shutdown);
+        let config = self.config.clone();
+
+        self.thread = Some(std::thread::Builder::new()
+            .name("adb-reconnect".to_string())
+            .spawn(move || {
+                let poll_dur = Duration::from_secs(config.poll_interval_secs);
+                while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    Self::poll_reconnect_queue(&queue, &registry, &config);
+                    // Wait for poll interval or shutdown signal
+                    let start = std::time::Instant::now();
+                    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        if start.elapsed() >= poll_dur {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            })
+            .expect("failed to spawn reconnect thread"));
+    }
+
+    /// Gracefully stop the background thread and wait for it to finish.
+    pub(crate) fn stop(&mut self) {
+        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Add a TCP transport to the reconnect queue.
+    ///
+    /// If the transport already exists in the queue, its retry count is reset
+    /// (it will attempt reconnection immediately on the next poll cycle).
+    pub(crate) fn add_transport(&self, serial: String, addr: SocketAddr) {
+        let mut queue = self.queue.lock().expect("reconnect queue lock");
+        let mut counts = self.ref_counts.lock().expect("refcounts lock");
+
+        // If already queued, reset retry count and next attempt time
+        if let Some(entry) = queue.iter_mut().find(|e| e.serial == serial) {
+            entry.retry_count = 0;
+            entry.kicked = false;
+            entry.next_attempt = std::time::Instant::now();
+            entry.addr = addr; // Update address in case it changed
+        } else {
+            queue.push(ReconnectEntry {
+                serial: serial.clone(),
+                addr,
+                retry_count: 0,
+                max_retries: self.config.max_retries,
+                next_attempt: std::time::Instant::now(),
+                kicked: false,
+            });
+        }
+
+        // Increment reference count
+        *counts.entry(serial).or_insert(0) += 1;
+    }
+
+    /// Mark a transport for removal from the reconnect queue and trigger
+    /// immediate disconnect.  Mirrors AOSP `kick_transport()`.
+    ///
+    /// Returns `true` if the transport was found and kicked.
+    pub(crate) fn kick_transport(&self, serial: &str) -> bool {
+        let mut queue = self.queue.lock().expect("reconnect queue lock");
+        if let Some(entry) = queue.iter_mut().find(|e| e.serial == serial) {
+            entry.kicked = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Decrement the reference count for a transport.
+    ///
+    /// When the count reaches zero, the transport is removed from the
+    /// reconnect queue (no more retry attempts).  Mirrors AOSP `transport_unref()`.
+    ///
+    /// Returns `true` if the refcount reached zero and the entry was removed.
+    pub(crate) fn transport_unref(&self, serial: &str) -> bool {
+        let mut counts = self.ref_counts.lock().expect("refcounts lock");
+        let mut removed = false;
+
+        if let Some(count) = counts.get_mut(serial) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                // Remove the entry from the queue
+                let mut queue = self.queue.lock().expect("reconnect queue lock");
+                queue.retain(|e| e.serial != serial);
+                counts.remove(serial);
+                removed = true;
+            }
+        }
+        removed
+    }
+
+    /// Get the current reference count for a transport.
+    pub(crate) fn ref_count(&self, serial: &str) -> u32 {
+        let counts = self.ref_counts.lock().expect("refcounts lock");
+        counts.get(serial).copied().unwrap_or(0)
+    }
+
+    /// Check if a transport is in the reconnect queue.
+    pub(crate) fn is_queued(&self, serial: &str) -> bool {
+        let queue = self.queue.lock().expect("reconnect queue lock");
+        queue.iter().any(|e| e.serial == serial && !e.kicked)
+    }
+
+    /// Get the number of entries currently in the reconnect queue (excluding
+    /// kicked entries).
+    pub(crate) fn queue_len(&self) -> usize {
+        let queue = self.queue.lock().expect("reconnect queue lock");
+        queue.iter().filter(|e| !e.kicked).count()
+    }
+
+    // -- Private helpers ------------------------------------------------------
+
+    /// Poll the reconnect queue and attempt reconnection for eligible entries.
+    fn poll_reconnect_queue(
+        queue: &Arc<Mutex<Vec<ReconnectEntry>>>,
+        registry: &Arc<Mutex<TransportRegistry>>,
+        config: &ReconnectConfig,
+    ) {
+        let now = std::time::Instant::now();
+        let mut entries_to_retry: Vec<(usize, ReconnectEntry)> = {
+            let mut q = queue.lock().expect("reconnect queue lock");
+            let mut ready = Vec::new();
+            let mut i = 0;
+            while i < q.len() {
+                if q[i].kicked {
+                    // Remove kicked entries
+                    q.swap_remove(i);
+                    continue;
+                }
+                if now >= q[i].next_attempt {
+                    let entry = q[i].clone();
+                    ready.push((i, entry));
+                }
+                i += 1;
+            }
+            ready
+        };
+
+        for (idx, entry) in &entries_to_retry {
+            // Check max retries
+            if entry.max_retries > 0 && entry.retry_count >= entry.max_retries {
+                eprintln!(
+                    "[adb-reconnect] Giving up on {} after {} failed attempts",
+                    entry.serial, entry.retry_count
+                );
+                let mut q = queue.lock().expect("reconnect queue lock");
+                q.retain(|e| e.serial != entry.serial);
+                continue;
+            }
+
+            // Attempt reconnection
+            match connect_to_remote(entry.addr, registry) {
+                Ok(_transport) => {
+                    eprintln!(
+                        "[adb-reconnect] Reconnected to {} (attempt {})",
+                        entry.serial, entry.retry_count + 1
+                    );
+                    // Reconnection succeeded — remove from queue
+                    let mut q = queue.lock().expect("reconnect queue lock");
+                    q.retain(|e| e.serial != entry.serial);
+                }
+                Err(ref err) => {
+                    eprintln!(
+                        "[adb-reconnect] Failed to reconnect to {} (attempt {}): {err}",
+                        entry.serial,
+                        entry.retry_count + 1
+                    );
+                    // Schedule next retry with backoff
+                    let mut q = queue.lock().expect("reconnect queue lock");
+                    if *idx < q.len() && q[*idx].serial == entry.serial {
+                        q[*idx].retry_count = entry.retry_count + 1;
+                        q[*idx].next_attempt =
+                            std::time::Instant::now() + config.next_delay(entry.retry_count);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remove all entries from the reconnect queue.
+    pub(crate) fn clear_queue(&self) {
+        let mut queue = self.queue.lock().expect("reconnect queue lock");
+        queue.clear();
+        let mut counts = self.ref_counts.lock().expect("refcounts lock");
+        counts.clear();
+    }
+}
+
+impl Drop for ReconnectHandler {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

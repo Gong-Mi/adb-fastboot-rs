@@ -16,8 +16,9 @@ pub mod tls_connection;
 // Re-export TLS connection types
 pub use tls_connection::{
     accept_tls_handshake, create_server_config, create_tls_config, export_pairing_key_material,
-    perform_tls_handshake, perform_tls_handshake_with_pairing_export, ClientConnection,
-    ServerConnection, TlsError, TlsStream,
+    perform_tls_handshake, perform_tls_handshake_with_key,
+    perform_tls_handshake_with_pairing_export, ClientConnection, ReadFully, ServerConnection,
+    TlsConnection, TlsError, TlsMode, TlsStream, WriteFully,
 };
 // re-export X.509 cert generation (moved to crypto::x509_generator)
 pub use crate::crypto::x509_generator::generate_self_signed_cert;

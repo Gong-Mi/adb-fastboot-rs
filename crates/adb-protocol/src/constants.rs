@@ -58,3 +58,34 @@ pub const SHELL_ID_STDERR: u8 = 2;
 pub const SHELL_ID_EXIT: u8 = 3;
 pub const SHELL_ID_CLOSE_STDIN: u8 = 4;
 pub const SHELL_ID_WINDOW_SIZE_CHANGE: u8 = 5;
+pub const SHELL_ID_INVALID: u8 = 255;
+
+// ---------------------------------------------------------------------------
+// ADB feature strings (AOSP transport.cpp kFeature*)
+// ---------------------------------------------------------------------------
+
+pub const FEATURE_SHELL_V2: &str = "shell_v2";
+pub const FEATURE_CMD: &str = "cmd";
+pub const FEATURE_STAT_V2: &str = "stat_v2";
+pub const FEATURE_LS_V2: &str = "ls_v2";
+pub const FEATURE_LIBUSB: &str = "libusb";
+pub const FEATURE_PUSH_SYNC: &str = "push_sync";
+pub const FEATURE_APEX: &str = "apex";
+pub const FEATURE_FIXED_PUSH_MKDIR: &str = "fixed_push_mkdir";
+pub const FEATURE_ABB: &str = "abb";
+pub const FEATURE_FIXED_PUSH_SYMLINK_TIMESTAMP: &str = "fixed_push_symlink_timestamp";
+pub const FEATURE_ABB_EXEC: &str = "abb_exec";
+pub const FEATURE_REMOUNT_SHELL: &str = "remount_shell";
+pub const FEATURE_TRACK_APP: &str = "track_app";
+pub const FEATURE_SENDRECV_V2: &str = "sendrecv_v2";
+pub const FEATURE_SENDRECV_V2_BROTLI: &str = "sendrecv_v2_brotli";
+pub const FEATURE_SENDRECV_V2_LZ4: &str = "sendrecv_v2_lz4";
+pub const FEATURE_SENDRECV_V2_ZSTD: &str = "sendrecv_v2_zstd";
+pub const FEATURE_SENDRECV_V2_DRY_RUN_SEND: &str = "sendrecv_v2_dry_run_send";
+pub const FEATURE_DELAYED_ACK: &str = "delayed_ack";
+pub const FEATURE_OPENSCREEN_MDNS: &str = "openscreen_mdns";
+pub const FEATURE_DEVICE_TRACKER_PROTO_FORMAT: &str = "devicetracker_proto_format";
+pub const FEATURE_DEV_RAW: &str = "devraw";
+pub const FEATURE_APP_INFO: &str = "app_info";
+pub const FEATURE_SERVER_STATUS: &str = "server_status";
+pub const FEATURE_TRACK_MDNS: &str = "track_mdns";

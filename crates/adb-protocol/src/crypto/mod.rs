@@ -1,6 +1,7 @@
 //! ADB crypto operations, mirroring AOSP `vendor/adb/crypto/`.
 pub mod key;
 pub mod rsa_2048_key;
+#[cfg(feature = "tls")]
 pub mod x509_generator;
 
 // Re-exports for convenience
@@ -13,4 +14,5 @@ pub use rsa_2048_key::{
     decode_android_pubkey_binary, encode_adb_public_key_string, encode_android_pubkey_binary,
     parse_adb_public_key_string,
 };
+#[cfg(feature = "tls")]
 pub use x509_generator::{generate_self_signed_cert, CertError};
