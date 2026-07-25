@@ -410,6 +410,7 @@ pub(crate) fn run_smart_socket_loop(
         // Non-host commands (e.g. shell,v2,raw:...) will be handled
         // after a transport is selected in bridge mode.
         if is_host_cmd {
+            eprintln!("[adb-debug-ss] dispatching host cmd: {:?}", &cmd);
             crate::server::handler::dispatch_host_service(
                 &mut smart.stream,
                 &cmd,
