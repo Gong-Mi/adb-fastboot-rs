@@ -1,18 +1,12 @@
-//! ADB Device Service Routing — maps AOSP `vendor/adb/services.cpp`.
+//! ADB Service Routing — maps AOSP `vendor/adb/services.cpp`.
 //!
-//! Handles routing device-level service requests (shell:, exec:, root:,
-//! tcpip:, usb:) to the ADB daemon by creating A_OPEN frames on an
-//! established transport connection.
-//!
-//! # AOSP mapping
-//!
-//! - `services.cpp::service_to_socket()`  → `device_service_to_socket()`
-//! - `services.cpp::shell_service_impl()`  → validity check in `validate_shell()`
-//! - `services.cpp::root_service_impl()`   → validity check in `validate_root()`
-//! - `services.cpp::tcpip_service_impl()`  → validity check in `validate_tcpip()`
-//! - `services.cpp::usb_service()`        → validity check in `validate_usb()`
+//! Handles:
+//! - Device services: routes shell:/exec:/root:/tcpip:/usb: to A_OPEN
+//! - Host services: routes track-devices, wait-for, connect, pair
+//! - Service thread creation (socketpair + thread)
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
 
 use adb_protocol::{
     AdbMessageHeader, Transport, A_OKAY, A_OPEN,
@@ -180,6 +174,114 @@ pub(crate) fn validate_service_name(service: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Host service routing — mirrors AOSP `host_service_to_socket()`
+// ---------------------------------------------------------------------------
+
+/// Route a host service name to its local handler.
+///
+/// Returns `Ok(())` if handled, `Err` if unknown.
+/// AOSP equivalent: `host_service_to_socket()` routes to:
+/// - `create_device_tracker()` for track-devices
+/// - `wait_service()` for wait-for-*
+/// - `connect_service()` for connect:
+/// - `pair_service()` for pair:
+/// - `create_mdns_tracker()` for track-mdns
+///
+/// The actual I/O for these services is handled by dispatch_host_service
+/// in handler.rs; this function validates and describes the routing.
+pub(crate) fn host_service_to_socket(service: &str) -> Result<(), String> {
+    if service == "track-devices"
+        || service == "track-devices-l"
+        || service == "track-devices-proto-binary"
+        || service == "track-devices-proto-text"
+    {
+        return Ok(()); // handled by dispatch_host_service
+    }
+    if let Some(spec) = service.strip_prefix("wait-for-") {
+        return validate_wait_spec(spec);
+    }
+    if let Some(host) = service.strip_prefix("connect:") {
+        return validate_connect_target(host);
+    }
+    if let Some(pair_data) = service.strip_prefix("pair:") {
+        return validate_pair_spec(pair_data);
+    }
+    if service == "track-mdns" || service == "track-mdns-services" {
+        return Ok(());
+    }
+    Err(format!("unknown host service: {}", service))
+}
+
+fn validate_wait_spec(spec: &str) -> Result<(), String> {
+    let parts: Vec<&str> = spec.split('-').collect();
+    if parts.len() < 2 {
+        return Err(format!("short wait-for spec: {}", spec));
+    }
+    let transport_ok = matches!(parts[0], "local" | "usb" | "any");
+    if !transport_ok {
+        return Err(format!("bad wait-for transport: {}", parts[0]));
+    }
+    for &state in &parts[1..] {
+        match state {
+            "device" | "recovery" | "rescue" | "sideload" | "bootloader" | "any" | "disconnect" => {}
+            _ => return Err(format!("bad wait-for state: {}", state)),
+        }
+    }
+    Ok(())
+}
+
+fn validate_connect_target(target: &str) -> Result<(), String> {
+    if target.is_empty() {
+        return Err("empty connect target".to_string());
+    }
+    if let Some(port_spec) = target.strip_prefix("emu:") {
+        let ports: Vec<&str> = port_spec.split(',').collect();
+        if ports.len() != 2 {
+            return Err(format!("emu target requires console_port,adb_port: {}", target));
+        }
+        for p in &ports {
+            let val: u16 = p.parse().map_err(|_| format!("invalid port: {}", p))?;
+            if val == 0 { return Err("port must be > 0".to_string()); }
+        }
+    }
+    Ok(())
+}
+
+fn validate_pair_spec(data: &str) -> Result<(), String> {
+    // Format: password:host:port
+    let divider = data.find(':').ok_or_else(|| "pair: requires password:host".to_string())?;
+    let _password = &data[..divider];
+    let host = &data[divider + 1..];
+    if _password.is_empty() { return Err("empty pairing password".to_string()); }
+    if host.is_empty() { return Err("empty pairing host".to_string()); }
+    Ok(())
+}
+
+/// Create a service thread — mirrors AOSP `create_service_thread()`.
+///
+/// Creates a socketpair, spawns a thread that runs `func` with one end,
+/// and returns the other end as a raw fd.
+pub(crate) fn create_service_thread<F>(name: &str, func: F) -> Result<(i32, i32), String>
+where
+    F: FnOnce(i32) + Send + 'static,
+{
+    let mut sv = [0i32; 2];
+    let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, &mut sv as *mut i32) };
+    if ret != 0 {
+        return Err(format!("socketpair failed for {}", name));
+    }
+    let fd_client = sv[0];
+    let fd_server = sv[1];
+
+    thread::spawn(move || {
+        func(fd_server);
+        unsafe { libc::close(fd_server); }
+    });
+
+    Ok((fd_client, fd_server))
+}
 
 #[cfg(test)]
 mod tests {
