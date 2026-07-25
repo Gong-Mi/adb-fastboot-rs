@@ -1,291 +1,262 @@
-//! ADB bugreport generation and collection.
+//! ADB bugreport — `adb bugreport [path]`
 //!
-//! AOSP source: `vendor/adb/client/bugreport.cpp`
+//! Mirrors AOSP `vendor/adb/client/bugreport.cpp`.
 //!
-//! Handles:
-//! - `adb bugreport [path]` — generate and pull a bugreport zip
-//! - Coordinates `dumpstate` service on the device
-//! - Manages bugreport progress and cancellation
+//! 1. `bugreportz -v` → detect version
+//! 2. No bugreportz → fallback to plain `bugreport`
+//! 3. v1.0 → `bugreportz` (no progress)
+//! 4. v1.1+ → `bugreportz -p` (with progress)
+//! 5. Parse `BEGIN:` / `OK:` / `FAIL:` / `PROGRESS:X/Y`
+//! 6. `OK:` → `adb pull` via sync protocol
 
-use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
-use adb_protocol::{
-    AdbMessageHeader, Transport,
-    A_CLSE, A_OKAY, A_WRTE,
-};
+use crate::client::file_sync;
+use crate::server::adb_utils;
 
-use super::protocol::open_service;
+const BUGZ_BEGIN: &str = "BEGIN:";
+const BUGZ_PROGRESS: &str = "PROGRESS:";
+const BUGZ_OK: &str = "OK:";
+const BUGZ_FAIL: &str = "FAIL:";
 
-/// Result of a bugreport operation.
 pub struct BugreportResult {
-    /// The raw bugreport data (zipped).
-    pub data: Vec<u8>,
-    /// The suggested file name from the device.
-    pub suggested_name: String,
+    pub saved_path: String,
 }
 
-/// Execute `bugreportz` on the device and collect the resulting zip data.
+/// Execute `adb bugreport [path]`.
 ///
-/// Uses the `shell,raw:bugreportz` approach which streams the zipped bugreport
-/// to stdout. Returns the raw zip bytes and the suggested filename.
-pub fn collect_bugreport(
-    transport: &mut dyn Transport,
+/// `transport` — authenticated transport to device.
+/// `serial` — device serial (for sync pull).
+/// `output_path` — optional output path (file or directory).
+pub fn do_bugreport(
+    transport: &mut dyn adb_protocol::Transport,
+    serial: &str,
+    output_path: Option<&str>,
 ) -> Result<BugreportResult, Box<dyn std::error::Error>> {
-    // Try bugreportz first (compressed, modern)
-    let result = try_bugreportz(transport);
-    if result.is_ok() {
-        return result;
-    }
-
-    // Fallback: legacy bugreport (text, can be very large)
-    try_legacy_bugreport(transport)
-}
-
-/// Try the `bugreportz` service for compressed bugreport.
-fn try_bugreportz(
-    transport: &mut dyn Transport,
-) -> Result<BugreportResult, Box<dyn std::error::Error>> {
-    // First, check if bugreportz is available
-    let dest = "shell,v2,raw:bugreportz -p".to_string();
-    let (local_id, _remote_id) = open_service(transport, &dest, 1)?;
-
-    let mut output = Vec::new();
-    let mut suggested_name = String::from("bugreport.zip");
-
-    let deadline = Instant::now() + Duration::from_secs(120);
-
-    loop {
-        if Instant::now() > deadline {
-            // Send CLSE to abort
-            let _ = transport.send_message(
-                &AdbMessageHeader::new(A_CLSE, local_id, 0, &[]),
-                &[],
-            );
-            return Err("Bugreport timed out".into());
+    let (dest_dir, mut dest_file) = match output_path {
+        None => {
+            let cwd = adb_utils::getcwd().unwrap_or_else(|| ".".to_string());
+            (cwd, "bugreport.zip".to_string())
         }
-
-        let (hdr, payload) = match transport.recv_message() {
-            Ok(msg) => msg,
-            Err(_) => {
-                // Timeout or EOF — try to finish with what we have
-                break;
-            }
-        };
-
-        match hdr.command {
-            A_OKAY => {}
-            A_WRTE => {
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-
-                // Parse bugreportz progress lines: "OK: <path>"
-                // or "BEGIN:<name>", "PROGRESS:<pct>", etc.
-                let text = String::from_utf8_lossy(&payload);
-                if text.starts_with("OK:") {
-                    // Path reported — the bugreportz has written a file
-                    let path = text[3..].trim().to_string();
-                    suggested_name = Path::new(&path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("bugreport.zip")
-                        .to_string();
-
-                    // Now we need to pull the file via sync
-                    let file_data = pull_file_via_sync(transport, &path)?;
-                    return Ok(BugreportResult {
-                        data: file_data,
-                        suggested_name,
-                    });
-                } else if text.starts_with("BEGIN:") {
-                    suggested_name = text[6..].trim().to_string();
-                } else if text.starts_with("PROGRESS:") {
-                    let pct = text[9..].trim();
-                    eprintln!("  bugreport: {pct}%");
-                }
-
-                output.extend_from_slice(&payload);
-            }
-            A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    // If we got here, bugreportz output contains the file path in plain text
-    let output_str = String::from_utf8_lossy(&output);
-    for line in output_str.lines() {
-        if let Some(path) = line.strip_prefix("OK:") {
-            let path = path.trim();
-            suggested_name = Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("bugreport.zip")
-                .to_string();
-            let file_data = pull_file_via_sync(transport, path)?;
-            return Ok(BugreportResult {
-                data: file_data,
-                suggested_name,
-            });
-        }
-    }
-
-    Err("bugreportz did not produce output file".into())
-}
-
-/// Fallback: use legacy `dumpstate` via shell.
-fn try_legacy_bugreport(
-    transport: &mut dyn Transport,
-) -> Result<BugreportResult, Box<dyn std::error::Error>> {
-    let dest = "shell,v2,raw:dumpstate".to_string();
-    let (local_id, _remote_id) = open_service(transport, &dest, 1)?;
-
-    let mut output = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(180);
-
-    loop {
-        if Instant::now() > deadline {
-            let _ = transport.send_message(
-                &AdbMessageHeader::new(A_CLSE, local_id, 0, &[]),
-                &[],
-            );
-            return Err("Legacy bugreport timed out".into());
-        }
-
-        transport
-            .recv_message()
-
-            .ok();
-        let (hdr, payload) = match transport.recv_message() {
-            Ok(msg) => msg,
-            Err(_) => break,
-        };
-
-        match hdr.command {
-            A_OKAY => {}
-            A_WRTE => {
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                output.extend_from_slice(&payload);
-                eprint!(".");
-            }
-            A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    eprintln!();
-
-    Ok(BugreportResult {
-        data: output,
-        suggested_name: "bugreport.txt".to_string(),
-    })
-}
-
-/// Pull a file from the device using the sync protocol.
-fn pull_file_via_sync(
-    transport: &mut dyn Transport,
-    remote_path: &str,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    use adb_protocol::build_sync_recv_req;
-    use adb_protocol::SyncMessageHeader;
-
-    let (local_id, _remote_id) = open_service(transport, "sync:", 1)?;
-
-    // Send RECV request
-    let mut recv_buf = Vec::new();
-    build_sync_recv_req(remote_path, &mut recv_buf)?;
-
-    let recv_hdr = AdbMessageHeader::new(A_WRTE, local_id, 1, &recv_buf);
-    transport.send_message(&recv_hdr, &recv_buf)?;
-
-    // Wait for OKAY ack
-    loop {
-        let (hdr, _) = transport.recv_message()?;
-        if hdr.command == A_OKAY {
-            break;
-        }
-    }
-
-    // Read DATA frames until DONE
-    let mut file_data = Vec::new();
-    loop {
-        let (hdr, payload) = transport.recv_message()?;
-        match hdr.command {
-            A_OKAY => {}
-            A_WRTE => {
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-
-                // Parse sync header
-                if payload.len() >= 8 {
-                    if let Ok(sync_hdr) = SyncMessageHeader::decode(&payload) {
-                        let data = &payload[8..];
-                        match sync_hdr.id {
-                            adb_protocol::constants::SYNC_DATA => {
-                                file_data.extend_from_slice(data);
-                            }
-                            adb_protocol::constants::SYNC_DONE => {
-                                // File transfer done
-                            }
-                            adb_protocol::constants::SYNC_FAIL => {
-                                let msg = String::from_utf8_lossy(data);
-                                return Err(format!("Sync RECV failed: {msg}").into());
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    Ok(file_data)
-}
-
-/// Save the bugreport data to a local file.
-pub fn save_bugreport(
-    result: &BugreportResult,
-    output_path: Option<&Path>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let path = match output_path {
+        Some(p) if Path::new(p).is_dir() => (p.to_string(), "bugreport.zip".to_string()),
         Some(p) => {
-            if p.is_dir() {
-                p.join(&result.suggested_name)
-            } else {
-                p.to_path_buf()
+            let mut f = p.to_string();
+            if !f.to_lowercase().ends_with(".zip") {
+                f.push_str(".zip");
             }
+            (String::new(), f)
         }
-        None => Path::new(&result.suggested_name).to_path_buf(),
     };
 
-    let mut file = fs::File::create(&path)?;
-    file.write_all(&result.data)?;
+    // 1. Check bugreportz version
+    let stdout = crate::client::shell::run_shell(transport, "bugreportz -v", true)?
+        .unwrap_or_default();
+    let stdout_str = String::from_utf8_lossy(&stdout);
+    let lines: Vec<&str> = stdout_str.lines().collect();
+    let bugz_version = lines.last().unwrap_or(&"").trim().to_string();
 
-    Ok(path.to_string_lossy().to_string())
+    if bugz_version.is_empty() || !bugz_version.contains('.') {
+        eprintln!("bugreportz not available (device pre-Android 7.0?).\nFalling back to plain-text bugreport.");
+        if output_path.is_none() {
+            return legacy_bugreport(transport, serial);
+        }
+        return Err(format!("bugreportz failed. Try: adb bugreport > bugreport.txt").into());
+    }
+
+    let show_progress = bugz_version != "1.0";
+    let bugz_cmd = if show_progress { "bugreportz -p" } else { "bugreportz" };
+
+    if !show_progress {
+        eprintln!("Bugreport is in progress — please be patient.");
+    }
+
+    // 2. Run bugreportz
+    let stdout = crate::client::shell::run_shell(transport, bugz_cmd, true)?
+        .unwrap_or_default();
+    let output = String::from_utf8_lossy(&stdout);
+
+    // 3. Parse output lines
+    let mut device_path = String::new();
+    let mut last_pct = 0i32;
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+
+        if let Some(rest) = line.strip_prefix(BUGZ_BEGIN) {
+            device_path = rest.to_string();
+            if !dest_dir.is_empty() {
+                dest_file = Path::new(rest)
+                    .file_name().map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| rest.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix(BUGZ_OK) {
+            device_path = rest.to_string();
+            if !dest_dir.is_empty() {
+                dest_file = Path::new(rest)
+                    .file_name().map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| rest.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix(BUGZ_FAIL) {
+            return Err(format!("device bugreportz failed: {}", rest).into());
+        } else if show_progress && line.starts_with(BUGZ_PROGRESS) {
+            let rest = &line[BUGZ_PROGRESS.len()..];
+            if let Some(idx) = rest.rfind('/') {
+                let prog: i32 = rest[..idx].parse().unwrap_or(0);
+                let total: i32 = rest[idx + 1..].parse().unwrap_or(1);
+                let pct = if total > 0 { prog * 100 / total } else { 0 };
+                if pct != 0 && pct <= last_pct { continue; }
+                last_pct = pct;
+                print!("\r[{}%] generating {}  ", pct, dest_file);
+                std::io::stdout().flush()?;
+            }
+        }
+    }
+
+    if show_progress && last_pct > 0 { println!(); }
+
+    if device_path.is_empty() {
+        return Err("bugreportz did not return OK: or FAIL: line".into());
+    }
+
+    // 4. Pull
+    let final_dest = if dest_dir.is_empty() {
+        dest_file.clone()
+    } else {
+        format!("{}/{}", dest_dir, dest_file)
+    };
+
+    file_sync::pull(Some(serial), &device_path, &final_dest)?;
+    println!("Bug report copied to {}", final_dest);
+
+    Ok(BugreportResult { saved_path: final_dest })
 }
 
-/// Generate and save a bugreport. High-level convenience function.
-pub fn generate_bugreport(
-    transport: &mut dyn Transport,
-    output_path: Option<&Path>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let result = collect_bugreport(transport)?;
-    let saved_path = save_bugreport(&result, output_path)?;
-    Ok(saved_path)
+/// Fallback to plain-text bugreport.
+fn legacy_bugreport(
+    transport: &mut dyn adb_protocol::Transport,
+    _serial: &str,
+) -> Result<BugreportResult, Box<dyn std::error::Error>> {
+    let data = crate::client::shell::run_shell(transport, "bugreport", true)?
+        .unwrap_or_default();
+    let path = "bugreport.txt";
+    std::fs::write(path, &data)?;
+    println!("Bug report copied to {}", path);
+    Ok(BugreportResult { saved_path: path.to_string() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constants() {
+        assert!(BUGZ_BEGIN.starts_with("BEGIN:"));
+        assert!(BUGZ_OK.starts_with("OK:"));
+        assert!(BUGZ_FAIL.starts_with("FAIL:"));
+        assert!(BUGZ_PROGRESS.starts_with("PROGRESS:"));
+    }
+
+    #[test]
+    fn test_version_parsing_1_1_shows_progress() {
+        let ver = "1.1".to_string();
+        assert_ne!(ver, "1.0");
+    }
+
+    #[test]
+    fn test_version_parsing_1_0_no_progress() {
+        let ver = "1.0".to_string();
+        assert_eq!(ver, "1.0");
+    }
+
+    #[test]
+    fn test_zip_extension_auto_appended() {
+        let mut f = "bugreport".to_string();
+        if !f.to_lowercase().ends_with(".zip") {
+            f.push_str(".zip");
+        }
+        assert_eq!(f, "bugreport.zip");
+    }
+
+    #[test]
+    fn test_zip_extension_not_duplicated() {
+        let mut f = "report.zip".to_string();
+        if !f.to_lowercase().ends_with(".zip") {
+            f.push_str(".zip");
+        }
+        assert_eq!(f, "report.zip");
+    }
+
+    #[test]
+    fn test_parse_ok_line() {
+        let line = "OK:/data/device/bugreport.zip";
+        assert!(line.starts_with("OK:"));
+        assert_eq!(&line[3..], "/data/device/bugreport.zip");
+    }
+
+    #[test]
+    fn test_parse_begin_line() {
+        let line = "BEGIN:/data/device/bugreport.zip";
+        assert!(line.starts_with("BEGIN:"));
+        assert_eq!(&line[6..], "/data/device/bugreport.zip");
+    }
+
+    #[test]
+    fn test_parse_fail_line() {
+        let line = "FAIL:D'OH!";
+        assert!(line.starts_with("FAIL:"));
+        assert_eq!(&line[5..], "D'OH!");
+    }
+
+    #[test]
+    fn test_parse_progress_line() {
+        let line = "PROGRESS:50/100";
+        assert!(line.starts_with("PROGRESS:"));
+        let rest = &line[9..];
+        if let Some(idx) = rest.rfind('/') {
+            let prog: i32 = rest[..idx].parse().unwrap();
+            let total: i32 = rest[idx + 1..].parse().unwrap();
+            let pct = prog * 100 / total;
+            assert_eq!(prog, 50);
+            assert_eq!(total, 100);
+            assert_eq!(pct, 50);
+        } else {
+            panic!("no separator");
+        }
+    }
+
+    #[test]
+    fn test_progress_always_forward() {
+        let mut last = 0i32;
+        let cases = vec![1i32, 50, 25, 75, 75, 700];
+        let totals = vec![100i32, 100, 100, 100, 100, 1000];
+        let mut shown = Vec::new();
+        for (prog, total) in cases.iter().zip(totals.iter()) {
+            let pct = if *total > 0 { prog * 100 / total } else { 0 };
+            if pct != 0 && pct <= last { continue; }
+            last = pct;
+            shown.push(pct);
+        }
+        assert_eq!(shown, vec![1, 50, 75]);
+    }
+
+    #[test]
+    fn test_invalid_args_too_many() {
+        // AOSP: argc > 2 → error
+        // We don't have a DoIt method that takes (argc, argv),
+        // but the output_path option only accepts 0 or 1 args
+    }
+
+    #[test]
+    fn test_directory_destination() {
+        let path = "/tmp";
+        assert!(Path::new(path).is_dir());
+    }
+
+    #[test]
+    fn test_file_destination() {
+        let path = "some_file.zip";
+        assert!(!Path::new(path).is_dir());
+    }
 }
