@@ -403,6 +403,7 @@ pub(crate) fn run_smart_socket_loop(
 
         let is_host_cmd = cmd.starts_with("host:");
         let is_transport_cmd = is_host_cmd && (cmd.starts_with("host:transport:")
+            || cmd == "host:transport-any"
             || cmd.starts_with("host:tport:")
             || cmd.starts_with("host:transport-id:"));
 
@@ -410,7 +411,7 @@ pub(crate) fn run_smart_socket_loop(
         // Non-host commands (e.g. shell,v2,raw:...) will be handled
         // after a transport is selected in bridge mode.
         if is_host_cmd {
-            eprintln!("[adb-debug-ss] dispatching host cmd: {:?}", &cmd);
+            eprintln!("[adb-debug-ss] dispatching host cmd: {:?}, is_transport={}", &cmd, is_transport_cmd);
             crate::server::handler::dispatch_host_service(
                 &mut smart.stream,
                 &cmd,
@@ -438,6 +439,11 @@ fn extract_serial_from_transport_cmd(
 ) -> Result<String, String> {
     if cmd.starts_with("host:transport:") {
         Ok(cmd["host:transport:".len()..].to_string())
+    } else if cmd == "host:transport-any" {
+        let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+        reg.find_any_device()
+            .map(|d| d.serial.clone())
+            .ok_or_else(|| "no devices available".to_string())
     } else if cmd.starts_with("host:tport:serial:") {
         Ok(cmd["host:tport:serial:".len()..].to_string())
     } else if cmd.starts_with("host:tport:") {

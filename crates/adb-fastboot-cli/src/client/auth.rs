@@ -10,7 +10,10 @@ use adb_protocol::AdbAuth;
 pub fn default_auth() -> &'static AdbAuth {
     static AUTH: OnceLock<AdbAuth> = OnceLock::new();
     AUTH.get_or_init(|| {
-        load_or_create_auth().expect("Failed to load or create persistent ADB auth key")
+        load_or_create_auth().unwrap_or_else(|e| {
+            eprintln!("[adb-auth] Failed to load/create auth key: {e}, generating ephemeral key");
+            AdbAuth::generate("adb-rs@localhost").expect("key generation failed")
+        })
     })
 }
 

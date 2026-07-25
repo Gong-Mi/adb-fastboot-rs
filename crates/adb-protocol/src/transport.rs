@@ -102,6 +102,11 @@ impl TcpTransport {
         Ok(Self { stream })
     }
 
+    /// Create a TcpTransport from an already-connected TcpStream.
+    pub fn from_stream(stream: TcpStream) -> Self {
+        Self { stream }
+    }
+
     /// Set the read timeout on the underlying TCP stream.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.stream.set_read_timeout(timeout)

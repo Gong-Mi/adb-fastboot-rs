@@ -9,11 +9,12 @@
 //! - `transport_registration` + events → callbacks on connect / disconnect / state change
 
 use std::net::SocketAddr;
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adb_protocol::{
-    AdbMessageHeader, ADB_VERSION, A_CNXN, MAX_PAYLOAD_V2,
+    AdbMessageHeader, ADB_VERSION, A_AUTH, A_AUTH_TOKEN, A_CNXN, MAX_PAYLOAD_V2,
     TcpTransport, Transport,
 };
 #[cfg(feature = "usb")]
@@ -257,14 +258,12 @@ pub(crate) fn connect_to_remote(
     registry: &Arc<Mutex<TransportRegistry>>,
 ) -> Result<Box<dyn Transport>, String> {
     // 1. Open TCP connection
-    let mut transport: Box<dyn Transport> = Box::new(
-        TcpTransport::connect_timeout(addr, TRANSPORT_CONNECT_TIMEOUT)
-            .map_err(|e| format!("cannot connect to device at {addr}: {e}"))?,
-    );
-    // Set read timeout so recv_message doesn't hang forever if device doesn't respond
-    if let Some(tcp) = transport.inner_tcp_mut() {
-        let _ = tcp.set_read_timeout(Some(TRANSPORT_CONNECT_TIMEOUT));
-    }
+    eprintln!("[adb-debug] connect_to_remote: connecting to {addr}...");
+    let stream = TcpStream::connect(addr)
+        .map_err(|e| format!("cannot connect to device at {addr}: {e}"))?;
+    let _ = stream.set_nodelay(true);
+    let mut transport: Box<dyn Transport> = Box::new(TcpTransport::from_stream(stream));
+    eprintln!("[adb-debug] connect_to_remote: connected, sending CNXN...");
 
     // 2. Send CNXN probe (AOSP: connect_to_remote sends A_CNXN)
     let probe = b"host::";
@@ -273,16 +272,65 @@ pub(crate) fn connect_to_remote(
         .send_message(&cnxn, probe)
         .map_err(|e| format!("CNXN probe failed: {e}"))?;
 
-    // 3. Await CNXN response
-    let (resp_hdr, payload) = transport
-        .recv_message()
-        .map_err(|e| format!("CNXN response failed: {e}"))?;
+    // 3. Handle AUTH handshake if required
+    let auth = crate::client::auth::default_auth();
+    let mut sent_signature = false;
+    let mut sent_public_key = false;
 
-    if resp_hdr.command != A_CNXN {
-        return Err(format!(
-            "expected A_CNXN from adbd at {addr}, got cmd={:#010x}",
-            resp_hdr.command
-        ));
+    let (resp_hdr, payload) = loop {
+        let (resp_hdr, payload) = transport
+            .recv_message()
+            .map_err(|e| format!("CNXN response failed: {e}"))?;
+
+        if resp_hdr.command == A_CNXN {
+            break (resp_hdr, payload);
+        }
+
+        if resp_hdr.command != A_AUTH {
+            return Err(format!(
+                "expected A_CNXN or A_AUTH from adbd at {addr}, got cmd={:#010x}",
+                resp_hdr.command
+            ));
+        }
+
+        // Handle AUTH loop
+        if resp_hdr.arg0 != A_AUTH_TOKEN {
+            return Err(format!(
+                "Unsupported AUTH request type from {addr}: {}",
+                resp_hdr.arg0
+            ));
+        }
+        if payload.len() != 20 {
+            return Err(format!(
+                "Invalid ADB AUTH token length from {addr}: {}",
+                payload.len()
+            ));
+        }
+
+        let (auth_hdr, auth_payload) = if !sent_signature {
+            sent_signature = true;
+            auth.make_signature_message(&payload)
+                .map_err(|e| format!("signature failed: {e}"))?
+        } else if !sent_public_key {
+            sent_public_key = true;
+            auth.make_rsakey_message()
+                .map_err(|e| format!("rsakey failed: {e}"))?
+        } else {
+            return Err(
+                "adbd rejected the ADB RSA key after signature and public-key exchange"
+                    .to_string(),
+            );
+        };
+
+        transport
+            .send_message(&auth_hdr, &auth_payload)
+            .map_err(|e| format!("AUTH send failed: {e}"))?;
+    };
+
+    // Persist public key on Android host
+    #[cfg(target_os = "android")]
+    if sent_public_key {
+        let _ = crate::client::auth::persist_adb_pubkey(auth);
     }
 
     // 4. Parse banner for features / product / model / device
