@@ -7,8 +7,6 @@ use rsa::pkcs1v15::{SigningKey, VerifyingKey};
 use rsa::signature::{SignatureEncoding, Signer, Verifier};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use sha1::Sha1;
-#[allow(unused_imports)]
-use sha2::Sha256;  // Some devices (MIUI) require SHA256
 
 use thiserror::Error;
 
@@ -49,10 +47,9 @@ pub fn generate_rsa_key() -> Result<RsaPrivateKey, AuthError> {
     Ok(private_key)
 }
 
-/// Sign ADB token (typically 20 bytes) using RSA private key (PKCS#1 v1.5 + SHA-256)
-/// AOSP standard uses SHA-1, but some devices (MIUI/HyperOS) require SHA-256.
+/// Sign ADB token (typically 20 bytes) using RSA private key (PKCS#1 v1.5 + SHA-1)
 pub fn sign_token(private_key: &RsaPrivateKey, token: &[u8]) -> Result<Vec<u8>, AuthError> {
-    let signer = SigningKey::<Sha256>::new(private_key.clone());
+    let signer = SigningKey::<Sha1>::new(private_key.clone());
     let signature = signer.sign(token);
     Ok(signature.to_vec())
 }
