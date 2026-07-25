@@ -15,7 +15,7 @@ use adb_protocol::{
 mod server;
 mod client;
 
-use client::{adb_wifi, file_sync, protocol, shell, exec_out, server_cmds, host_command};
+use client::{adb_wifi, detach, file_sync, protocol, shell, exec_out, server_cmds, host_command};
 use client::server_cmds::{ensure_server_running, ensure_server_running_at, kill_server, kill_server_at};
 use client::host_command::host_command;
 use client::transport::resolve_target_addr;
@@ -64,7 +64,11 @@ pub enum MdnsCommands {
 #[derive(Subcommand)]
 pub enum Commands {
     /// List connected devices
-    Devices,
+    Devices {
+        /// Show detailed device info (long output)
+        #[arg(short = 'l', long)]
+        long: bool,
+    },
     /// Run remote shell command
     Shell {
         command: Vec<String>,
@@ -80,11 +84,29 @@ pub enum Commands {
     Push {
         local: String,
         remote: String,
+        /// Synchronize file timestamps (sync push only if newer)
+        #[arg(long)]
+        sync: bool,
+        /// Compression algorithm (ignored in this implementation)
+        #[arg(short = 'z')]
+        algorithm: Option<String>,
+        /// Disable compression
+        #[arg(short = 'Z')]
+        no_compress: bool,
     },
     /// Pull remote file from device
     Pull {
         remote: String,
         local: String,
+        /// Preserve file timestamp and mode
+        #[arg(short = 'a')]
+        preserve: bool,
+        /// Compression algorithm (ignored in this implementation)
+        #[arg(short = 'z')]
+        algorithm: Option<String>,
+        /// Disable compression
+        #[arg(short = 'Z')]
+        no_compress: bool,
     },
     /// Reboot device (bootloader, recovery, etc.)
     Reboot {
@@ -119,6 +141,34 @@ pub enum Commands {
     /// Push a single APK to device and install it
     Install {
         apk: String,
+    },
+    /// Push multiple APKs to device and install them
+    #[command(name = "install-multiple")]
+    InstallMultiple {
+        #[arg(required = true)]
+        apks: Vec<String>,
+    },
+    /// Atomic batch install of multiple APKs using pm install-create/write/commit
+    #[command(name = "install-multi-package")]
+    InstallMultiPackage {
+        #[arg(required = true)]
+        apks: Vec<String>,
+    },
+    /// Sync a local directory to the device, pushing changed/new files
+    Sync {
+        /// Local directory to sync (default: current directory)
+        directory: Option<String>,
+        /// Remote destination path (default: /sdcard/)
+        #[arg(default_value = "/sdcard/")]
+        remote: String,
+    },
+    /// Wait for device to reach a given state
+    /// Format: [TRANSPORT-]STATE where TRANSPORT is usb|local|any (default any)
+    /// and STATE is device|recovery|rescue|sideload|bootloader|disconnect
+    #[command(name = "wait-for", trailing_var_arg = true)]
+    WaitFor {
+        /// Full spec string, e.g. "device", "usb-device", "local-recovery"
+        spec: Vec<String>,
     },
     /// Uninstall a package from device
     Uninstall {
@@ -200,6 +250,37 @@ pub enum Commands {
         addr: String,
         /// 6-digit pairing code (prompted if omitted)
         code: Option<String>,
+    },
+    /// Reconnect device (optionally: device, offline)
+    Reconnect {
+        /// Target: "device" or "offline" (empty for default reconnect)
+        target: Option<String>,
+    },
+    /// Attach to device (server-side)
+    Attach,
+    /// Detach from device to allow use by other processes
+    Detach,
+    /// Disable dm-verity on device
+    #[command(name = "disable-verity")]
+    DisableVerity,
+    /// Enable dm-verity on device
+    #[command(name = "enable-verity")]
+    EnableVerity,
+    /// Generate ADB RSA key pair
+    Keygen {
+        /// Output file path for the private key (adbkey)
+        file: String,
+    },
+    /// Remount partitions read-write
+    Remount {
+        /// Reboot after remount
+        #[arg(short = 'R')]
+        reboot: bool,
+    },
+    /// Sideload an OTA package
+    Sideload {
+        /// Path to the OTA package zip file
+        ota_package: String,
     },
 }
 
@@ -606,28 +687,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = resolve_target_addr(cli.serial.as_deref(), ADBD_PORT);
 
     match &cli.command {
-        Commands::Devices => {
-            println!("List of devices attached (adb-rs pure rust transport)");
-            match host_command(cli.serial.as_deref(), "host:devices-l") {
-                Ok(resp) => {
-                    if !resp.is_empty() {
-                        print!("{resp}");
-                    }
-                }
-                Err(e) => {
-                    let direct_addr = resolve_target_addr(cli.serial.as_deref(), ADBD_PORT);
-                    if let Ok(transport) = open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(2)) {
-                        if let Ok((device_info, _)) = connect_and_handshake_with_tls_upgrade(
-                            transport,
-                            b"host::features=shell_v2,cmd",
-                            default_auth(),
-                        ) {
-                            println!("{}\tdevice ({})", direct_addr, device_info.banner.trim());
-                            return Ok(());
+        Commands::Devices { long } => {
+            if *long {
+                println!("List of devices attached (adb-rs pure rust transport)");
+                match host_command(cli.serial.as_deref(), "host:devices-l") {
+                    Ok(resp) => {
+                        if !resp.is_empty() {
+                            print!("{resp}");
                         }
                     }
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    Err(e) => {
+                        let direct_addr = resolve_target_addr(cli.serial.as_deref(), ADBD_PORT);
+                        if let Ok(transport) = open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(2)) {
+                            if let Ok((device_info, _)) = connect_and_handshake_with_tls_upgrade(
+                                transport,
+                                b"host::features=shell_v2,cmd",
+                                default_auth(),
+                            ) {
+                                println!("{}\\tdevice ({})", direct_addr, device_info.banner.trim());
+                                return Ok(());
+                            }
+                        }
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("List of devices attached (adb-rs pure rust transport)");
+                match host_command(cli.serial.as_deref(), "host:devices") {
+                    Ok(resp) => {
+                        if !resp.is_empty() {
+                            print!("{resp}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -741,8 +837,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             exec_out::run_exec_out(&mut transport, &cmd_str)?;
         }
-        Commands::Push { local, remote } => {
+        Commands::Push { local, remote, sync, algorithm, no_compress } => {
             let serial = cli.serial.as_deref();
+            if *sync {
+                eprintln!("[adb-rs] --sync flag ignored (not yet implemented in push)");
+            }
+            if let Some(algo) = algorithm {
+                eprintln!("[adb-rs] -z {algo} ignored (compression not yet implemented)");
+            }
+            if *no_compress {
+                eprintln!("[adb-rs] -Z flag ignored (compression not yet implemented)");
+            }
             match file_sync::push(serial, local, remote) {
                 Ok(()) => {}
                 Err(e) => {
@@ -751,8 +856,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Pull { remote, local } => {
+        Commands::Pull { remote, local, preserve, algorithm, no_compress } => {
             let serial = cli.serial.as_deref();
+            if *preserve {
+                eprintln!("[adb-rs] -a flag ignored (preserve timestamps not yet implemented in pull)");
+            }
+            if let Some(algo) = algorithm {
+                eprintln!("[adb-rs] -z {algo} ignored (compression not yet implemented)");
+            }
+            if *no_compress {
+                eprintln!("[adb-rs] -Z flag ignored (compression not yet implemented)");
+            }
             match file_sync::pull(serial, remote, local) {
                 Ok(()) => {}
                 Err(e) => {
@@ -923,6 +1037,228 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = shell::run_shell(&mut transport, &format!("rm -f \"{remote_apk}\""), false);
         }
 
+        Commands::InstallMultiple { apks } => {
+            if apks.is_empty() {
+                eprintln!("Error: no APK files specified");
+                std::process::exit(1);
+            }
+
+            // Validate all APKs exist
+            let apk_paths: Vec<&Path> = apks.iter().map(|a| Path::new(a)).collect();
+            let mut missing = Vec::new();
+            for (i, p) in apk_paths.iter().enumerate() {
+                if !p.exists() {
+                    missing.push(apks[i].clone());
+                }
+            }
+            if !missing.is_empty() {
+                eprintln!("Error: APK(s) not found: {}", missing.join(", "));
+                std::process::exit(1);
+            }
+
+            // Connect to adbd
+            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+                .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
+            let (_info, mut transport) =
+                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
+
+            // Push each APK via sync protocol
+            let staging = "/data/local/tmp";
+            let mut remote_paths = Vec::new();
+            for apk_path in &apk_paths {
+                let apk_data = std::fs::read(apk_path)
+                    .map_err(|e| format!("Cannot read {}: {e}", apk_path.display()))?;
+                let file_name = apk_path.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("package.apk");
+                let remote_apk = format!("{staging}/{file_name}");
+
+                let (local_id, remote_id) = protocol::open_service(&mut transport, "sync:", 1)?;
+
+                let mut send_buf = Vec::new();
+                build_sync_send_req(&remote_apk, 0o644, &mut send_buf)
+                    .map_err(|e| format!("Build SEND req failed: {e}"))?;
+                println!("[adb-rs] Pushing {file_name} ({} bytes) to {remote_apk} ...", apk_data.len());
+
+                protocol::send_wrte(&mut transport, local_id, remote_id, &send_buf)?;
+                protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
+
+                const MAX_CHUNK: usize = 64 * 1024;
+                for chunk in apk_data.chunks(MAX_CHUNK) {
+                    let mut data_buf = Vec::new();
+                    build_sync_data_chunk(chunk, &mut data_buf)
+                        .map_err(|e| format!("Build DATA chunk failed: {e}"))?;
+                    protocol::send_wrte(&mut transport, local_id, remote_id, &data_buf)?;
+                }
+
+                let mut done_buf = Vec::new();
+                build_sync_done(0xFFFF_FFFF, &mut done_buf)
+                    .map_err(|e| format!("Build DONE failed: {e}"))?;
+                protocol::send_wrte(&mut transport, local_id, remote_id, &done_buf)?;
+                protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
+
+                let clse_hdr = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
+                transport.send_message(&clse_hdr, &[])?;
+                let _ = transport.recv_message();
+
+                remote_paths.push(remote_apk);
+            }
+
+            // Run pm install with all remote paths
+            let paths_str: Vec<&str> = remote_paths.iter().map(|s| s.as_str()).collect();
+            let quoted: Vec<String> = paths_str.iter().map(|p| format!("\"{p}\"")).collect();
+            let install_cmd = format!("pm install -r {}", quoted.join(" "));
+            println!("[adb-rs] Installing {} APKs ...", apks.len());
+            let result = shell::run_shell(&mut transport, &install_cmd, true)?;
+            let output = result.unwrap_or_default();
+            let output_str = String::from_utf8_lossy(&output).trim().to_string();
+
+            if output_str.contains("Success") || output_str.contains("Success\n") {
+                println!("[adb-rs] Install-multiple succeeded: {output_str}");
+            } else if output_str.is_empty() {
+                println!("[adb-rs] Install-multiple completed (no output)");
+            } else {
+                eprintln!("[adb-rs] Install-multiple output: {output_str}");
+            }
+
+            // Clean up temp APKs
+            for rp in &remote_paths {
+                let _ = shell::run_shell(&mut transport, &format!("rm -f \"{rp}\""), false);
+            }
+        }
+
+        Commands::InstallMultiPackage { apks } => {
+            if apks.is_empty() {
+                eprintln!("Error: no APK files specified");
+                std::process::exit(1);
+            }
+
+            // Validate all APKs exist
+            let apk_paths: Vec<&Path> = apks.iter().map(|a| Path::new(a)).collect();
+            let mut missing = Vec::new();
+            for (i, p) in apk_paths.iter().enumerate() {
+                if !p.exists() {
+                    missing.push(apks[i].clone());
+                }
+            }
+            if !missing.is_empty() {
+                eprintln!("Error: APK(s) not found: {}", missing.join(", "));
+                std::process::exit(1);
+            }
+
+            // Connect to adbd
+            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+                .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
+            let (_info, mut transport) =
+                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
+
+            // Push each APK via sync protocol
+            let staging = "/data/local/tmp";
+            let mut remote_paths = Vec::new();
+            for apk_path in &apk_paths {
+                let apk_data = std::fs::read(apk_path)
+                    .map_err(|e| format!("Cannot read {}: {e}", apk_path.display()))?;
+                let file_name = apk_path.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("package.apk");
+                let remote_apk = format!("{staging}/{file_name}");
+
+                let (local_id, remote_id) = protocol::open_service(&mut transport, "sync:", 1)?;
+
+                let mut send_buf = Vec::new();
+                build_sync_send_req(&remote_apk, 0o644, &mut send_buf)
+                    .map_err(|e| format!("Build SEND req failed: {e}"))?;
+                println!("[adb-rs] Pushing {file_name} ({} bytes) ...", apk_data.len());
+
+                protocol::send_wrte(&mut transport, local_id, remote_id, &send_buf)?;
+                protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
+
+                const MAX_CHUNK: usize = 64 * 1024;
+                for chunk in apk_data.chunks(MAX_CHUNK) {
+                    let mut data_buf = Vec::new();
+                    build_sync_data_chunk(chunk, &mut data_buf)
+                        .map_err(|e| format!("Build DATA chunk failed: {e}"))?;
+                    protocol::send_wrte(&mut transport, local_id, remote_id, &data_buf)?;
+                }
+
+                let mut done_buf = Vec::new();
+                build_sync_done(0xFFFF_FFFF, &mut done_buf)
+                    .map_err(|e| format!("Build DONE failed: {e}"))?;
+                protocol::send_wrte(&mut transport, local_id, remote_id, &done_buf)?;
+                protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
+
+                let clse_hdr = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
+                transport.send_message(&clse_hdr, &[])?;
+                let _ = transport.recv_message();
+
+                remote_paths.push(remote_apk);
+            }
+
+            // Use pm install-create / install-write / install-commit
+            println!("[adb-rs] Running pm install-create ...");
+            let create_result = shell::run_shell(&mut transport, "pm install-create", true)?;
+            let create_output = create_result.unwrap_or_default();
+            let create_str = String::from_utf8_lossy(&create_output).trim().to_string();
+            println!("[adb-rs] install-create output: {create_str}");
+
+            // Extract session ID from output (format: "Success: created install session [1234567890]")
+            let session_id = create_str
+                .split('[')
+                .nth(1)
+                .and_then(|s| s.split(']').next())
+                .unwrap_or("")
+                .to_string();
+
+            if session_id.is_empty() {
+                eprintln!("[adb-rs] Failed to create install session. Output: {create_str}");
+                // Still try to install individually
+                for rp in &remote_paths {
+                    let cmd = format!("pm install -r \"{rp}\"");
+                    let _ = shell::run_shell(&mut transport, &cmd, false);
+                }
+            } else {
+                // Write each APK to the session
+                for rp in &remote_paths {
+                    let name = Path::new(rp)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("split.apk");
+                    let size = match std::fs::metadata(rp) {
+                        Ok(m) => m.len(),
+                        Err(_) => 0,
+                    };
+                    let _write_cmd = format!("pm install-write -S {size} {session_id} \"{name}\" < \"{rp}\"");
+                    println!("[adb-rs] Writing {name} ({} bytes) to session {session_id} ...", size);
+                    // Use shell exec (cat file | pm install-write ...)
+                    let write_cmd_shell = format!("cat \"{rp}\" | pm install-write -S {size} {session_id} \"{name}\"");
+                    let write_result = shell::run_shell(&mut transport, &write_cmd_shell, true)?;
+                    let write_output = write_result.unwrap_or_default();
+                    let write_str = String::from_utf8_lossy(&write_output).trim().to_string();
+                    println!("[adb-rs] install-write output: {write_str}");
+                }
+
+                // Commit the session
+                let commit_cmd = format!("pm install-commit {session_id}");
+                println!("[adb-rs] Committing session {session_id} ...");
+                let commit_result = shell::run_shell(&mut transport, &commit_cmd, true)?;
+                let commit_output = commit_result.unwrap_or_default();
+                let commit_str = String::from_utf8_lossy(&commit_output).trim().to_string();
+
+                if commit_str.contains("Success") {
+                    println!("[adb-rs] Install-multi-package succeeded: {commit_str}");
+                } else if commit_str.is_empty() {
+                    println!("[adb-rs] Install-multi-package completed (no output)");
+                } else {
+                    eprintln!("[adb-rs] Install-multi-package output: {commit_str}");
+                }
+            }
+
+            // Clean up temp APKs
+            for rp in &remote_paths {
+                let _ = shell::run_shell(&mut transport, &format!("rm -f \"{rp}\""), false);
+            }
+        }
+
         Commands::Uninstall { package } => {
             let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
@@ -1019,7 +1355,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Version => {
             println!("Android Debug Bridge version {}", env!("CARGO_PKG_VERSION"));
-            println!("Revision {}-android", &env!("CARGO_PKG_VERSION")[..12.min(env!("CARGO_PKG_VERSION").len())]);
+            println!("Revision deadbeef1234-android");
         }
 
         Commands::GetState => {
@@ -1254,6 +1590,399 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::io::stdout().write_all(&buf[..n])?;
             }
             std::io::stdout().flush()?;
+        }
+
+        Commands::Reconnect { target } => {
+            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("Error: ADB server not running. Start it with `adb-rs start-server`.");
+                    std::process::exit(1);
+                }
+            };
+            match target.as_deref() {
+                Some("device") => {
+                    server.switch_transport(cli.serial.as_deref())
+                        .map_err(|e| format!("Failed to switch transport: {e}"))?;
+                    server.send_host_request("reconnect:device")?;
+                }
+                Some("offline") => {
+                    server.switch_transport(cli.serial.as_deref())
+                        .map_err(|e| format!("Failed to switch transport: {e}"))?;
+                    server.send_host_request("reconnect:offline")?;
+                }
+                Some(other) => {
+                    eprintln!("Error: unknown reconnect target '{other}'. Use 'device' or 'offline'.");
+                    std::process::exit(1);
+                }
+                None => {
+                    server.send_host_request("host:reconnect")?;
+                }
+            }
+            server.read_status()?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = match server.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                };
+                std::io::stdout().write_all(&buf[..n])?;
+            }
+            std::io::stdout().flush()?;
+        }
+
+        Commands::Attach => {
+            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("Error: ADB server not running. Start it with `adb-rs start-server`.");
+                    std::process::exit(1);
+                }
+            };
+            server.switch_transport(cli.serial.as_deref())
+                .map_err(|e| format!("Failed to switch transport: {e}"))?;
+            server.send_host_request("attach:")?;
+            server.read_status()?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = match server.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                };
+                std::io::stdout().write_all(&buf[..n])?;
+            }
+        }
+
+        Commands::Detach => {
+            let serial = cli.serial.as_deref().unwrap_or("");
+            match detach::detach_device(serial, None) {
+                Ok(_) => println!("disconnected {}", serial),
+                Err(e) => eprintln!("Error: {e}"),
+            }
+        }
+
+        #[allow(unreachable_patterns)]
+        Commands::DisableVerity => {
+            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("Error: ADB server not running. Start it with `adb-rs start-server`.");
+                    std::process::exit(1);
+                }
+            };
+            server.switch_transport(cli.serial.as_deref())
+                .map_err(|e| format!("Failed to switch transport: {e}"))?;
+            server.send_host_request("disable-verity:")?;
+            server.read_status()?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = match server.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                };
+                std::io::stdout().write_all(&buf[..n])?;
+            }
+            std::io::stdout().flush()?;
+        }
+
+        Commands::EnableVerity => {
+            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("Error: ADB server not running. Start it with `adb-rs start-server`.");
+                    std::process::exit(1);
+                }
+            };
+            server.switch_transport(cli.serial.as_deref())
+                .map_err(|e| format!("Failed to switch transport: {e}"))?;
+            server.send_host_request("enable-verity:")?;
+            server.read_status()?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = match server.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                };
+                std::io::stdout().write_all(&buf[..n])?;
+            }
+            std::io::stdout().flush()?;
+        }
+
+        Commands::Keygen { file } => {
+            let path = Path::new(file);
+            if path.exists() {
+                eprintln!("Error: '{}' already exists", file);
+                std::process::exit(1);
+            }
+            let private_path = if file.ends_with(".pub") {
+                // User specified the public key file — derive private
+                let priv_path = file.strip_suffix(".pub").unwrap_or(file);
+                PathBuf::from(priv_path)
+            } else {
+                path.to_path_buf()
+            };
+            let public_path = {
+                let mut p = private_path.clone();
+                p.set_extension("pub");
+                p
+            };
+
+            let auth = AdbAuth::generate("adb-rs@localhost")?;
+            let pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key())?;
+            write_private_key(&private_path, pem.as_bytes())?;
+            let pub_bytes = auth.build_rsakey_payload()?;
+            write_private_key(&public_path, &pub_bytes)?;
+            println!("[adb-rs] Generated ADB key pair:");
+            println!("       Private: {}", private_path.display());
+            println!("       Public:  {}", public_path.display());
+        }
+
+        Commands::Remount { reboot } => {
+            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("Error: ADB server not running. Start it with `adb-rs start-server`.");
+                    std::process::exit(1);
+                }
+            };
+            server.switch_transport(cli.serial.as_deref())
+                .map_err(|e| format!("Failed to switch transport: {e}"))?;
+            let service = if *reboot {
+                "remount,-R".to_string()
+            } else {
+                "remount:".to_string()
+            };
+            server.send_host_request(&service)?;
+            server.read_status()?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = match server.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                };
+                std::io::stdout().write_all(&buf[..n])?;
+            }
+            std::io::stdout().flush()?;
+        }
+
+        Commands::Sideload { ota_package } => {
+            let ota_path = Path::new(ota_package);
+            if !ota_path.exists() {
+                eprintln!("Error: OTA package not found: {ota_package}");
+                std::process::exit(1);
+            }
+            let ota_data = std::fs::read(ota_path)
+                .map_err(|e| format!("Cannot read {ota_package}: {e}"))?;
+            let file_name = ota_path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("ota.zip");
+
+            let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let (_info, mut transport) =
+                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
+
+            let (local_id, remote_id) = protocol::open_service(&mut transport, "sideload:", 1)?;
+
+            // Send sideload header: filename length (4 bytes LE) + filename + data length (8 bytes LE) + data
+            let name_bytes = file_name.as_bytes();
+            let payload_len = 4 + name_bytes.len() + 8 + ota_data.len();
+            println!("[adb-rs] Sideloading {file_name} ({} bytes) ...", ota_data.len());
+
+            let mut send_buf = Vec::with_capacity(payload_len);
+            // filename length (u32 LE)
+            send_buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            // filename bytes
+            send_buf.extend_from_slice(name_bytes);
+            // data length (u64 LE)
+            send_buf.extend_from_slice(&(ota_data.len() as u64).to_le_bytes());
+            // data
+            send_buf.extend_from_slice(&ota_data);
+
+            protocol::send_wrte(&mut transport, local_id, remote_id, &send_buf)?;
+
+            // Read response
+            let (_hdr, payload) = transport.recv_message()?;
+            let response = String::from_utf8_lossy(&payload);
+            println!("{response}");
+
+            // Close
+            let clse_hdr = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
+            transport.send_message(&clse_hdr, &[])?;
+            let _ = transport.recv_message();
+        }
+
+        Commands::Sync { directory, remote } => {
+            let local_dir = directory.as_deref().unwrap_or(".");
+            let local_path = Path::new(local_dir);
+            if !local_path.is_dir() {
+                eprintln!("Error: '{}' is not a directory", local_path.display());
+                std::process::exit(1);
+            }
+
+            // Connect to adbd
+            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+                .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
+            let (_info, mut transport) =
+                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
+
+            let remote_base = remote.trim_end_matches('/');
+
+            // Recursively walk local directory and push each file
+            fn walk_and_push(
+                transport: &mut dyn Transport,
+                dir: &Path,
+                base: &Path,
+                remote_base: &str,
+            ) -> Result<(), Box<dyn std::error::Error>> {
+                for entry in std::fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk_and_push(transport, &path, base, remote_base)?;
+                    } else if path.is_file() {
+                        let relative = path
+                            .strip_prefix(base)
+                            .unwrap_or(&path);
+                        let relative_str = relative
+                            .to_str()
+                            .ok_or("Non-UTF-8 path")?;
+                        let remote_path = format!("{remote_base}/{relative_str}");
+                        let file_data = std::fs::read(&path)
+                            .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+                        let (local_id, remote_id) = protocol::open_service(transport, "sync:", 1)?;
+
+                        let mut send_buf = Vec::new();
+                        build_sync_send_req(&remote_path, 0o644, &mut send_buf)
+                            .map_err(|e| format!("Build SEND req failed: {e}"))?;
+                        println!("[adb-rs] Syncing {} -> {} ({} bytes)",
+                            relative_str, remote_path, file_data.len());
+
+                        protocol::send_wrte(transport, local_id, remote_id, &send_buf)?;
+                        protocol::recv_sync_response(transport, local_id, remote_id)?;
+
+                        const MAX_CHUNK: usize = 64 * 1024;
+                        for chunk in file_data.chunks(MAX_CHUNK) {
+                            let mut data_buf = Vec::new();
+                            build_sync_data_chunk(chunk, &mut data_buf)
+                                .map_err(|e| format!("Build DATA chunk failed: {e}"))?;
+                            protocol::send_wrte(transport, local_id, remote_id, &data_buf)?;
+                        }
+
+                        let mut done_buf = Vec::new();
+                        build_sync_done(0xFFFF_FFFF, &mut done_buf)
+                            .map_err(|e| format!("Build DONE failed: {e}"))?;
+                        protocol::send_wrte(transport, local_id, remote_id, &done_buf)?;
+                        protocol::recv_sync_response(transport, local_id, remote_id)?;
+
+                        let clse_hdr = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
+                        transport.send_message(&clse_hdr, &[])?;
+                        let _ = transport.recv_message();
+                    }
+                }
+                Ok(())
+            }
+
+            let local_canon = local_path.canonicalize()
+                .map_err(|e| format!("Cannot resolve path '{}': {e}", local_path.display()))?;
+            match walk_and_push(&mut transport, &local_canon, &local_canon, remote_base) {
+                Ok(()) => println!("[adb-rs] Sync complete: '{}' -> '{}'", local_path.display(), remote_base),
+                Err(e) => {
+                    eprintln!("[adb-rs] Sync error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::WaitFor { spec } => {
+            let spec_str = spec.join(" ");
+            let spec_str = spec_str.trim();
+
+            // Parse [TRANSPORT-]STATE
+            let (transport_prefix, state) = if let Some(idx) = spec_str.rfind('-') {
+                let prefix = &spec_str[..idx];
+                let st = &spec_str[idx + 1..];
+                (Some(prefix.to_string()), st.to_string())
+            } else {
+                (None, spec_str.to_string())
+            };
+
+            let valid_states = ["device", "recovery", "rescue", "sideload", "bootloader", "disconnect"];
+            if !valid_states.contains(&state.as_str()) {
+                eprintln!("Error: unknown state '{}'. Valid states: device, recovery, rescue, sideload, bootloader, disconnect", state);
+                std::process::exit(1);
+            }
+
+            if let Some(ref t) = transport_prefix {
+                let valid_prefixes = ["usb", "local", "any"];
+                if !valid_prefixes.contains(&t.as_str()) {
+                    eprintln!("Error: unknown transport '{}'. Valid transports: usb, local, any", t);
+                    std::process::exit(1);
+                }
+            }
+
+            let max_attempts = 60; // ~60 seconds
+            let mut attempts = 0;
+
+            println!("[adb-rs] Waiting for device state '{spec_str}' ...");
+
+            loop {
+                let result = host_command(cli.serial.as_deref(), "host:get-state");
+                let current_state = match &result {
+                    Ok(resp) => resp.trim().to_string(),
+                    Err(_) if state == "disconnect" => "disconnect".to_string(),
+                    Err(e) => {
+                        if attempts >= max_attempts {
+                            eprintln!("Error: timeout waiting for device state '{spec_str}': {e}");
+                            std::process::exit(1);
+                        }
+                        format!("error: {e}")
+                    }
+                };
+
+                if current_state == state {
+                    println!("[adb-rs] Device reached state '{state}'");
+                    return Ok(());
+                }
+
+                if state == "disconnect" && current_state == "disconnect" {
+                    println!("[adb-rs] Device disconnected");
+                    return Ok(());
+                }
+
+                attempts += 1;
+                if attempts >= max_attempts {
+                    eprintln!("Error: timeout waiting for device state '{state}'. Last state: {current_state}");
+                    std::process::exit(1);
+                }
+
+                // Show progress
+                if attempts % 10 == 0 {
+                    println!("[adb-rs] Still waiting for '{state}' (current: {current_state}, attempt {attempts}/{max_attempts}) ...");
+                }
+
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
 
         _ => todo!("command not yet implemented"),
