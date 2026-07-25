@@ -6,26 +6,34 @@
 //! - models.rs  → transport.cpp types (TransportRegistry, atransport)
 //! - bridge.rs  → smart socket connect_to_remote bridge logic
 //! - forward.rs → adb_listeners.cpp (forward/reverse)
+//! - types.rs   → types.cpp (IOVector block I/O)
+//! - apacket_reader.rs → apacket_reader.cpp (ADB packet assembly)
 //! - watcher.rs → USB device watcher (usb.cpp)
-//! - adb_utils.rs → adb_utils.cpp (file/path helpers, shell escaping, logging
+//! - adb_utils.rs → adb_utils.cpp (file/path helpers, shell escaping, logging)
 
+pub mod adb_mdns;
 pub mod adb_utils;
+pub mod apacket_reader;
 pub mod bridge;
 pub mod forward;
-pub mod services;
 pub mod handler;
 pub mod models;
 pub mod runner;
+pub mod services;
 pub mod transport;
+pub mod types;
 pub mod watcher;
 
 // Re-export all items for backward compatibility within the crate.
+pub(crate) use adb_mdns::*;
 pub(crate) use adb_utils::*;
+pub(crate) use apacket_reader::*;
 pub(crate) use bridge::*;
 pub(crate) use forward::*;
-pub(crate) use services::*;
 pub(crate) use handler::*;
 pub(crate) use models::*;
 pub(crate) use runner::*;
+pub(crate) use services::*;
 pub(crate) use transport::*;
+pub(crate) use types::*;
 pub(crate) use watcher::*;
