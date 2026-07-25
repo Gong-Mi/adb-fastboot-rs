@@ -235,9 +235,7 @@ pub enum Commands {
     /// Connect to a device via TCP/IP
     Connect {
         /// Device address (host:port)
-        host: String,
-        /// Optional port (defaults to 5555)
-        port: Option<u16>,
+        target: String,
     },
     /// Disconnect from one or all TCP devices
     Disconnect {
@@ -1412,8 +1410,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             server::run_server_fork(Some(*reply_fd), port);
         }
 
-        Commands::Connect { host, port } => {
-            let port = port.unwrap_or(5555);
+        Commands::Connect { target } => {
+            // Parse target as host:port
+            let (host, port) = if let Some(idx) = target.rfind(':') {
+                let h = &target[..idx];
+                let p: u16 = target[idx+1..].parse().unwrap_or(5555);
+                (h.to_string(), p)
+            } else {
+                (target.clone(), 5555)
+            };
             let request = format!("host:connect:{}:{}", host, port);
 
             match host_command(cli.serial.as_deref(), &request) {

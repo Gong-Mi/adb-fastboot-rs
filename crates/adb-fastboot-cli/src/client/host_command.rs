@@ -33,5 +33,6 @@ pub fn host_command(
 
     let result = server.execute_host_command(request)
         .map_err(|e| format!("ADB host command failed: {e}"))?;
+    eprintln!("[adb-debug] host_command OK: resp={:?}", &result);
     Ok(result)
 }

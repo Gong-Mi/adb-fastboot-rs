@@ -82,6 +82,7 @@ pub(crate) fn dispatch_host_service(
 ) -> Result<(), String> {
     // ----- Helper closures -----
 
+    eprintln!("[adb-debug] dispatch_host_service: cmd={:?}", cmd);
     let ok = |sock: &mut TcpStream, data: &[u8]| -> Result<(), String> {
         let len_hdr = format!("{:04x}", data.len());
         sock.write_all(b"OKAY")
@@ -352,9 +353,11 @@ pub(crate) fn dispatch_host_service(
 
             match crate::server::transport::connect_to_remote(addr, registry) {
                 Ok(_transport) => {
+                    eprintln!("[adb-debug] host:connect OK, sending serial: {:?}", &serial);
                     ok_str(client, &serial)
                 }
                 Err(e) => {
+                    eprintln!("[adb-debug] host:connect FAIL: {:?}", &e);
                     fail(client, &format!("connection failed: {e}"))
                 }
             }

@@ -254,10 +254,14 @@ pub(crate) fn connect_to_remote(
     registry: &Arc<Mutex<TransportRegistry>>,
 ) -> Result<Box<dyn Transport>, String> {
     // 1. Open TCP connection
-    let mut transport = Box::new(
+    let mut transport: Box<dyn Transport> = Box::new(
         TcpTransport::connect_timeout(addr, TRANSPORT_CONNECT_TIMEOUT)
             .map_err(|e| format!("cannot connect to device at {addr}: {e}"))?,
     );
+    // Set read timeout so recv_message doesn't hang forever if device doesn't respond
+    if let Some(tcp) = transport.inner_tcp_mut() {
+        let _ = tcp.set_read_timeout(Some(TRANSPORT_CONNECT_TIMEOUT));
+    }
 
     // 2. Send CNXN probe (AOSP: connect_to_remote sends A_CNXN)
     let probe = b"host::";

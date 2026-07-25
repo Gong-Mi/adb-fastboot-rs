@@ -76,6 +76,12 @@ pub trait Transport: Read + Write + Send {
     fn try_clone_box(&self) -> Option<Box<dyn Transport>> {
         None
     }
+
+    /// Return a mutable reference to the inner TcpStream, if this
+    /// transport wraps one. Used for setting socket options.
+    fn inner_tcp_mut(&mut self) -> Option<&mut TcpStream> {
+        None
+    }
 }
 
 /// Connect trait abstraction for establishing transport connections
@@ -94,6 +100,11 @@ impl TcpTransport {
     pub fn try_clone(&self) -> Result<Self, TransportError> {
         let stream = self.stream.try_clone().map_err(TransportError::Io)?;
         Ok(Self { stream })
+    }
+
+    /// Set the read timeout on the underlying TCP stream.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.stream.set_read_timeout(timeout)
     }
 
     pub fn connect<A: ToSocketAddrs + std::fmt::Display>(addr: A) -> Result<Self, TransportError> {
@@ -164,7 +175,11 @@ impl Write for TcpTransport {
     }
 }
 
-impl Transport for TcpTransport {}
+impl Transport for TcpTransport {
+    fn inner_tcp_mut(&mut self) -> Option<&mut TcpStream> {
+        Some(&mut self.stream)
+    }
+}
 
 impl Transport for Box<dyn Transport + '_> {
     fn send_message(&mut self, header: &AdbMessageHeader, payload: &[u8]) -> Result<(), TransportError> {
@@ -175,6 +190,9 @@ impl Transport for Box<dyn Transport + '_> {
     }
     fn try_clone_box(&self) -> Option<Box<dyn Transport>> {
         (**self).try_clone_box()
+    }
+    fn inner_tcp_mut(&mut self) -> Option<&mut TcpStream> {
+        (**self).inner_tcp_mut()
     }
 }
 
@@ -295,9 +313,13 @@ impl AdbServerTransport {
 
     /// Execute a host command expecting a data payload (e.g. "host:devices-l", "host:version")
     pub fn execute_host_command(&mut self, request: &str) -> Result<String, TransportError> {
+        eprintln!("[adb-debug] execute_host_command: sending '{}'", request);
         self.send_host_request(request)?;
+        eprintln!("[adb-debug] execute_host_command: sent OK, reading status");
         self.read_status()?;
+        eprintln!("[adb-debug] execute_host_command: status OK, reading payload");
         let payload = self.read_payload()?;
+        eprintln!("[adb-debug] execute_host_command: payload={:?}", &payload);
         Ok(String::from_utf8_lossy(&payload).to_string())
     }
 
