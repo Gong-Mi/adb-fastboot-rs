@@ -162,9 +162,6 @@ fn parse_tcp_socket_spec_inner(spec: &str) -> Result<(String, u16), String> {
 
     // If the rest is just a port number, host is empty.
     if let Ok(port) = rest.parse::<u16>() {
-        if port == 0 {
-            return Err("port 0 is not valid in a socket spec".to_string());
-        }
         return Ok((String::new(), port));
     }
 
@@ -181,10 +178,6 @@ fn parse_tcp_socket_spec_inner(spec: &str) -> Result<(String, u16), String> {
     let port: u16 = port_str
         .parse()
         .map_err(|_| format!("invalid port in tcp spec: '{port_str}'"))?;
-
-    if port == 0 {
-        return Err("port 0 is not valid in a socket spec".to_string());
-    }
 
     Ok((host.to_string(), port))
 }
@@ -666,8 +659,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_tcp_socket_spec_rejects_port_zero() {
-        assert!(parse_tcp_socket_spec("tcp:0").is_err());
+    fn test_parse_tcp_socket_spec_accepts_port_zero_for_listen() {
+        // Port 0 is valid for listen (OS auto-assigns), AOSP accepts it.
+        let (host, port) = parse_tcp_socket_spec("tcp:0").unwrap();
+        assert_eq!(host, "");
+        assert_eq!(port, 0);
     }
 
     #[test]
