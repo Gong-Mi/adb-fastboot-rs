@@ -32,6 +32,16 @@ fn parse_server_addr(addr: &str) -> Option<u16> {
     }
 }
 
+/// Map `adb reconnect [device|offline]` to the AOSP host-service request.
+fn reconnect_service(target: Option<&str>) -> Result<&'static str, String> {
+    match target {
+        None => Ok("host:reconnect"),
+        Some("device") => Ok("reconnect"),
+        Some("offline") => Ok("host:reconnect-offline"),
+        Some(other) => Err(format!("unknown reconnect target '{other}'. Use 'device' or 'offline'.")),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "adb-rs", author, version, about = "Rust ADB Command-Line Interface")]
 pub struct Cli {
@@ -1621,25 +1631,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             };
-            match target.as_deref() {
-                Some("device") => {
-                    server.switch_transport(cli.serial.as_deref())
-                        .map_err(|e| format!("Failed to switch transport: {e}"))?;
-                    server.send_host_request("reconnect:device")?;
-                }
-                Some("offline") => {
-                    server.switch_transport(cli.serial.as_deref())
-                        .map_err(|e| format!("Failed to switch transport: {e}"))?;
-                    server.send_host_request("reconnect:offline")?;
-                }
-                Some(other) => {
-                    eprintln!("Error: unknown reconnect target '{other}'. Use 'device' or 'offline'.");
-                    std::process::exit(1);
-                }
-                None => {
-                    server.send_host_request("host:reconnect")?;
-                }
+            let request = reconnect_service(target.as_deref())?;
+            if target.as_deref() == Some("device") {
+                server.switch_transport(cli.serial.as_deref())
+                    .map_err(|e| format!("Failed to switch transport: {e}"))?;
             }
+            server.send_host_request(request)?;
             server.read_status()?;
             let mut buf = [0u8; 8192];
             loop {
@@ -2016,6 +2013,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use crate::client::server_cmds::kill_server_at;
+
+    #[test]
+    fn reconnect_offline_uses_aosp_host_service() {
+        assert_eq!(reconnect_service(Some("offline")).unwrap(), "host:reconnect-offline");
+    }
 
     #[test]
     fn test_kill_server_when_not_running() {
