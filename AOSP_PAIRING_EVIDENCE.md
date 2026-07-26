@@ -1,6 +1,7 @@
 # AOSP Pairing Evidence Ledger
 
-Status: source-derived defects; not a completion claim.
+Status: P0-1 through P0-5 repaired and landed; real-device pairing not yet
+performed. See "Repair status" at the bottom.
 
 Reference root: `/data/data/com.termux/files/home/android-tools-36.0.1/vendor/adb`
 Rust root: `crates/adb-protocol` and `crates/adb-fastboot-cli`
@@ -78,3 +79,21 @@ Call chain: `PairingClient::execute_pairing_with_exported_keys` (`pairing_connec
 4. Move TLS exporter handling before SPAKE exactly as AOSP does.
 5. Do not continue patching handwritten `Fe`, `ExtendedPoint`, or SPAKE2. Bind a vendored, source-pinned AOSP/BoringSSL pairing-auth implementation first, including headers, licenses, and build provenance.
 6. Only then perform real-device pairing followed by a second-process `adb connect` using the persisted same key.
+
+## Repair status (2026-07-26)
+
+1. P0-1/P0-2 packet framing: landed (`8e9526e`). Six-byte packed header,
+   SPAKE2_MSG=0/PEER_INFO=1, byte fixtures in tests.
+2. P0-4 single RSA identity: `PairingClient::with_rsa_key` passes the TLS
+   key material through; internally generated B-key path remains only as an
+   explicit fallback when no key is provided.
+3. P0-3 TLS exporter ordering: landed (`ebdb41d`). Exporter appended to the
+   SPAKE password; AES key is HKDF-SHA256(null salt, SPAKE2 output) only;
+   NUL-terminated peer names.
+4. P0-5 SPAKE2 primitive: landed (`1abb55b`). Vendored BoringSSL crypto +
+   AOSP `adb/pairing_auth` C API behind feature `pairing-vendored`;
+   68/68 adb-protocol tests pass, including a full in-memory
+   PairingClient<->PairingServer exchange. The handwritten curve25519
+   SPAKE2 stays only in the default (non-vendored) build and is known-broken.
+5. Pending: route production `adb pair` through `pairing-vendored` and run
+   real-device pairing + reconnect acceptance.
