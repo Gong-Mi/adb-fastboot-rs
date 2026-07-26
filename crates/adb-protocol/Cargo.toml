@@ -7,13 +7,13 @@ license.workspace = true
 description = "Pure Rust ADB (Android Debug Bridge) protocol packet framing, parser, and auth encoder"
 
 [features]
-default = []
+# Production pairing is the vendored AOSP pairing_auth implementation.
+default = ["pairing-vendored"]
 tls = ["dep:rcgen", "dep:rustls"]
 usb = []
 usb-rusb = ["usb", "dep:rusb"]
 usb-android = ["usb"]
-# pairing-vendored: replace the handwritten SPAKE2/AES pairing primitives with
-# the vendored AOSP pairing_auth C API on top of vendored BoringSSL.
+# pairing-vendored builds the AOSP pairing_auth C API on top of vendored BoringSSL.
 pairing-vendored = []
 
 [build-dependencies]

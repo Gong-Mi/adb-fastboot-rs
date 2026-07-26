@@ -3,7 +3,7 @@
 //! This module contains the base wire types (`PairingPacket`, `PeerInfo`,
 //! `PairingError`) and re-exports authentication and connection types from:
 //!
-//! - [`crate::pairing_auth`] — `PairingCipher`, `Spake2`, `SpakeRole`
+//! - [`crate::pairing_auth`] — AOSP-compatible `PairingAuth` C API wrapper
 //! - [`crate::pairing_connection`] — `PairingClient`, `PairingServer`, `AdbKeystore`
 //!
 //! The AOSP pairing connection is a TLS 1.3 channel followed by a six-byte
@@ -231,11 +231,6 @@ pub fn validate_pairing_code(code: &str) -> Result<(), PairingError> {
 // Re-exports from sub-modules
 // ---------------------------------------------------------------------------
 
-#[cfg(not(feature = "pairing-vendored"))]
-pub use crate::pairing_auth::PairingCipher;
-#[cfg(not(feature = "pairing-vendored"))]
-pub use crate::pairing_auth::Spake2;
-#[cfg(feature = "pairing-vendored")]
 pub use crate::pairing_auth::PairingAuth;
 pub use crate::pairing_connection::{save_adb_keystore, AdbKeystore, PairingClient, PairingServer};
 
@@ -244,8 +239,6 @@ mod tests {
     use super::*;
     use crate::auth;
     use std::io::Cursor;
-    #[cfg(not(feature = "pairing-vendored"))]
-    use crate::pairing_auth::SpakeRole;
 
     #[test]
     fn aosp_pairing_packet_uses_raw_six_byte_header() {
@@ -314,40 +307,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "pairing-vendored"))]
-    fn spake2_key_exchange_matching_and_mismatched_passwords() {
-        let mut alice =
-            Spake2::new(SpakeRole::Alice, b"adb pair client\0", b"adb pair server\0", b"123456");
-        let mut bob =
-            Spake2::new(SpakeRole::Bob, b"adb pair server\0", b"adb pair client\0", b"123456");
-
-        let msg_alice = alice.generate_msg().unwrap();
-        let msg_bob = bob.generate_msg().unwrap();
-
-        assert_eq!(msg_alice.len(), 32);
-        assert_eq!(msg_bob.len(), 32);
-
-        let key_alice = alice.process_msg(&msg_bob).unwrap();
-        let key_bob = bob.process_msg(&msg_alice).unwrap();
-
-        assert_eq!(key_alice.len(), 32);
-        assert_eq!(key_alice, key_bob, "SPAKE2+ keys do not match — known bug: custom Fe/ExtendedPoint field arithmetic needs replacement with ed25519-dalek");
-
-        // Mismatched password
-        let mut charlie =
-            Spake2::new(SpakeRole::Bob, b"adb pair server\0", b"adb pair client\0", b"654321");
-        let msg_charlie = charlie.generate_msg().unwrap();
-        let mut alice2 =
-            Spake2::new(SpakeRole::Alice, b"adb pair client\0", b"adb pair server\0", b"123456");
-        let _ = alice2.generate_msg().unwrap();
-
-        let key_alice2 = alice2.process_msg(&msg_charlie).unwrap();
-        let key_charlie = charlie.process_msg(&alice2.my_msg).unwrap();
-
-        assert_ne!(key_alice2, key_charlie);
-    }
-
-    #[test]
     fn adb_keystore_certificate_persistence() {
         let temp_dir = std::env::temp_dir().join("adb_keystore_test");
         let rsa_key = auth::generate_rsa_key().unwrap();
@@ -363,94 +322,6 @@ mod tests {
         assert!(loaded_pub_str.contains("test-device"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    #[cfg(not(feature = "pairing-vendored"))]
-    fn full_pairing_client_server_exchange() {
-        struct Pipe {
-            read_buf: Vec<u8>,
-            read_pos: usize,
-        }
-
-        struct DuplexPipe {
-            c2s: Vec<u8>,
-            s2c: Vec<u8>,
-        }
-
-        // Mock in-memory duplex transport
-        struct ClientSide<'a>(&'a mut DuplexPipe);
-        struct ServerSide<'a>(&'a mut DuplexPipe);
-
-        impl<'a> Read for ClientSide<'a> {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.0.s2c.is_empty() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        "empty",
-                    ));
-                }
-                let len = buf.len().min(self.0.s2c.len());
-                buf[..len].copy_from_slice(&self.0.s2c[..len]);
-                self.0.s2c.drain(..len);
-                Ok(len)
-            }
-        }
-
-        impl<'a> Write for ClientSide<'a> {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.c2s.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> Read for ServerSide<'a> {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.0.c2s.is_empty() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        "empty",
-                    ));
-                }
-                let len = buf.len().min(self.0.c2s.len());
-                buf[..len].copy_from_slice(&self.0.c2s[..len]);
-                self.0.c2s.drain(..len);
-                Ok(len)
-            }
-        }
-
-        impl<'a> Write for ServerSide<'a> {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.s2c.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let _pipe = DuplexPipe {
-            c2s: Vec::new(),
-            s2c: Vec::new(),
-        };
-        let _client = PairingClient::new("123456").unwrap();
-        let server_info = PeerInfo::from_device_info("DEVICE_123", "Android_Device");
-        let _server = PairingServer::new("123456", server_info.clone()).unwrap();
-
-        // 1. Client writes Spake2Msg
-        let mut spake_client =
-            Spake2::new(SpakeRole::Alice, b"adb pair client\0", b"adb pair server\0", b"123456");
-        let client_spake_msg = spake_client.generate_msg().unwrap();
-        let mut spake_server =
-            Spake2::new(SpakeRole::Bob, b"adb pair server\0", b"adb pair client\0", b"123456");
-        let server_spake_msg = spake_server.generate_msg().unwrap();
-
-        let client_key = spake_client.process_msg(&server_spake_msg).unwrap();
-        let server_key = spake_server.process_msg(&client_spake_msg).unwrap();
-        assert_eq!(client_key, server_key);
     }
 
     /// Full PairingClient <-> PairingServer exchange over an in-memory duplex
