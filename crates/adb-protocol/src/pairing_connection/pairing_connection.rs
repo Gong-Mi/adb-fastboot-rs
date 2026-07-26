@@ -169,12 +169,6 @@ impl PairingClient {
         let decrypted_peer_bytes = cipher.decrypt(&peer_info_packet.payload)?;
         let peer_info = PeerInfo::deserialize(&decrypted_peer_bytes)?;
 
-        let home_dir = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        let adb_dir = home_dir.join(".android");
-        let _ = save_adb_keystore(&rsa_key, "adb-pairing", &adb_dir);
-
         self.peer_info = Some(peer_info.clone());
         Ok(peer_info)
     }

@@ -16,6 +16,8 @@
 
 
 #[cfg(feature = "usb-rusb")]
+use std::time::Duration;
+#[cfg(feature = "usb-rusb")]
 use adb_protocol::{RusbUsbTransport, UsbTransportAdapter};
 
 /// The libusb-based ADB USB transport.

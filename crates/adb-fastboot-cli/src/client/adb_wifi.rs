@@ -296,7 +296,7 @@ pub fn pair_device(
 
     // --- SPAKE2+ key exchange + encrypted PeerInfo exchange ---
     eprintln!("Executing SPAKE2+ key exchange and certificate pairing...");
-    let mut client = PairingClient::new(code)
+    let mut client = PairingClient::with_rsa_key(code, rsa_key.clone())
         .map_err(|e| WifiError::Other(format!("Failed to create pairing client: {e}")))?;
 
     let peer_info = client

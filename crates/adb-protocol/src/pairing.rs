@@ -30,8 +30,8 @@ pub const ADB_DEVICE_GUID: u8 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PairingPacketType {
-    Spake2Msg = 1,
-    PeerInfo = 2,
+    Spake2Msg = 0,
+    PeerInfo = 1,
 }
 
 impl TryFrom<u8> for PairingPacketType {
@@ -39,8 +39,8 @@ impl TryFrom<u8> for PairingPacketType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 | 1 => Ok(Self::Spake2Msg),
-            2 => Ok(Self::PeerInfo),
+            0 => Ok(Self::Spake2Msg),
+            1 => Ok(Self::PeerInfo),
             other => Err(PairingError::InvalidHeader(format!(
                 "unknown packet type {other}"
             ))),
@@ -96,79 +96,39 @@ impl PairingPacket {
         })
     }
 
-    pub fn encode_protobuf(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(6 + self.payload.len());
-        out.push(0x08);
-        out.push(self.packet_type as u8);
-        out.push(0x12);
-        let mut len = self.payload.len();
-        while len >= 0x80 {
-            out.push((len as u8 & 0x7f) | 0x80);
-            len >>= 7;
-        }
-        out.push(len as u8);
-        out.extend_from_slice(&self.payload);
-        out
-    }
-
     pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<(), PairingError> {
-        let proto = self.encode_protobuf();
-        let len = (proto.len() as u32).to_be_bytes();
-        writer.write_all(&len)?;
-        writer.write_all(&proto)?;
+        let payload_len = u32::try_from(self.payload.len())
+            .map_err(|_| PairingError::InvalidPayload("payload length exceeds u32".into()))?;
+        let mut header = [0u8; PAIRING_HEADER_SIZE];
+        header[0] = self.version;
+        header[1] = self.packet_type as u8;
+        header[2..].copy_from_slice(&payload_len.to_be_bytes());
+        writer.write_all(&header)?;
+        writer.write_all(&self.payload)?;
         writer.flush()?;
         Ok(())
     }
 
     pub fn read_from<R: Read>(reader: &mut R) -> Result<Self, PairingError> {
-        let mut len_bytes = [0u8; 4];
-        reader.read_exact(&mut len_bytes)?;
-        let len = u32::from_be_bytes(len_bytes) as usize;
-        if len == 0 || len > MAX_PAIRING_PAYLOAD {
+        let mut header = [0u8; PAIRING_HEADER_SIZE];
+        reader.read_exact(&mut header)?;
+        let version = header[0];
+        if version != PAIRING_VERSION {
             return Err(PairingError::InvalidHeader(format!(
-                "unsafe payload length {len}"
+                "unsupported pairing version {version}"
             )));
         }
-        let mut proto_buf = vec![0u8; len];
-        reader.read_exact(&mut proto_buf)?;
-
-        let mut packet_type = PairingPacketType::Spake2Msg;
-        let mut payload = Vec::new();
-        let mut idx = 0;
-
-        while idx < proto_buf.len() {
-            let tag = proto_buf[idx];
-            idx += 1;
-            match tag {
-                0x08 => {
-                    if idx < proto_buf.len() {
-                        packet_type = PairingPacketType::try_from(proto_buf[idx])?;
-                        idx += 1;
-                    }
-                }
-                0x12 => {
-                    let mut p_len = 0usize;
-                    let mut shift = 0;
-                    while idx < proto_buf.len() {
-                        let b = proto_buf[idx];
-                        idx += 1;
-                        p_len |= ((b & 0x7f) as usize) << shift;
-                        if b & 0x80 == 0 {
-                            break;
-                        }
-                        shift += 7;
-                    }
-                    if idx + p_len <= proto_buf.len() {
-                        payload = proto_buf[idx..idx + p_len].to_vec();
-                        idx += p_len;
-                    }
-                }
-                _ => break,
-            }
+        let packet_type = PairingPacketType::try_from(header[1])?;
+        let payload_len = u32::from_be_bytes(header[2..].try_into().unwrap()) as usize;
+        if payload_len == 0 || payload_len > MAX_PAIRING_PAYLOAD {
+            return Err(PairingError::InvalidHeader(format!(
+                "unsafe payload length {payload_len}"
+            )));
         }
-
+        let mut payload = vec![0u8; payload_len];
+        reader.read_exact(&mut payload)?;
         Ok(Self {
-            version: PAIRING_VERSION,
+            version,
             packet_type,
             payload,
         })
@@ -283,11 +243,22 @@ mod tests {
     use crate::pairing_auth::SpakeRole;
 
     #[test]
-    fn aosp_protobuf_pairing_packet_roundtrip() {
-        let packet = PairingPacket::new(PairingPacketType::Spake2Msg, vec![0xaa; 0x20]).unwrap();
+    fn aosp_pairing_packet_uses_raw_six_byte_header() {
+        let packet = PairingPacket::new(PairingPacketType::Spake2Msg, vec![0xaa, 0xbb]).unwrap();
         let mut wire = Vec::new();
         packet.write_to(&mut wire).unwrap();
+
+        // pairing_connection.cpp::PairingPacketHeader is packed as:
+        // version:u8, type:u8, payload_size:be-u32, followed by raw payload.
+        assert_eq!(wire, vec![PAIRING_VERSION, 0, 0, 0, 0, 2, 0xaa, 0xbb]);
         assert_eq!(PairingPacket::read_from(&mut Cursor::new(wire)).unwrap(), packet);
+    }
+
+    #[test]
+    fn aosp_pairing_packet_type_values_match_pairing_proto() {
+        // vendor/adb/proto/pairing.proto: SPAKE2_MSG=0, PEER_INFO=1.
+        assert_eq!(PairingPacketType::Spake2Msg as u8, 0);
+        assert_eq!(PairingPacketType::PeerInfo as u8, 1);
     }
 
     #[test]
