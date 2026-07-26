@@ -65,11 +65,17 @@ impl UsbDescriptor {
         if in_ep.direction != UsbEndpointDirection::In {
             return Err(UsbTransportError::InvalidDescriptor { reason: "bulk_in has wrong direction".into() });
         }
+        if in_ep.max_packet_size == 0 {
+            return Err(UsbTransportError::InvalidDescriptor { reason: "bulk_in has zero max packet size".into() });
+        }
         let out_ep = self.bulk_out.ok_or(UsbTransportError::MissingEndpoint {
             direction: UsbEndpointDirection::Out,
         })?;
         if out_ep.direction != UsbEndpointDirection::Out {
             return Err(UsbTransportError::InvalidDescriptor { reason: "bulk_out has wrong direction".into() });
+        }
+        if out_ep.max_packet_size == 0 {
+            return Err(UsbTransportError::InvalidDescriptor { reason: "bulk_out has zero max packet size".into() });
         }
         Ok(())
     }
@@ -249,5 +255,17 @@ mod tests {
         d.bulk_out = None;
         let mock = MockBulk { descriptor: d, reads: VecDeque::new(), writes: vec![], output: vec![] };
         assert!(matches!(FastbootUsbTransport::new(mock), Err(UsbTransportError::MissingEndpoint { direction: UsbEndpointDirection::Out })));
+    }
+
+    #[test]
+    fn rejects_zero_sized_bulk_endpoint_descriptor() {
+        let mut d = descriptor();
+        d.bulk_out = Some(UsbEndpointInfo::new(0x02, UsbEndpointDirection::Out, 0));
+        let mock = MockBulk { descriptor: d, reads: VecDeque::new(), writes: vec![], output: vec![] };
+
+        assert!(matches!(
+            FastbootUsbTransport::new(mock),
+            Err(UsbTransportError::InvalidDescriptor { reason }) if reason == "bulk_out has zero max packet size"
+        ));
     }
 }
