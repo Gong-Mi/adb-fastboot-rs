@@ -6,7 +6,10 @@ use std::io::{Read, Write};
 use crate::pairing::{
     PairingError, PairingPacket, PairingPacketType, PeerInfo, validate_pairing_code,
 };
+#[cfg(not(feature = "pairing-vendored"))]
 use crate::pairing_auth::{PairingCipher, Spake2, SpakeRole};
+#[cfg(feature = "pairing-vendored")]
+use crate::pairing_auth::{PairingAuth, PairingRole};
 
 /// AOSP pairing server implementation (for testing and peer acceptance).
 pub struct PairingServer {
@@ -41,14 +44,20 @@ impl PairingServer {
         if let Some(exported) = exported_key_material {
             pswd.extend_from_slice(exported);
         }
+        #[cfg(not(feature = "pairing-vendored"))]
         let mut spake = Spake2::new(
             SpakeRole::Bob,
             b"adb pair server\0",
             b"adb pair client\0",
             &pswd,
         );
+        #[cfg(feature = "pairing-vendored")]
+        let mut auth = PairingAuth::new(PairingRole::Server, &pswd)?;
 
+        #[cfg(not(feature = "pairing-vendored"))]
         let my_spake_msg = spake.generate_msg()?;
+        #[cfg(feature = "pairing-vendored")]
+        let my_spake_msg = auth.msg();
 
         let peer_packet = PairingPacket::read_from(transport)?;
         if peer_packet.packet_type != PairingPacketType::Spake2Msg {
@@ -58,8 +67,20 @@ impl PairingServer {
         let out_packet = PairingPacket::new(PairingPacketType::Spake2Msg, my_spake_msg)?;
         out_packet.write_to(transport)?;
 
-        let spake_key = spake.process_msg(&peer_packet.payload)?;
-        let mut cipher = PairingCipher::from_spake2_key(&spake_key)?;
+        #[cfg(not(feature = "pairing-vendored"))]
+        let mut cipher = {
+            let spake_key = spake.process_msg(&peer_packet.payload)?;
+            PairingCipher::from_spake2_key(&spake_key)?
+        };
+        #[cfg(feature = "pairing-vendored")]
+        let mut cipher = {
+            if !auth.init_cipher(&peer_packet.payload)? {
+                return Err(PairingError::Crypto(
+                    "SPAKE2 password mismatch (pairing_auth_init_cipher=false)".into(),
+                ));
+            }
+            auth
+        };
 
         let peer_info_packet = PairingPacket::read_from(transport)?;
         if peer_info_packet.packet_type != PairingPacketType::PeerInfo {

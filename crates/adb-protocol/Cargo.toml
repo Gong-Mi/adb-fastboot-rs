@@ -12,6 +12,12 @@ tls = ["dep:rcgen", "dep:rustls"]
 usb = []
 usb-rusb = ["usb", "dep:rusb"]
 usb-android = ["usb"]
+# pairing-vendored: replace the handwritten SPAKE2/AES pairing primitives with
+# the vendored AOSP pairing_auth C API on top of vendored BoringSSL.
+pairing-vendored = []
+
+[build-dependencies]
+cc = "1"
 
 [dependencies]
 libc = "0.2"

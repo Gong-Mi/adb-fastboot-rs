@@ -28,9 +28,13 @@ pub use constants::*;
 pub use header::{AdbMessageHeader, AuthType, HeaderError};
 pub use mdns::{parse_txt_record, AdbMdnsService, AdbMdnsServiceType, MdnsError};
 pub use pairing::{
-    validate_pairing_code, PairingCipher, PairingClient, PairingError, PairingPacket,
+    validate_pairing_code, PairingClient, PairingError, PairingPacket,
     PairingPacketType, MAX_PAIRING_PAYLOAD, PAIRING_HEADER_SIZE, PAIRING_VERSION,
 };
+#[cfg(not(feature = "pairing-vendored"))]
+pub use pairing::PairingCipher;
+#[cfg(feature = "pairing-vendored")]
+pub use pairing::PairingAuth;
 pub use shell_v2::{ShellV2Error, ShellV2Packet};
 pub use stls::{StlsAction, StlsError, StlsPacket, StlsState, StlsStateMachine};
 pub use sync::{

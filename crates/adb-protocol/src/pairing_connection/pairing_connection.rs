@@ -8,7 +8,10 @@ use rsa::RsaPrivateKey;
 use crate::pairing::{
     PairingError, PairingPacket, PairingPacketType, PeerInfo, validate_pairing_code,
 };
+#[cfg(not(feature = "pairing-vendored"))]
 use crate::pairing_auth::{PairingCipher, Spake2, SpakeRole};
+#[cfg(feature = "pairing-vendored")]
+use crate::pairing_auth::{PairingAuth, PairingRole};
 
 /// Paired ADB Keystore Certificate Persistence.
 #[derive(Debug, Clone)]
@@ -115,14 +118,22 @@ impl PairingClient {
         if let Some(exported) = exported_key_material {
             pswd.extend_from_slice(exported);
         }
+
+        #[cfg(not(feature = "pairing-vendored"))]
         let mut spake = Spake2::new(
             SpakeRole::Alice,
             b"adb pair client\0",
             b"adb pair server\0",
             &pswd,
         );
+        #[cfg(feature = "pairing-vendored")]
+        let mut auth = PairingAuth::new(PairingRole::Client, &pswd)?;
 
+        #[cfg(not(feature = "pairing-vendored"))]
         let my_spake_msg = spake.generate_msg()?;
+        #[cfg(feature = "pairing-vendored")]
+        let my_spake_msg = auth.msg();
+
         let out_packet = PairingPacket::new(PairingPacketType::Spake2Msg, my_spake_msg)?;
         out_packet.write_to(transport)?;
 
@@ -134,9 +145,21 @@ impl PairingClient {
             )));
         }
 
-        let spake_key = spake.process_msg(&peer_packet.payload)?;
-        // AOSP aes_128_gcm.cpp: HKDF-SHA256(salt=null, ikm=SPAKE2 output).
-        let mut cipher = PairingCipher::from_spake2_key(&spake_key)?;
+        #[cfg(not(feature = "pairing-vendored"))]
+        let mut cipher = {
+            let spake_key = spake.process_msg(&peer_packet.payload)?;
+            // AOSP aes_128_gcm.cpp: HKDF-SHA256(salt=null, ikm=SPAKE2 output).
+            PairingCipher::from_spake2_key(&spake_key)?
+        };
+        #[cfg(feature = "pairing-vendored")]
+        let mut cipher = {
+            if !auth.init_cipher(&peer_packet.payload)? {
+                return Err(PairingError::Crypto(
+                    "SPAKE2 password mismatch (pairing_auth_init_cipher=false)".into(),
+                ));
+            }
+            auth
+        };
 
         let rsa_key = match &self.rsa_key {
             Some(k) => k.clone(),

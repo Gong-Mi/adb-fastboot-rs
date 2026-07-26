@@ -231,8 +231,12 @@ pub fn validate_pairing_code(code: &str) -> Result<(), PairingError> {
 // Re-exports from sub-modules
 // ---------------------------------------------------------------------------
 
+#[cfg(not(feature = "pairing-vendored"))]
 pub use crate::pairing_auth::PairingCipher;
+#[cfg(not(feature = "pairing-vendored"))]
 pub use crate::pairing_auth::Spake2;
+#[cfg(feature = "pairing-vendored")]
+pub use crate::pairing_auth::PairingAuth;
 pub use crate::pairing_connection::{save_adb_keystore, AdbKeystore, PairingClient, PairingServer};
 
 #[cfg(test)]
@@ -240,6 +244,7 @@ mod tests {
     use super::*;
     use crate::auth;
     use std::io::Cursor;
+    #[cfg(not(feature = "pairing-vendored"))]
     use crate::pairing_auth::SpakeRole;
 
     #[test]
@@ -270,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "pairing-vendored"))]
     fn aosp_sequence_nonce_cipher_round_trip_and_no_nonce_on_wire() {
         let material = [7u8; 32];
         let mut enc = PairingCipher::from_spake2_key(&material).unwrap();
@@ -308,6 +314,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "pairing-vendored"))]
     fn spake2_key_exchange_matching_and_mismatched_passwords() {
         let mut alice =
             Spake2::new(SpakeRole::Alice, b"adb pair client\0", b"adb pair server\0", b"123456");
@@ -359,6 +366,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "pairing-vendored"))]
     fn full_pairing_client_server_exchange() {
         struct Pipe {
             read_buf: Vec<u8>,
@@ -443,5 +451,82 @@ mod tests {
         let client_key = spake_client.process_msg(&server_spake_msg).unwrap();
         let server_key = spake_server.process_msg(&client_spake_msg).unwrap();
         assert_eq!(client_key, server_key);
+    }
+
+    /// Full PairingClient <-> PairingServer exchange over an in-memory duplex
+    /// transport, backed by the vendored BoringSSL SPAKE2 + AES-128-GCM.
+    /// AOSP equivalent: pairing_connection_test.cpp round-trip.
+    #[test]
+    #[cfg(feature = "pairing-vendored")]
+    fn full_pairing_client_server_exchange_vendored() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        struct Channel {
+            tx: mpsc::Sender<Vec<u8>>,
+            rx: std::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+        }
+        impl Read for &Channel {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let mut data = self
+                    .rx
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed"))?;
+                let n = buf.len().min(data.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                if data.len() > n {
+                    // Re-queue the remainder for the next read.
+                    data.drain(..n);
+                    let _ = self.tx.send(data);
+                }
+                Ok(n)
+            }
+        }
+        impl Write for &Channel {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.tx
+                    .send(buf.to_vec())
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))?;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (c2s_tx, c2s_rx) = mpsc::channel::<Vec<u8>>();
+        let (s2c_tx, s2c_rx) = mpsc::channel::<Vec<u8>>();
+        let client_chan = Channel {
+            tx: c2s_tx,
+            rx: std::sync::Mutex::new(s2c_rx),
+        };
+        let server_chan = Channel {
+            tx: s2c_tx,
+            rx: std::sync::Mutex::new(c2s_rx),
+        };
+
+        let server_info = PeerInfo::from_device_info("DEVICE_123", "Android_Device");
+        let server_handle = thread::spawn(move || {
+            let mut server = PairingServer::new("123456", server_info).unwrap();
+            let mut transport = &server_chan;
+            server.execute_pairing(&mut transport).unwrap()
+        });
+
+        let client_handle = thread::spawn(move || {
+            let mut client = PairingClient::new("123456").unwrap();
+            let mut transport = &client_chan;
+            client.execute_pairing(&mut transport).unwrap()
+        });
+
+        let client_seen = client_handle.join().expect("client thread panicked");
+        let server_seen = server_handle.join().expect("server thread panicked");
+
+        // Client sees the server's device info; server sees the client's RSA pubkey.
+        let (serial, dev_name) = client_seen.parse_device_info();
+        assert_eq!(serial, "DEVICE_123");
+        assert_eq!(dev_name, "Android_Device");
+        assert_eq!(server_seen.info_type, ADB_RSA_PUB_KEY);
     }
 }

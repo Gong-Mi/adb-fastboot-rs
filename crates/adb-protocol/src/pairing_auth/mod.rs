@@ -1,12 +1,28 @@
 //! AOSP pairing authentication primitives, mirroring `vendor/adb/pairing_auth/`.
+//!
+//! With `pairing-vendored`, the production path is the vendored BoringSSL
+//! SPAKE2 + AES-128-GCM implementation (`pairing_auth_ffi`). The handwritten
+//! Rust curve25519/SPAKE2 modules remain for reference and for builds where
+//! the vendored C stack is unavailable; they are known-broken (see
+//! AOSP_PAIRING_EVIDENCE.md P0-5) and must not back production pairing.
+#[cfg(not(feature = "pairing-vendored"))]
 pub mod aes_128_gcm;
+#[cfg(not(feature = "pairing-vendored"))]
 pub mod pairing_auth;
 
+#[cfg(feature = "pairing-vendored")]
+pub mod pairing_auth_ffi;
+
 // Re-exports for convenience
+#[cfg(not(feature = "pairing-vendored"))]
 pub use aes_128_gcm::PairingCipher;
+#[cfg(not(feature = "pairing-vendored"))]
 pub use pairing_auth::{Spake2, SpakeRole};
 
-#[cfg(test)]
+#[cfg(feature = "pairing-vendored")]
+pub use pairing_auth_ffi::{PairingAuth, PairingRole};
+
+#[cfg(all(test, not(feature = "pairing-vendored")))]
 mod tests {
     use super::pairing_auth::ExtendedPoint;
 
