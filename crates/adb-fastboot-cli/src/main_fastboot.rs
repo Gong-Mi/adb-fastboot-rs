@@ -221,10 +221,10 @@ enum Commands {
         #[arg(value_parser = ["unlock", "lock", "unlock_critical", "lock_critical", "get_unlock_ability"])]
         action: String,
     },
-    /// GSI command
+    /// GSI command; AOSP forwards every positional argument as a colon-separated wire command.
     Gsi {
-        #[arg(value_parser = ["wipe", "disable", "status"])]
-        action: String,
+        #[arg(required = true, num_args = 1..)]
+        action: Vec<String>,
     },
     /// Flash all partitions from an update.zip package
     Update {
@@ -2298,10 +2298,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             };
-            transport.send_cmd(&format!("gsi:{action}"))?;
+            let command = format!("gsi:{}", action.join(":"));
+            transport.send_cmd(&command)?;
             let response = recv_and_print_info(&mut transport)?;
             if let fastboot_protocol::FastbootResponse::Fail(reason) = response {
-                return Err(format!("gsi:{action} failed: {reason}").into());
+                return Err(format!("{command} failed: {reason}").into());
             }
         }
     }
@@ -2499,6 +2500,16 @@ mod tests {
     #[test]
     fn aosp_stage_requires_an_input_file() {
         assert!(Cli::try_parse_from(["fastboot-rs", "stage"]).is_err());
+    }
+
+    #[test]
+    fn gsi_accepts_multiple_aosp_command_arguments() {
+        let cli = Cli::try_parse_from(["fastboot-rs", "gsi", "wipe", "vendor", "extra"])
+            .expect("AOSP forwards every gsi argument as a colon-separated command");
+        assert!(matches!(
+            cli.command,
+            Commands::Gsi { ref action } if action == &["wipe", "vendor", "extra"]
+        ));
     }
 
     #[test]
