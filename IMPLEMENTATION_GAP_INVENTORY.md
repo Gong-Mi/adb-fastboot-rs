@@ -6,9 +6,9 @@ This file separates design/implementation work from device acceptance. Passing u
 
 ## Current count
 
-There are 30 identified design items that are not fully landed in code:
+There are 29 identified design items that are not fully landed in code:
 
-- ADB: 9
+- ADB: 8
 - Fastboot CLI: 12
 - Fastboot protocol/image: 5
 - AIDL: 4
@@ -19,13 +19,12 @@ The count is an implementation-gap count, not an acceptance score.
 
 1. Complete `A_STLS` upgrade state machine.
 2. TLS transport integration and plaintext fallback state handling.
-3. Curve25519/BoringSSL-compatible SPAKE2 primitive.
-4. Pairing TLS/client/certificate persistence lifecycle.
-5. mDNS discovery (`_adb-tls-pairing`, `_adb-tls-connect`).
-6. ADB server USB watcher and hotplug lifecycle.
-7. Complete USB claim/reset/permission lifecycle.
-8. `exec-out`, PTY, and transport-feature parity.
-9. Install/uninstall host workflows.
+3. Pairing TLS/client/certificate persistence lifecycle.
+4. mDNS discovery (`_adb-tls-pairing`, `_adb-tls-connect`).
+5. ADB server USB watcher and hotplug lifecycle.
+6. Complete USB claim/reset/permission lifecycle.
+7. `exec-out`, PTY, and transport-feature parity.
+8. Install/uninstall host workflows.
 
 ## Fastboot CLI — 12 gaps
 
@@ -90,12 +89,13 @@ Already landed and therefore not counted as gaps here:
 
 Any C/C++ fallback must be vendored into this repository, including all required public/private headers and build metadata. A system-preinstalled library or header is not an acceptable final dependency. The vendored component must record its upstream source, exact version/commit, license, patches, and reproducible build command.
 
-1. SPAKE2: use a verified BoringSSL FFI/backend or port the exact primitive; do not invent a compatible-looking implementation.
-2. mDNS discovery: choose and integrate a real Android-compatible DNS-SD backend.
-3. USB daemon watcher: choose the Termux/usbfs/rusb ownership and hotplug model.
-4. AVB: vendor the AOSP C implementation with headers and build metadata, or implement a compatible Rust component.
-5. Filesystem generation: vendor the required C/C++ tools/library with headers, or invoke a repository-owned tool; do not rely on an untracked system binary.
-6. Full `flashall`/`update`: build the AOSP-like task and slot orchestration layer first.
+1. mDNS discovery: choose and integrate a real Android-compatible DNS-SD backend.
+2. USB daemon watcher: choose the Termux/usbfs/rusb ownership and hotplug model.
+3. AVB: vendor the AOSP C implementation with headers and build metadata, or implement a compatible Rust component.
+4. Filesystem generation: vendor the required C/C++ tools/library with headers, or invoke a repository-owned tool; do not rely on an untracked system binary.
+5. Full `flashall`/`update`: build the AOSP-like task and slot orchestration layer first.
+
+The SPAKE2 primitive is no longer a gap: production pairing defaults to the vendored AOSP `pairing_auth` C API and pinned BoringSSL backend. TLS pairing transport, mDNS discovery, and real-device acceptance remain separate gaps.
 
 ## Acceptance is intentionally separate
 
