@@ -42,6 +42,35 @@ fn reconnect_service(target: Option<&str>) -> Result<&'static str, String> {
     }
 }
 
+/// The only compression selection safe on the current V1 SYNC transfer path.
+///
+/// AOSP selects SEND_V2/RECV_V2 codecs only after checking adbd's advertised
+/// `sendrecv_v2*` features. This client does not retain those negotiated
+/// features after connecting, so requesting a codec must fail instead of being
+/// silently downgraded to an uncompressed V1 transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncCompressionOption {
+    None,
+}
+
+fn sync_compression_option(
+    algorithm: Option<&str>,
+    no_compress: bool,
+) -> Result<SyncCompressionOption, String> {
+    if no_compress && algorithm.is_some() {
+        return Err("-z and -Z cannot be used together".to_string());
+    }
+
+    match algorithm {
+        None | Some("none") => Ok(SyncCompressionOption::None),
+        Some("any" | "brotli" | "lz4" | "zstd") => Err(
+            "compression requires sendrecv_v2 feature negotiation, which is unavailable in this client"
+                .to_string(),
+        ),
+        Some(other) => Err(format!("unexpected compression type '{other}'")),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "adb-rs", author, version, about = "Rust ADB Command-Line Interface")]
 pub struct Cli {
@@ -96,7 +125,7 @@ pub enum Commands {
         /// Synchronize file timestamps (sync push only if newer)
         #[arg(long)]
         sync: bool,
-        /// Compression algorithm (ignored in this implementation)
+        /// Compression algorithm (`none` is supported; codecs require unavailable device feature negotiation)
         #[arg(short = 'z')]
         algorithm: Option<String>,
         /// Disable compression
@@ -110,7 +139,7 @@ pub enum Commands {
         /// Preserve file timestamp and mode
         #[arg(short = 'a')]
         preserve: bool,
-        /// Compression algorithm (ignored in this implementation)
+        /// Compression algorithm (`none` is supported; codecs require unavailable device feature negotiation)
         #[arg(short = 'z')]
         algorithm: Option<String>,
         /// Disable compression
@@ -868,14 +897,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Push { local, remote, sync, algorithm, no_compress } => {
             let serial = cli.serial.as_deref();
             if *sync {
-                eprintln!("[adb-rs] --sync flag ignored (not yet implemented in push)");
+                return Err("--sync is not implemented for push".into());
             }
-            if let Some(algo) = algorithm {
-                eprintln!("[adb-rs] -z {algo} ignored (compression not yet implemented)");
-            }
-            if *no_compress {
-                eprintln!("[adb-rs] -Z flag ignored (compression not yet implemented)");
-            }
+            let _compression = sync_compression_option(algorithm.as_deref(), *no_compress)?;
             match file_sync::push(serial, local, remote) {
                 Ok(()) => {}
                 Err(e) => {
@@ -889,12 +913,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if *preserve {
                 eprintln!("[adb-rs] -a flag ignored (preserve timestamps not yet implemented in pull)");
             }
-            if let Some(algo) = algorithm {
-                eprintln!("[adb-rs] -z {algo} ignored (compression not yet implemented)");
-            }
-            if *no_compress {
-                eprintln!("[adb-rs] -Z flag ignored (compression not yet implemented)");
-            }
+            let _compression = sync_compression_option(algorithm.as_deref(), *no_compress)?;
             match file_sync::pull(serial, remote, local) {
                 Ok(()) => {}
                 Err(e) => {
@@ -2013,6 +2032,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use crate::client::server_cmds::kill_server_at;
+
+    #[test]
+    fn sync_compression_accepts_explicit_no_compression() {
+        assert_eq!(sync_compression_option(Some("none"), false).unwrap(), SyncCompressionOption::None);
+        assert_eq!(sync_compression_option(None, true).unwrap(), SyncCompressionOption::None);
+    }
+
+    #[test]
+    fn sync_compression_rejects_enabled_codec_without_feature_negotiation() {
+        let error = sync_compression_option(Some("zstd"), false).unwrap_err();
+        assert!(error.contains("sendrecv_v2 feature negotiation"));
+        assert!(error.contains("unavailable"));
+    }
+
+    #[test]
+    fn sync_compression_rejects_unknown_algorithm() {
+        assert_eq!(
+            sync_compression_option(Some("snappy"), false).unwrap_err(),
+            "unexpected compression type 'snappy'"
+        );
+    }
 
     #[test]
     fn reconnect_offline_uses_aosp_host_service() {
