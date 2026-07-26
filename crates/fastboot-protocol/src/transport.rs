@@ -244,6 +244,32 @@ pub struct FastbootTcpTransport {
 }
 
 impl FastbootTcpTransport {
+    fn recv_length_prefixed_response_with_info(
+        &mut self,
+        info_logs: &mut Vec<String>,
+    ) -> Result<FastbootResponse, FastbootTransportError> {
+        loop {
+            let mut len_buf = [0u8; 8];
+            self.stream.read_exact(&mut len_buf)?;
+            let message_len = u64::from_be_bytes(len_buf) as usize;
+            if message_len > MAX_LENGTH_PREFIXED_PAYLOAD {
+                return Err(FastbootTransportError::Protocol(format!(
+                    "LengthPrefixed payload size {} exceeds maximum allowed limit ({})",
+                    message_len, MAX_LENGTH_PREFIXED_PAYLOAD
+                )));
+            }
+
+            let mut message = vec![0; message_len];
+            self.stream.read_exact(&mut message)?;
+            match FastbootResponse::parse(&message)? {
+                FastbootResponse::Info(message) | FastbootResponse::Text(message) => {
+                    info_logs.push(message);
+                }
+                response => return Ok(response),
+            }
+        }
+    }
+
     /// Perform the FB01 handshake to detect the protocol mode.
     ///
     /// Sends "FB01" (4 bytes), then attempts to read a 4-byte response
@@ -444,6 +470,10 @@ impl FastbootTcpTransport {
         &mut self,
         info_logs: &mut Vec<String>,
     ) -> Result<FastbootResponse, FastbootTransportError> {
+        if self.mode == FbMode::LengthPrefixed {
+            return self.recv_length_prefixed_response_with_info(info_logs);
+        }
+
         let mut accum = Vec::new();
         if self.read_pos < self.read_buf.len() {
             accum.extend_from_slice(&self.read_buf[self.read_pos..]);
@@ -955,6 +985,40 @@ mod tests {
             .to_string()
             .contains("exceeds maximum allowed limit"));
 
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_length_prefixed_info_payload_does_not_split_on_status_text() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut handshake_buf = [0u8; 4];
+            socket.read_exact(&mut handshake_buf).unwrap();
+            assert_eq!(&handshake_buf, b"FB01");
+            socket.write_all(b"FB01").unwrap();
+
+            let mut len_buf = [0u8; 8];
+            socket.read_exact(&mut len_buf).unwrap();
+            let cmd_len = u64::from_be_bytes(len_buf) as usize;
+            let mut cmd_buf = vec![0u8; cmd_len];
+            socket.read_exact(&mut cmd_buf).unwrap();
+
+            for message in [b"INFOprogress OKAY still working".as_slice(), b"OKAYdone".as_slice()] {
+                socket.write_all(&(message.len() as u64).to_be_bytes()).unwrap();
+                socket.write_all(message).unwrap();
+            }
+        });
+
+        let mut transport = FastbootTcpTransport::connect(local_addr.to_string()).unwrap();
+        transport.send_cmd("getvar:version").unwrap();
+        let mut info_logs = Vec::new();
+        let response = transport.recv_response_with_info(&mut info_logs).unwrap();
+
+        assert_eq!(info_logs, vec!["progress OKAY still working".to_string()]);
+        assert_eq!(response, FastbootResponse::Okay("done".to_string()));
         handle.join().unwrap();
     }
 }
