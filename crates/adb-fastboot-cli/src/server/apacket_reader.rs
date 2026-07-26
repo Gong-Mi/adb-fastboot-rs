@@ -114,10 +114,10 @@ impl APacketReader {
             return;
         }
 
-        let header = match AdbMessageHeader::decode(self.header_.data()) {
-            Ok(h) => h,
-            Err(_) => { self.prepare_next(); return; }
-        };
+        // AOSP APacketReader assembles the raw amessage here and defers magic
+        // validation to transport.cpp::check_header(). Keep framing separate
+        // from transport-level validation for the same handoff.
+        let header = Self::decode_framing_header(self.header_.data());
 
         if header.data_length > MAX_PAYLOAD {
             self.prepare_next();
@@ -170,9 +170,24 @@ impl APacketReader {
     }
 
     fn prepare_next(&mut self) {
-        self.header_.clear();
+        // types.h::Block::rewind() retains the fixed header allocation and
+        // resets only its cursor. This is required before recursive parsing of
+        // residual bytes from a merged payload/header block.
+        self.header_.rewind();
         self.packet_ = None;
         self.payload_ = None;
+    }
+
+    fn decode_framing_header(buf: &[u8]) -> AdbMessageHeader {
+        debug_assert_eq!(buf.len(), AdbMessageHeader::SIZE);
+        AdbMessageHeader {
+            command: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            arg0: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            arg1: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            data_length: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            data_check: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            magic: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+        }
     }
 
     pub fn drain_packets(&mut self) -> Vec<AdbPacket> {
@@ -358,10 +373,16 @@ mod tests {
     }
 
     #[test]
-    fn test_corrupt() {
+    fn test_preserves_invalid_magic_for_transport_validation() {
+        // AOSP APacketReader only bounds-checks data_length before assembling
+        // the apacket; transport.cpp::check_header() validates magic later.
         let mut raw = encode(A_OKAY, b"data");
         raw[20] ^= 0xff;
-        assert!(APacketReader::new().add_bytes(&raw).is_empty());
+
+        let packets = APacketReader::new().add_bytes(&raw);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].header.magic, !A_OKAY ^ 0xff);
+        assert_eq!(packets[0].payload, b"data");
     }
 
     #[test]
@@ -374,10 +395,20 @@ mod tests {
 
     #[test]
     fn test_chainsaw() {
-        // Known edge case: extreme fragmentation across chunk boundaries.
-        // Real TCP streams handle reassembly at OS level; this test validated
-        // during development but is skipped for CI.
-        // TODO: fix header residual in process_block recursion
+        // apacket_reader.h requires arbitrary chopping/merging boundaries.
+        // End the first block after one byte of the following header to exercise
+        // recursive residual-header parsing after the first payload completes.
+        let first = encode(A_OKAY, b"payload");
+        let second = encode(A_CLSE, b"next");
+        let split = first.len() + 1;
+        let merged = [first, second].concat();
+        let mut reader = APacketReader::new();
+
+        assert_eq!(reader.add_bytes(&merged[..split]).len(), 1);
+        let packets = reader.add_bytes(&merged[split..]);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].header.command, A_CLSE);
+        assert_eq!(packets[0].payload, b"next");
     }
 
     #[test]
