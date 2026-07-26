@@ -12,29 +12,17 @@ pub struct PairingCipher {
 }
 
 impl PairingCipher {
+    /// AOSP `aes_128_gcm.cpp`: HKDF-SHA256 with null salt, IKM = SPAKE2 output,
+    /// info = "adb pairing_auth aes-128-gcm key". The TLS exporter is never
+    /// mixed in here; AOSP binds it earlier by appending it to the SPAKE
+    /// password in `pairing_connection.cpp`.
     pub fn from_spake2_key(key_material: &[u8]) -> Result<Self, PairingError> {
-        Self::from_spake2_and_exported_key(key_material, None)
-    }
-
-    pub fn from_spake2_and_exported_key(
-        spake2_key: &[u8],
-        exported_key_material: Option<&[u8]>,
-    ) -> Result<Self, PairingError> {
-        if spake2_key.is_empty() {
+        if key_material.is_empty() {
             return Err(PairingError::Crypto("empty SPAKE2 key material".into()));
         }
-        let (salt_bytes, ikm_bytes) = match exported_key_material {
-            Some(exp) => {
-                let mut combined = Vec::with_capacity(spake2_key.len() + exp.len());
-                combined.extend_from_slice(spake2_key);
-                combined.extend_from_slice(exp);
-                (exp, combined)
-            }
-            None => (&[][..], spake2_key.to_vec()),
-        };
 
-        let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, salt_bytes);
-        let prk = salt.extract(&ikm_bytes);
+        let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]);
+        let prk = salt.extract(key_material);
         let okm = prk
             .expand(&[b"adb pairing_auth aes-128-gcm key"], Key16)
             .map_err(|_| PairingError::Crypto("HKDF expansion failed".into()))?;

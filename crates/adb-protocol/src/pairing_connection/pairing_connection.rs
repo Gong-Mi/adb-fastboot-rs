@@ -109,11 +109,17 @@ impl PairingClient {
         transport: &mut T,
         exported_key_material: Option<&[u8]>,
     ) -> Result<PeerInfo, PairingError> {
+        // AOSP pairing_connection.cpp: append the 64-byte TLS exporter to the
+        // password BEFORE SPAKE, so the PAKE transcript binds this TLS channel.
+        let mut pswd = self.code.clone().into_bytes();
+        if let Some(exported) = exported_key_material {
+            pswd.extend_from_slice(exported);
+        }
         let mut spake = Spake2::new(
             SpakeRole::Alice,
-            b"adb pair client",
-            b"adb pair server",
-            &self.code,
+            b"adb pair client\0",
+            b"adb pair server\0",
+            &pswd,
         );
 
         let my_spake_msg = spake.generate_msg()?;
@@ -129,8 +135,8 @@ impl PairingClient {
         }
 
         let spake_key = spake.process_msg(&peer_packet.payload)?;
-        let mut cipher =
-            PairingCipher::from_spake2_and_exported_key(&spake_key, exported_key_material)?;
+        // AOSP aes_128_gcm.cpp: HKDF-SHA256(salt=null, ikm=SPAKE2 output).
+        let mut cipher = PairingCipher::from_spake2_key(&spake_key)?;
 
         let rsa_key = match &self.rsa_key {
             Some(k) => k.clone(),

@@ -27,11 +27,25 @@ impl PairingServer {
         &mut self,
         transport: &mut T,
     ) -> Result<PeerInfo, PairingError> {
+        self.execute_pairing_with_exported_keys(transport, None)
+    }
+
+    pub fn execute_pairing_with_exported_keys<T: Read + Write>(
+        &mut self,
+        transport: &mut T,
+        exported_key_material: Option<&[u8]>,
+    ) -> Result<PeerInfo, PairingError> {
+        // AOSP pairing_connection.cpp: exporter is appended to the password
+        // before SPAKE (mirrors the client-side binding).
+        let mut pswd = self.code.clone().into_bytes();
+        if let Some(exported) = exported_key_material {
+            pswd.extend_from_slice(exported);
+        }
         let mut spake = Spake2::new(
             SpakeRole::Bob,
-            b"adb pair server",
-            b"adb pair client",
-            &self.code,
+            b"adb pair server\0",
+            b"adb pair client\0",
+            &pswd,
         );
 
         let my_spake_msg = spake.generate_msg()?;

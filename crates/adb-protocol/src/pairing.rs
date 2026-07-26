@@ -310,9 +310,9 @@ mod tests {
     #[test]
     fn spake2_key_exchange_matching_and_mismatched_passwords() {
         let mut alice =
-            Spake2::new(SpakeRole::Alice, b"adb pair client", b"adb pair server", "123456");
+            Spake2::new(SpakeRole::Alice, b"adb pair client\0", b"adb pair server\0", b"123456");
         let mut bob =
-            Spake2::new(SpakeRole::Bob, b"adb pair server", b"adb pair client", "123456");
+            Spake2::new(SpakeRole::Bob, b"adb pair server\0", b"adb pair client\0", b"123456");
 
         let msg_alice = alice.generate_msg().unwrap();
         let msg_bob = bob.generate_msg().unwrap();
@@ -328,10 +328,10 @@ mod tests {
 
         // Mismatched password
         let mut charlie =
-            Spake2::new(SpakeRole::Bob, b"adb pair server", b"adb pair client", "654321");
+            Spake2::new(SpakeRole::Bob, b"adb pair server\0", b"adb pair client\0", b"654321");
         let msg_charlie = charlie.generate_msg().unwrap();
         let mut alice2 =
-            Spake2::new(SpakeRole::Alice, b"adb pair client", b"adb pair server", "123456");
+            Spake2::new(SpakeRole::Alice, b"adb pair client\0", b"adb pair server\0", b"123456");
         let _ = alice2.generate_msg().unwrap();
 
         let key_alice2 = alice2.process_msg(&msg_charlie).unwrap();
@@ -434,10 +434,10 @@ mod tests {
 
         // 1. Client writes Spake2Msg
         let mut spake_client =
-            Spake2::new(SpakeRole::Alice, b"adb pair client", b"adb pair server", "123456");
+            Spake2::new(SpakeRole::Alice, b"adb pair client\0", b"adb pair server\0", b"123456");
         let client_spake_msg = spake_client.generate_msg().unwrap();
         let mut spake_server =
-            Spake2::new(SpakeRole::Bob, b"adb pair server", b"adb pair client", "123456");
+            Spake2::new(SpakeRole::Bob, b"adb pair server\0", b"adb pair client\0", b"123456");
         let server_spake_msg = spake_server.generate_msg().unwrap();
 
         let client_key = spake_client.process_msg(&server_spake_msg).unwrap();

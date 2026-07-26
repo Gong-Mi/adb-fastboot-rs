@@ -592,9 +592,9 @@ pub struct Spake2 {
 }
 
 impl Spake2 {
-    pub fn new(role: SpakeRole, my_name: &[u8], their_name: &[u8], password: &str) -> Self {
+    pub fn new(role: SpakeRole, my_name: &[u8], their_name: &[u8], password: &[u8]) -> Self {
         let mut ctx = Context::new(&SHA512);
-        ctx.update(password.as_bytes());
+        ctx.update(password);
         let digest = ctx.finish();
         let mut password_hash = [0u8; 64];
         password_hash.copy_from_slice(digest.as_ref());
@@ -630,7 +630,6 @@ impl Spake2 {
         };
 
         let p_star = p_pt.add(&mask_pt).encode();
-        eprintln!("generate_msg for {:?}: p_pt.x={:?} mask_pt.x={:?} p_star={:?}", self.role, &p_pt.encode()[..4], &mask_pt.encode()[..4], &p_star[..4]);
         self.my_msg = p_star;
         Ok(self.my_msg.to_vec())
     }
