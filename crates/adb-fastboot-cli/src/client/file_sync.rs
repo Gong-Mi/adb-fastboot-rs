@@ -20,6 +20,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use adb_protocol::{
@@ -100,6 +101,7 @@ pub fn pull(
     serial: Option<&str>,
     remote: &str,
     local: &str,
+    preserve: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Priority 1: ADB server
     let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
@@ -107,7 +109,7 @@ pub fn pull(
         if server.switch_transport(serial).is_ok() {
             server.send_host_request("sync:")?;
             server.read_status()?;
-            return pull_file_server(&mut server, remote, local);
+            return pull_file_server(&mut server, remote, local, preserve);
         }
     }
 
@@ -116,7 +118,7 @@ pub fn pull(
     let (_info, mut transport) =
         connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
     let (local_id, remote_id) = protocol::open_service(&mut transport, "sync:", 1)?;
-    pull_file_direct(&mut transport, local_id, remote_id, remote, local)
+    pull_file_direct(&mut transport, local_id, remote_id, remote, local, preserve)
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +274,7 @@ pub fn pull_dir(
     // Pull each file — open a new sync connection per pull
     // (Each `pull()` call handles server-first/direct fallback)
     for pair in &entries {
-        pull(serial, &pair.remote, &pair.local)?;
+        pull(serial, &pair.remote, &pair.local, false)?;
     }
 
     println!("[adb-rs] Pull complete: '{}' -> '{}'", remote_dir, local_dir);
@@ -520,83 +522,127 @@ fn pull_file_direct(
     remote_id: u32,
     remote: &str,
     local: &str,
+    preserve: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("[adb-rs] Pulling '{}' -> '{}'", remote, local);
+    let attrs = if preserve {
+        Some(stat_direct_inner(transport, local_id, remote_id, remote)?)
+    } else {
+        None
+    };
 
-    // Build RECV request
     let mut recv_buf = Vec::new();
     build_sync_recv_req(remote, &mut recv_buf)
         .map_err(|e| format!("Build RECV req failed: {e}"))?;
     protocol::send_wrte(transport, local_id, remote_id, &recv_buf)?;
 
-    // Read DATA chunks until DONE or FAIL
     let mut file_data = Vec::new();
     loop {
         let (hdr, payload) = transport.recv_message()?;
-
         match hdr.command {
-            A_OKAY => {
-                // WRTE ack — skip, continue reading
-            }
+            A_OKAY => {}
             A_WRTE => {
-                // Ack the WRTE
                 let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-
-                if payload.len() < 8 {
+                transport.send_message(&ack, &[])?;
+                if payload.len() < SyncMessageHeader::SIZE {
                     return Err("Sync response too short during pull".into());
                 }
-
                 let sync_hdr = SyncMessageHeader::decode(&payload)
                     .map_err(|e| format!("Bad sync header during pull: {e}"))?;
-
                 match sync_hdr.id {
-                    SYNC_DATA => {
-                        // Accumulate file data
-                        let data = &payload[8..];
-                        file_data.extend_from_slice(data);
-                    }
-                    SYNC_DENT => {
-                        // DENT response — file info, not expected here
-                        file_data.extend_from_slice(&payload[8..]);
-                    }
-                    SYNC_OKAY => {
-                        // Transfer complete
-                        break;
-                    }
-                    SYNC_FAIL => {
-                        let msg = String::from_utf8_lossy(&payload[8..]).to_string();
-                        return Err(format!("Sync FAIL during pull: {msg}").into());
-                    }
-                    other => {
-                        return Err(format!("Unexpected sync id {other:#x} during pull").into());
-                    }
+                    SYNC_DATA => file_data.extend_from_slice(&payload[SyncMessageHeader::SIZE..]),
+                    // AOSP RECV ends with DONE; retain OKAY for existing peers.
+                    SYNC_DONE | SYNC_OKAY => break,
+                    SYNC_FAIL => return Err(format!(
+                        "Sync FAIL during pull: {}",
+                        String::from_utf8_lossy(&payload[SyncMessageHeader::SIZE..])
+                    ).into()),
+                    other => return Err(format!("Unexpected sync id {other:#x} during pull").into()),
                 }
             }
-            A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                // If we have data, it's a normal close after transfer
-                if !file_data.is_empty() {
-                    break;
-                }
-                return Err("Sync connection closed prematurely".into());
-            }
+            A_CLSE => return Err("Sync connection closed prematurely".into()),
             _ => {}
         }
     }
 
-    // Write received data to local file
     let local_path = Path::new(local);
     if let Some(parent) = local_path.parent() {
-        std::fs::create_dir_all(parent)
+        fs::create_dir_all(parent)
             .map_err(|e| format!("Cannot create directory '{}': {e}", parent.display()))?;
     }
-    std::fs::write(local_path, &file_data)
+    fs::write(local_path, &file_data)
         .map_err(|e| format!("Cannot write local file '{local}': {e}"))?;
+    if let Some(attrs) = attrs {
+        set_time_and_mode(local_path, attrs.mtime, attrs.mode)?;
+    }
 
     println!("[adb-rs] Pull complete: '{}' -> '{}' ({} bytes)", remote, local, file_data.len());
     Ok(())
+}
+
+/// Preserve the subset of remote attributes that AOSP `adb pull -a` applies:
+/// mtime and permission bits. The process umask is sampled under a lock because
+/// POSIX exposes no non-mutating umask getter.
+fn set_time_and_mode(path: &Path, mtime: u32, mode: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())?;
+    let times = libc::utimbuf { actime: mtime as libc::time_t, modtime: mtime as libc::time_t };
+    if unsafe { libc::utime(c_path.as_ptr(), &times) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    static UMASK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = UMASK_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let umask = unsafe { libc::umask(0) };
+    unsafe { libc::umask(umask) };
+    fs::set_permissions(path, fs::Permissions::from_mode((mode & 0o7777) & !umask))?;
+    Ok(())
+}
+
+/// STAT without closing the already-open direct SYNC channel.
+fn stat_direct_inner(
+    transport: &mut dyn Transport,
+    local_id: u32,
+    remote_id: u32,
+    remote_path: &str,
+) -> Result<FileStat, Box<dyn std::error::Error>> {
+    let mut req_buf = Vec::new();
+    build_sync_stat_req(remote_path, &mut req_buf)
+        .map_err(|e| format!("Build STAT req failed: {e}"))?;
+    protocol::send_wrte(transport, local_id, remote_id, &req_buf)?;
+
+    loop {
+        let (hdr, payload) = transport.recv_message()?;
+        match hdr.command {
+            A_OKAY => {}
+            A_WRTE => {
+                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
+                transport.send_message(&ack, &[])?;
+                if payload.len() < SyncMessageHeader::SIZE {
+                    return Err("Sync response too short during stat".into());
+                }
+                let sync_hdr = SyncMessageHeader::decode(&payload)
+                    .map_err(|e| format!("Bad sync header during stat: {e}"))?;
+                match sync_hdr.id {
+                    SYNC_STAT => {
+                        let s = SyncStatResponse::decode(&payload[SyncMessageHeader::SIZE..])
+                            .map_err(|e| format!("Bad STAT response: {e}"))?;
+                        return Ok(FileStat { mode: s.mode, size: s.size, mtime: s.mtime });
+                    }
+                    SYNC_FAIL => return Err(format!(
+                        "Sync FAIL during stat: {}",
+                        String::from_utf8_lossy(&payload[SyncMessageHeader::SIZE..])
+                    ).into()),
+                    other => return Err(format!("Unexpected sync id {other:#x} during stat").into()),
+                }
+            }
+            A_CLSE => return Err("Sync connection closed during stat".into()),
+            _ => {}
+        }
+    }
 }
 
 /// Push multiple files via a single direct-mode sync connection.
@@ -905,8 +951,10 @@ fn pull_file_server(
     transport: &mut dyn Transport,
     remote: &str,
     local: &str,
+    preserve: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("[adb-rs] Pulling '{}' -> '{}'", remote, local);
+    let attrs = if preserve { Some(stat_server(transport, remote)?) } else { None };
 
     // Build and send RECV request
     let mut recv_buf = Vec::new();
@@ -927,8 +975,8 @@ fn pull_file_server(
                 // DENT response — file metadata, not expected for single-file pull
                 file_data.extend_from_slice(&payload);
             }
-            SYNC_OKAY => {
-                // Transfer complete
+            SYNC_DONE | SYNC_OKAY => {
+                // AOSP RECV terminates with DONE; retain OKAY for existing peers.
                 break;
             }
             SYNC_FAIL => {
@@ -949,6 +997,9 @@ fn pull_file_server(
     }
     std::fs::write(local_path, &file_data)
         .map_err(|e| format!("Cannot write local file '{local}': {e}"))?;
+    if let Some(attrs) = attrs {
+        set_time_and_mode(local_path, attrs.mtime, attrs.mode)?;
+    }
 
     println!("[adb-rs] Pull complete: '{}' -> '{}' ({} bytes)", remote, local, file_data.len());
     Ok(())
@@ -1109,5 +1160,91 @@ fn stat_server(
                 return Err(format!("Unexpected sync id {other:#x} during stat").into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Read, Write};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    struct ScriptedTransport {
+        reads: Cursor<Vec<u8>>,
+        writes: Vec<u8>,
+    }
+
+    impl Read for ScriptedTransport {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.read(buf)
+        }
+    }
+
+    impl Write for ScriptedTransport {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Transport for ScriptedTransport {}
+
+    fn adb_frame(command: u32, arg0: u32, arg1: u32, payload: &[u8]) -> Vec<u8> {
+        let header = AdbMessageHeader::new(command, arg0, arg1, payload);
+        let mut encoded = [0u8; 24];
+        header.encode(&mut encoded);
+        [encoded.as_slice(), payload].concat()
+    }
+
+    #[test]
+    fn pull_with_preserve_stats_then_receives_and_applies_remote_mtime_and_mode() {
+        let mut stat_payload = Vec::new();
+        let stat = SyncStatResponse { mode: 0o100600, size: 6, mtime: 1_720_000_000 };
+        let mut encoded_stat = [0u8; SyncStatResponse::SIZE];
+        stat.encode(&mut encoded_stat);
+        let mut stat_header = [0u8; SyncMessageHeader::SIZE];
+        SyncMessageHeader::new(SYNC_STAT, SyncStatResponse::SIZE as u32).encode(&mut stat_header);
+        stat_payload.extend_from_slice(&stat_header);
+        stat_payload.extend_from_slice(&encoded_stat);
+
+        let mut data_payload = Vec::new();
+        build_sync_data_chunk(b"pulled", &mut data_payload).unwrap();
+        let mut done_payload = [0u8; SyncMessageHeader::SIZE];
+        SyncMessageHeader::new(SYNC_DONE, 0).encode(&mut done_payload);
+
+        let script = [
+            adb_frame(A_OKAY, 2, 1, &[]),
+            adb_frame(A_WRTE, 2, 1, &stat_payload),
+            adb_frame(A_OKAY, 2, 1, &[]),
+            adb_frame(A_WRTE, 2, 1, &data_payload),
+            adb_frame(A_WRTE, 2, 1, &done_payload),
+        ]
+        .concat();
+        let mut transport = ScriptedTransport { reads: Cursor::new(script), writes: Vec::new() };
+        let destination = std::env::temp_dir().join(format!("adb-rs-preserve-{}", std::process::id()));
+        let _ = fs::remove_file(&destination);
+
+        pull_file_direct(&mut transport, 1, 2, "/remote/file", destination.to_str().unwrap(), true).unwrap();
+
+        let metadata = fs::metadata(&destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"pulled");
+        assert_eq!(metadata.mtime(), 1_720_000_000);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        let stat_request = AdbMessageHeader::decode(&transport.writes[..24]).unwrap();
+        assert_eq!(stat_request.command, A_WRTE);
+        assert_eq!(SyncMessageHeader::decode(&transport.writes[24..]).unwrap().id, SYNC_STAT);
+        let recv_offset = 24 + stat_request.data_length as usize + 24;
+        let recv_request = AdbMessageHeader::decode(&transport.writes[recv_offset..]).unwrap();
+        assert_eq!(recv_request.command, A_WRTE);
+        assert_eq!(
+            SyncMessageHeader::decode(&transport.writes[recv_offset + 24..]).unwrap().id,
+            adb_protocol::SYNC_RECV
+        );
+        let _ = fs::remove_file(destination);
     }
 }

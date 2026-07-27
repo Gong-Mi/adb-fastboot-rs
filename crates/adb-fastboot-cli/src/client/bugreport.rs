@@ -127,7 +127,7 @@ pub fn do_bugreport(
         format!("{}/{}", dest_dir, dest_file)
     };
 
-    file_sync::pull(Some(serial), &device_path, &final_dest)?;
+    file_sync::pull(Some(serial), &device_path, &final_dest, false)?;
     println!("Bug report copied to {}", final_dest);
 
     Ok(BugreportResult { saved_path: final_dest })
