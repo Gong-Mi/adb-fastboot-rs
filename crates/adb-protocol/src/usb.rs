@@ -225,7 +225,10 @@ pub fn parse_adb_interface_descriptors(
                         return Ok(complete_endpoint_info(number, in_ep, out_ep, packet_size)?.unwrap());
                     }
                 }
-                if is_adb_interface(descriptor[5], descriptor[6], descriptor[7]) {
+                // ADB discovery operates on the active/default alternate
+                // setting. AOSP's libusb backend deliberately inspects only
+                // `interface.altsetting[0]` and does not issue SET_INTERFACE.
+                if descriptor[3] == 0 && is_adb_interface(descriptor[5], descriptor[6], descriptor[7]) {
                     candidate = Some((descriptor[2], None, None, None));
                 }
             }
@@ -405,7 +408,7 @@ impl RusbUsbTransport {
         let mut candidates = Vec::new();
         for device in devices.iter() {
             let config = match device.active_config_descriptor() { Ok(config) => config, _ => continue };
-            if config.interfaces().flat_map(|i| i.descriptors()).any(|d| is_adb_interface(d.class_code(), d.sub_class_code(), d.protocol_code())) {
+            if config.interfaces().flat_map(|i| i.descriptors()).any(|d| d.setting_number() == 0 && is_adb_interface(d.class_code(), d.sub_class_code(), d.protocol_code())) {
                 let serial = device.open().ok().and_then(|handle| device.device_descriptor().ok().and_then(|d| handle.read_serial_number_string_ascii(&d).ok()));
                 candidates.push(RusbAdbCandidate { serial, bus_number: device.bus_number(), address: device.address() });
             }
@@ -434,7 +437,7 @@ impl RusbUsbTransport {
             let mut interface_number = None;
             for interface in config.interfaces() {
                 for descriptor in interface.descriptors() {
-                    if is_adb_interface(descriptor.class_code(), descriptor.sub_class_code(), descriptor.protocol_code()) {
+                    if descriptor.setting_number() == 0 && is_adb_interface(descriptor.class_code(), descriptor.sub_class_code(), descriptor.protocol_code()) {
                         interface_number = Some(descriptor.interface_number());
                         break;
                     }
@@ -478,7 +481,7 @@ fn descriptor_info(
 ) -> Result<UsbEndpointInfo, RusbUsbTransportError> {
     let interface = config.interfaces().find(|i| i.number() == interface_number)
         .ok_or_else(|| RusbUsbTransportError::Descriptor(UsbTransportError::NoAdbInterface))?;
-    let descriptor = interface.descriptors().find(|d| is_adb_interface(d.class_code(), d.sub_class_code(), d.protocol_code()))
+    let descriptor = interface.descriptors().find(|d| d.setting_number() == 0 && is_adb_interface(d.class_code(), d.sub_class_code(), d.protocol_code()))
         .ok_or_else(|| RusbUsbTransportError::Descriptor(UsbTransportError::NoAdbInterface))?;
     let mut bulk_in = None;
     let mut bulk_out = None;
@@ -562,6 +565,18 @@ mod tests {
     fn rejects_non_bulk_only_interface() {
         let descriptors = vec![9, 4, 3, 0, 1, 0xff, 0x42, 1, 0, 7, 5, 0x81, 3, 64, 0, 0];
         assert_eq!(parse_adb_interface_descriptors(&descriptors), Err(UsbTransportError::MissingBulkEndpoint { interface_number: 3, missing: "IN" }));
+    }
+
+    #[test]
+    fn ignores_adb_endpoints_only_present_in_inactive_alternate_setting() {
+        // AOSP's libusb client inspects `interface.altsetting[0]`; it does not
+        // select a non-default alternate setting while discovering ADB.
+        let descriptors = vec![
+            9, 4, 3, 1, 2, 0xff, 0x42, 1, 0,
+            7, 5, 0x83, 2, 64, 0, 0,
+            7, 5, 0x02, 2, 64, 0, 0,
+        ];
+        assert_eq!(parse_adb_interface_descriptors(&descriptors), Err(UsbTransportError::NoAdbInterface));
     }
 
     #[test]
