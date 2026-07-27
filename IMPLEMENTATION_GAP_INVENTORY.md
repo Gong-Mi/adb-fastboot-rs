@@ -15,7 +15,7 @@ There are 29 identified design items that are not fully landed in code:
 
 The count is an implementation-gap count, not an acceptance score.
 
-## ADB — 9 gaps
+## ADB — 8 gaps
 
 1. Complete `A_STLS` upgrade state machine.
 2. TLS transport integration and plaintext fallback state handling.
