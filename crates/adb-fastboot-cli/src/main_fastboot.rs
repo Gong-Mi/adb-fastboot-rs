@@ -95,6 +95,16 @@ enum Commands {
         #[arg(short = 'l', long)]
         long: bool,
     },
+    /// Validate and persist a TCP or UDP Fastboot network target.
+    Connect {
+        /// Network serial in AOSP form: tcp:HOST:PORT or udp:HOST:PORT.
+        target: String,
+    },
+    /// Remove one persisted network target, or all targets when omitted.
+    Disconnect {
+        /// Optional network serial in AOSP form: tcp:HOST:PORT or udp:HOST:PORT.
+        target: Option<String>,
+    },
     /// Get variable value from bootloader
     Getvar {
         variable: String,
@@ -238,6 +248,99 @@ fn resolve_target_addr(serial: Option<&str>, default_port: u16) -> String {
         Some(s) if s.contains(':') => s.to_string(),
         Some(s) => format!("{}:{}", s, default_port),
         None => format!("127.0.0.1:{}", default_port),
+    }
+}
+
+/// Parse the network serial form accepted by AOSP `fastboot connect`.
+///
+/// AOSP `ParseNetworkSerial` accepts only `tcp:` and `udp:` prefixes, then
+/// validates a host and port. This CLI returns the protocol and the transport
+/// address without its protocol prefix.
+fn parse_network_target(serial: &str) -> Result<(&str, String), String> {
+    let (protocol, address) = if let Some(address) = serial.strip_prefix("tcp:") {
+        ("tcp", address)
+    } else if let Some(address) = serial.strip_prefix("udp:") {
+        ("udp", address)
+    } else {
+        return Err(format!(
+            "protocol prefix ('tcp:' or 'udp:') is missing: {serial}"
+        ));
+    };
+
+    if address.is_empty() {
+        return Err(format!("invalid network address '{address}'"));
+    }
+
+    let (host, port) = if let Some(bracketed) = address.strip_prefix('[') {
+        bracketed
+            .split_once("]:")
+            .ok_or_else(|| format!("invalid network address '{address}'"))?
+    } else {
+        address
+            .rsplit_once(':')
+            .ok_or_else(|| format!("invalid network address '{address}'"))?
+    };
+    if host.is_empty() || port.parse::<u16>().is_err() {
+        return Err(format!("invalid network address '{address}'"));
+    }
+
+    Ok((protocol, address.to_string()))
+}
+
+/// AOSP ConnectedDevicesStorage uses `$HOME/.fastboot/devices` and stores a
+/// sorted set, one serial per line (fastboot.cpp:468-474; storage.cpp:26-52).
+fn connected_devices_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    Ok(std::path::PathBuf::from(home).join(".fastboot/devices"))
+}
+
+fn read_connected_devices(
+    path: &std::path::Path,
+) -> std::io::Result<std::collections::BTreeSet<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents.lines().map(str::to_owned).collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_connected_devices(
+    path: &std::path::Path,
+    devices: &std::collections::BTreeSet<String>,
+) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("devices path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let contents = devices.iter().cloned().collect::<Vec<_>>().join("\n");
+    std::fs::write(path, format!("{contents}\n"))
+}
+
+fn store_connected_device(path: &std::path::Path, serial: &str) -> std::io::Result<()> {
+    let mut devices = read_connected_devices(path)?;
+    devices.insert(serial.to_string());
+    write_connected_devices(path, &devices)
+}
+
+fn remove_connected_device(path: &std::path::Path, serial: Option<&str>) -> std::io::Result<()> {
+    if let Some(serial) = serial {
+        let mut devices = read_connected_devices(path)?;
+        devices.remove(serial);
+        if devices.is_empty() {
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        } else {
+            write_connected_devices(path, &devices)
+        }
+    } else {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1512,6 +1615,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cli.command {
+        Commands::Connect { target } => {
+            let (protocol, address) = parse_network_target(&target)?;
+            let transport_address = if protocol == "udp" {
+                format!("udp:{address}")
+            } else {
+                address
+            };
+            open_transport(false, &transport_address, Duration::from_secs(3))?;
+            store_connected_device(&connected_devices_path()?, &target)?;
+            println!("connected to {target}");
+        }
+        Commands::Disconnect { target } => {
+            if let Some(target) = target.as_deref() {
+                parse_network_target(target)?;
+            }
+            remove_connected_device(&connected_devices_path()?, target.as_deref())?;
+            match target {
+                Some(target) => println!("disconnected {target}"),
+                None => println!("disconnected all devices"),
+            }
+        }
         Commands::Devices { long } => {
             println!("List of fastboot devices (fastboot-rs pure rust protocol)");
             if use_usb {
@@ -2517,5 +2641,30 @@ mod tests {
         assert!(Cli::try_parse_from(["fastboot-rs", "flashing", "unlock"]).is_ok());
         assert!(Cli::try_parse_from(["fastboot-rs", "flashing", "unknown"]).is_err());
         assert!(Cli::try_parse_from(["fastboot-rs", "oem"]).is_err());
+    }
+
+    #[test]
+    fn connected_device_storage_is_sorted_deduplicated_and_removable() {
+        let root = std::env::temp_dir().join(format!(
+            "fastboot-rs-connected-devices-{}",
+            std::process::id()
+        ));
+        let devices_path = root.join(".fastboot/devices");
+        let _ = std::fs::remove_dir_all(&root);
+
+        store_connected_device(&devices_path, "tcp:127.0.0.1:5554").unwrap();
+        store_connected_device(&devices_path, "udp:127.0.0.1:5555").unwrap();
+        store_connected_device(&devices_path, "tcp:127.0.0.1:5554").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&devices_path).unwrap(),
+            "tcp:127.0.0.1:5554\nudp:127.0.0.1:5555\n"
+        );
+
+        remove_connected_device(&devices_path, Some("tcp:127.0.0.1:5554")).unwrap();
+        assert_eq!(std::fs::read_to_string(&devices_path).unwrap(), "udp:127.0.0.1:5555\n");
+
+        remove_connected_device(&devices_path, None).unwrap();
+        assert!(!devices_path.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }
