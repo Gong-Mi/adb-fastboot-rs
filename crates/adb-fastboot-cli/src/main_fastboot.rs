@@ -10,6 +10,103 @@ use fastboot_protocol::{FastbootTcpTransport, FastbootTransport};
 use fastboot_protocol::usb_android::UsbfsFastbootDevice;
 use zip::ZipArchive;
 
+/// AOSP-mirror global options that affect flash/update orchestration.
+///
+/// Constructed once in `main()` from the CLI flags and threaded through
+/// every command that needs them.  Field names match the AOSP C++ globals
+/// (`g_disable_verity`, `fp->skip_reboot`, etc.) for traceability.
+#[derive(Debug, Clone, Copy, Default)]
+struct GlobalOptions {
+    /// `--skip-reboot`: don't reboot after flashing.
+    skip_reboot: bool,
+    /// `--skip-secondary`: don't flash secondary slots in flashall/update.
+    skip_secondary: bool,
+    /// `--force`: force a flash operation that may be unsafe.
+    force_flash: bool,
+    /// `--disable-verity`: set bit 0 in vbmeta flags.
+    disable_verity: bool,
+    /// `--disable-verification`: set bit 1 in vbmeta flags.
+    disable_verification: bool,
+    /// `--verbose` / `-v`.
+    verbose: bool,
+}
+
+impl GlobalOptions {
+    /// True when either vbmeta flag needs patching.
+    fn needs_vbmeta_patch(&self) -> bool {
+        self.disable_verity || self.disable_verification
+    }
+}
+
+/// AOSP `AVB_MAGIC` = "AVB0" (4 bytes).
+const AVB_MAGIC: &[u8; 4] = b"AVB0";
+/// AOSP `AVB_FOOTER_MAGIC` = "AVBf" (4 bytes).
+const AVB_FOOTER_MAGIC: &[u8; 4] = b"AVBf";
+/// Size of the AVB footer struct (AOSP `AVB_FOOTER_SIZE`).
+const AVB_FOOTER_SIZE: usize = 64;
+/// Offset of the big-endian `flags` field inside the VBMeta header.
+/// The flags field is 32-bit BE at byte offset 120; the LSB is at 123.
+const VBMETA_FLAGS_LSB_OFFSET: usize = 123;
+
+/// Patch vbmeta flags in an image buffer, mirroring AOSP
+/// `fastboot.cpp:SetVbmetaFlags()`.
+///
+/// Returns a new buffer with the flags patched, or `None` if the image
+/// does not contain a recognisable AVB structure (in which case the
+/// caller should flash the original data unchanged).
+fn patch_vbmeta_flags(data: &[u8], opts: &GlobalOptions) -> Option<Vec<u8>> {
+    if !opts.needs_vbmeta_patch() || data.len() < 256 {
+        return None;
+    }
+
+    // Determine vbmeta offset: either 0 (standalone vbmeta.img) or
+    // read from the AVB footer appended to a boot image.
+    let vbmeta_offset: usize = if data.len() >= AVB_FOOTER_SIZE
+        && &data[data.len() - AVB_FOOTER_SIZE..data.len() - AVB_FOOTER_SIZE + 4] == AVB_FOOTER_MAGIC
+    {
+        // Footer present — read vbmeta_offset (BE u64 at footer + 8).
+        let footer = &data[data.len() - AVB_FOOTER_SIZE..];
+        let off = u64::from_be_bytes(footer[8..16].try_into().ok()?) as usize;
+        off
+    } else {
+        0
+    };
+
+    // Verify AVB_MAGIC at the computed offset.
+    if data.len() < vbmeta_offset + 4 || &data[vbmeta_offset..vbmeta_offset + 4] != AVB_MAGIC {
+        return None;
+    }
+
+    let flags_byte = vbmeta_offset + VBMETA_FLAGS_LSB_OFFSET;
+    if flags_byte >= data.len() {
+        return None;
+    }
+
+    let mut patched = data.to_vec();
+    if opts.disable_verity {
+        patched[flags_byte] |= 0x01;
+    }
+    if opts.disable_verification {
+        patched[flags_byte] |= 0x02;
+    }
+    Some(patched)
+}
+
+/// Returns true when `partition` is a vbmeta partition (AOSP
+/// `is_vbmeta_partition()`).
+fn is_vbmeta_partition(partition: &str) -> bool {
+    partition.ends_with("vbmeta")
+        || partition.ends_with("vbmeta_a")
+        || partition.ends_with("vbmeta_b")
+}
+
+/// Verbose log helper — prints only when `--verbose` is active.
+macro_rules! vlog {
+    ($opts:expr, $($arg:tt)*) => {
+        if $opts.verbose { eprintln!($($arg)*); }
+    };
+}
+
 
 #[derive(Parser)]
 #[command(name = "fastboot-rs", author, version, about = "Rust Fastboot Command-Line Interface")]
@@ -29,6 +126,34 @@ struct Cli {
     /// Set the active slot after the selected command (`--set-active[=SLOT]`).
     #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
     set_active: Option<String>,
+
+    /// Don't reboot device after flashing (AOSP --skip-reboot).
+    #[arg(long, global = true)]
+    skip_reboot: bool,
+
+    /// Don't flash secondary slots in flashall/update (AOSP --skip-secondary).
+    #[arg(long, global = true)]
+    skip_secondary: bool,
+
+    /// Force a flash operation that may be unsafe (AOSP --force).
+    #[arg(long, global = true)]
+    force: bool,
+
+    /// Sets disable-verity flag when flashing vbmeta (AOSP --disable-verity).
+    #[arg(long, global = true)]
+    disable_verity: bool,
+
+    /// Sets disable-verification flag when flashing vbmeta (AOSP --disable-verification).
+    #[arg(long, global = true)]
+    disable_verification: bool,
+
+    /// Verbose output (AOSP --verbose / -v).
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
+
+    /// Don't buffer stdout/stderr (AOSP --unbuffered).
+    #[arg(long, global = true)]
+    unbuffered: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -1036,6 +1161,7 @@ const AOSP_IMAGES: &[(&str, &str, bool)] = &[
 fn do_update<T: FastbootTransport>(
     transport: &mut T,
     zip_path: &str,
+    gopts: &GlobalOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // --- Step 1: 打开 update.zip ---
     let zip_file = match File::open(zip_path) {
@@ -1159,6 +1285,20 @@ fn do_update<T: FastbootTransport>(
                 );
                 std::process::exit(1);
             }
+        };
+
+        // AOSP SetVbmetaFlags: patch disable-verity/verification bits
+        // before flashing vbmeta partitions.
+        let image_data = if is_vbmeta_partition(partition) {
+            match patch_vbmeta_flags(&image_data, gopts) {
+                Some(patched) => {
+                    vlog!(gopts, "[fastboot-rs] vbmeta flags patched for {img_name} ({} bytes)", patched.len());
+                    patched
+                }
+                None => image_data,
+            }
+        } else {
+            image_data
         };
 
         let file_size = image_data.len();
@@ -1385,7 +1525,10 @@ fn flash_image_file<T: FastbootTransport>(
     partition_label: &str,
     wire_partition: &str,
     image_path: &std::path::Path,
+    gopts: &GlobalOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    vlog!(gopts, "[fastboot-rs] flash_image_file: partition={partition_label} wire={wire_partition} path={}", image_path.display());
+
     let mut image_file = match File::open(image_path) {
         Ok(f) => f,
         Err(e) => {
@@ -1441,6 +1584,20 @@ fn flash_image_file<T: FastbootTransport>(
                 eprintln!("Error reading image file '{}': {}", image_path.display(), e);
                 std::process::exit(1);
             }
+        };
+
+        // AOSP SetVbmetaFlags: patch disable-verity/verification bits
+        // before flashing vbmeta partitions.
+        let image_data = if is_vbmeta_partition(partition_label) {
+            match patch_vbmeta_flags(&image_data, gopts) {
+                Some(patched) => {
+                    vlog!(gopts, "[fastboot-rs] vbmeta flags patched ({} bytes)", patched.len());
+                    patched
+                }
+                None => image_data,
+            }
+        } else {
+            image_data
         };
 
         let limit = max_download_size.unwrap();
@@ -1529,21 +1686,45 @@ fn flash_image_file<T: FastbootTransport>(
         }
     } else {
         let chunk_size = max_download_size.unwrap_or(16 * 1024 * 1024);
+
+        // AOSP SetVbmetaFlags: for vbmeta partitions, read the whole image
+        // into memory so we can patch the flags byte before sending.
+        let vbmeta_patched: Option<Vec<u8>> = if is_vbmeta_partition(partition_label) && gopts.needs_vbmeta_patch() {
+            let data = match std::fs::read(image_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Error reading image file '{}': {}", image_path.display(), e);
+                    std::process::exit(1);
+                }
+            };
+            match patch_vbmeta_flags(&data, gopts) {
+                Some(patched) => {
+                    vlog!(gopts, "[fastboot-rs] vbmeta flags patched ({} bytes)", patched.len());
+                    Some(patched)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let effective_size = vbmeta_patched.as_ref().map_or(file_size, |p| p.len());
+
         println!(
             "[fastboot-rs] Flashing partition '{}' with image '{}' ({} bytes, chunk size: {} bytes)",
             partition_label,
             image_path.display(),
-            file_size,
+            effective_size,
             chunk_size
         );
 
-        let download_cmd = fastboot_protocol::download(file_size as u32);
+        let download_cmd = fastboot_protocol::download(effective_size as u32);
         transport.send_cmd(&download_cmd)?;
         let dl_resp = transport.recv_response()?;
         match dl_resp {
             fastboot_protocol::FastbootResponse::Data(expected_len) => {
-                if expected_len != file_size as u32 {
-                    eprintln!("Error: Device requested {} bytes, but local file is {} bytes", expected_len, file_size);
+                if expected_len != effective_size as u32 {
+                    eprintln!("Error: Device requested {} bytes, but local file is {} bytes", expected_len, effective_size);
                     std::process::exit(1);
                 }
             }
@@ -1557,28 +1738,43 @@ fn flash_image_file<T: FastbootTransport>(
             }
         }
 
-        println!("[fastboot-rs] Sending image payload in chunks ({} bytes total)...", file_size);
-        let mut buffer = vec![0u8; chunk_size];
-        let mut remaining = file_size;
-        let mut chunk_index = 0u64;
+        println!("[fastboot-rs] Sending image payload in chunks ({} bytes total)...", effective_size);
 
-        while remaining > 0 {
-            let to_read = remaining.min(chunk_size);
-            if let Err(e) = image_file.read_exact(&mut buffer[..to_read]) {
-                eprintln!("Error reading from '{}' at offset {}: {}", image_path.display(), file_size - remaining, e);
-                std::process::exit(1);
+        if let Some(ref patched_data) = vbmeta_patched {
+            // Send patched vbmeta data from memory.
+            let mut offset = 0usize;
+            while offset < patched_data.len() {
+                let to_send = (patched_data.len() - offset).min(chunk_size);
+                if let Err(e) = transport.write_all(&patched_data[offset..offset + to_send]) {
+                    eprintln!("Error writing patched vbmeta to transport at offset {offset}: {e}");
+                    std::process::exit(1);
+                }
+                offset += to_send;
             }
-            if let Err(e) = transport.write_all(&buffer[..to_read]) {
-                eprintln!(
-                    "Error writing to transport at chunk {} (offset {}): {}",
-                    chunk_index,
-                    file_size - remaining,
-                    e
-                );
-                std::process::exit(1);
+        } else {
+            // Stream from file as before.
+            let mut buffer = vec![0u8; chunk_size];
+            let mut remaining = file_size;
+            let mut chunk_index = 0u64;
+
+            while remaining > 0 {
+                let to_read = remaining.min(chunk_size);
+                if let Err(e) = image_file.read_exact(&mut buffer[..to_read]) {
+                    eprintln!("Error reading from '{}' at offset {}: {}", image_path.display(), file_size - remaining, e);
+                    std::process::exit(1);
+                }
+                if let Err(e) = transport.write_all(&buffer[..to_read]) {
+                    eprintln!(
+                        "Error writing to transport at chunk {} (offset {}): {}",
+                        chunk_index,
+                        file_size - remaining,
+                        e
+                    );
+                    std::process::exit(1);
+                }
+                remaining -= to_read;
+                chunk_index += 1;
             }
-            remaining -= to_read;
-            chunk_index += 1;
         }
         transport.flush()?;
 
@@ -1602,6 +1798,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = resolve_target_addr(cli.serial.as_deref(), 5554);
     let use_usb = cli.usb;
     let slot_selection = fastboot_protocol::SlotSelection::parse(cli.slot.as_deref())?;
+
+    // AOSP-mirror global options, constructed once and threaded through.
+    let gopts = GlobalOptions {
+        skip_reboot: cli.skip_reboot,
+        skip_secondary: cli.skip_secondary,
+        force_flash: cli.force,
+        disable_verity: cli.disable_verity,
+        disable_verification: cli.disable_verification,
+        verbose: cli.verbose,
+    };
+    if gopts.verbose {
+        eprintln!("[fastboot-rs] verbose mode enabled");
+        eprintln!("[fastboot-rs] global options: {gopts:?}");
+    }
+
     // `--set-active[=SLOT]` is parsed and validated here. Applying it around
     // flashall/update requires orchestration deliberately outside this slice.
     if let Some(value) = cli.set_active.as_deref() {
@@ -1762,7 +1973,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!("[fastboot-rs] Connected to fastboot target {}", addr);
 
-            flash_image_file(&mut transport, &partition, &wire_partition, &image_path)?;
+            flash_image_file(&mut transport, &partition, &wire_partition, &image_path, &gopts)?;
         }
         Commands::WipeSuper { image } => {
             let wire_partition = slot_selection.partition_name("super")?;
@@ -1787,7 +1998,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[fastboot-rs] Connected to fastboot target {}", addr);
 
             println!("[fastboot-rs] Wiping super partition using image '{}'", image_path.display());
-            flash_image_file(&mut transport, "super", &wire_partition, &image_path)?;
+            flash_image_file(&mut transport, "super", &wire_partition, &image_path, &gopts)?;
         }
         Commands::Erase { partition } => {
             let wire_partition = slot_selection.partition_name(&partition)?;
@@ -2412,7 +2623,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             println!("[fastboot-rs] 已连接至 fastboot 目标 {addr}");
-            do_update(&mut transport, &zip_file)?;
+            do_update(&mut transport, &zip_file, &gopts)?;
         }
         Commands::Gsi { action } => {
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
@@ -2666,5 +2877,147 @@ mod tests {
         remove_connected_device(&devices_path, None).unwrap();
         assert!(!devices_path.exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ------------------------------------------------------------------
+    // AOSP global options (--skip-reboot, --force, --disable-verity, etc.)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cli_accepts_aosp_global_flash_options() {
+        let cli = Cli::try_parse_from([
+            "fastboot-rs",
+            "--skip-reboot",
+            "--skip-secondary",
+            "--force",
+            "--disable-verity",
+            "--disable-verification",
+            "-v",
+            "getvar", "unlocked",
+        ])
+        .expect("all AOSP global options should parse");
+        assert!(cli.skip_reboot);
+        assert!(cli.skip_secondary);
+        assert!(cli.force);
+        assert!(cli.disable_verity);
+        assert!(cli.disable_verification);
+        assert!(cli.verbose);
+    }
+
+    #[test]
+    fn global_options_default_to_false() {
+        let cli = Cli::try_parse_from(["fastboot-rs", "getvar", "unlocked"]).unwrap();
+        assert!(!cli.skip_reboot);
+        assert!(!cli.skip_secondary);
+        assert!(!cli.force);
+        assert!(!cli.disable_verity);
+        assert!(!cli.disable_verification);
+        assert!(!cli.verbose);
+    }
+
+    #[test]
+    fn global_options_work_after_subcommand() {
+        // AOSP getopt_long allows options anywhere on the command line.
+        let cli = Cli::try_parse_from([
+            "fastboot-rs", "flash", "boot", "--skip-reboot", "--force",
+        ])
+        .expect("global flags after subcommand should parse");
+        assert!(cli.skip_reboot);
+        assert!(cli.force);
+        assert!(matches!(cli.command, Commands::Flash { .. }));
+    }
+
+    // ------------------------------------------------------------------
+    // vbmeta flag patching (AOSP SetVbmetaFlags)
+    // ------------------------------------------------------------------
+
+    /// Build a minimal 256-byte vbmeta image with AVB0 magic at offset 0.
+    fn fake_vbmeta() -> Vec<u8> {
+        let mut data = vec![0u8; 256];
+        data[0..4].copy_from_slice(b"AVB0");
+        // flags field at offset 120..124 (BE u32), LSB at 123
+        data
+    }
+
+    #[test]
+    fn patch_vbmeta_sets_verity_bit() {
+        let data = fake_vbmeta();
+        let opts = GlobalOptions { disable_verity: true, ..Default::default() };
+        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch");
+        assert_eq!(patched[123] & 0x01, 0x01, "bit 0 = disable-verity");
+        assert_eq!(patched[123] & 0x02, 0x00, "bit 1 unchanged");
+    }
+
+    #[test]
+    fn patch_vbmeta_sets_verification_bit() {
+        let data = fake_vbmeta();
+        let opts = GlobalOptions { disable_verification: true, ..Default::default() };
+        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch");
+        assert_eq!(patched[123] & 0x02, 0x02, "bit 1 = disable-verification");
+        assert_eq!(patched[123] & 0x01, 0x00, "bit 0 unchanged");
+    }
+
+    #[test]
+    fn patch_vbmeta_sets_both_bits() {
+        let data = fake_vbmeta();
+        let opts = GlobalOptions { disable_verity: true, disable_verification: true, ..Default::default() };
+        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch");
+        assert_eq!(patched[123] & 0x03, 0x03, "both bits set");
+    }
+
+    #[test]
+    fn patch_vbmeta_noop_without_flags() {
+        let data = fake_vbmeta();
+        let opts = GlobalOptions::default();
+        assert!(patch_vbmeta_flags(&data, &opts).is_none(), "no flags → None");
+    }
+
+    #[test]
+    fn patch_vbmeta_rejects_short_buffer() {
+        let data = vec![0u8; 100];
+        let opts = GlobalOptions { disable_verity: true, ..Default::default() };
+        assert!(patch_vbmeta_flags(&data, &opts).is_none(), "too short → None");
+    }
+
+    #[test]
+    fn patch_vbmeta_rejects_missing_magic() {
+        let mut data = vec![0u8; 256];
+        data[0..4].copy_from_slice(b"XXXX"); // wrong magic
+        let opts = GlobalOptions { disable_verity: true, ..Default::default() };
+        assert!(patch_vbmeta_flags(&data, &opts).is_none(), "no AVB0 → None");
+    }
+
+    #[test]
+    fn patch_vbmeta_via_avb_footer() {
+        // Simulate a boot image: 512 bytes of payload + AVB footer at end.
+        // vbmeta lives at offset 256 inside the image.
+        let mut data = vec![0u8; 512 + AVB_FOOTER_SIZE];
+        // Place AVB0 magic at offset 256
+        data[256..260].copy_from_slice(b"AVB0");
+        // Build footer at the end
+        let footer_start = data.len() - AVB_FOOTER_SIZE;
+        data[footer_start..footer_start + 4].copy_from_slice(b"AVBf");
+        // vbmeta_offset as BE u64 at footer+8
+        data[footer_start + 8..footer_start + 16].copy_from_slice(&256u64.to_be_bytes());
+
+        let opts = GlobalOptions { disable_verity: true, disable_verification: true, ..Default::default() };
+        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch via footer");
+        // flags LSB at 256 + 123 = 379
+        assert_eq!(patched[379] & 0x03, 0x03, "both bits set via footer path");
+    }
+
+    #[test]
+    fn is_vbmeta_partition_matches_aosp() {
+        // AOSP: EndsWith(partition, "vbmeta") || EndsWith("vbmeta_a") || EndsWith("vbmeta_b")
+        assert!(is_vbmeta_partition("vbmeta"));
+        assert!(is_vbmeta_partition("vbmeta_a"));
+        assert!(is_vbmeta_partition("vbmeta_b"));
+        // vbmeta_system / vbmeta_vendor do NOT end with "vbmeta" — AOSP
+        // patches them via the flash path's partition-name check, not
+        // is_vbmeta_partition().
+        assert!(!is_vbmeta_partition("vbmeta_system"));
+        assert!(!is_vbmeta_partition("vbmeta_vendor"));
+        assert!(!is_vbmeta_partition("boot"));
+        assert!(!is_vbmeta_partition("system"));
     }
 }
