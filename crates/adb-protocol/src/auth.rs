@@ -17,6 +17,9 @@ pub enum AuthError {
     #[error("Base64 error: {0}")]
     Base64(#[from] base64::DecodeError),
 
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("Invalid token length: expected {expected}, got {got}")]
     InvalidTokenLength { expected: usize, got: usize },
 
@@ -40,6 +43,149 @@ pub fn generate_rsa_key() -> Result<RsaPrivateKey, AuthError> {
     let mut rng = rsa::rand_core::OsRng;
     let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
     Ok(private_key)
+}
+
+/// AOSP `adb_get_homedir_path()`: `$HOME` (adb_utils.cpp:275-290).
+pub fn adb_get_homedir_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// AOSP `adb_get_android_dir_path()` (adb_utils.cpp:310-320): `$HOME/.android`,
+/// created (0750) if missing.
+pub fn adb_get_android_dir_path() -> Result<std::path::PathBuf, AuthError> {
+    let home = adb_get_homedir_path().ok_or_else(|| {
+        AuthError::InvalidPublicKeyFormat("HOME not set; cannot locate .android dir".to_string())
+    })?;
+    let dir = home.join(".android");
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)?;
+    }
+    Ok(dir)
+}
+
+/// AOSP `adb_auth_get_userkey_path()` (client/auth.cpp:204-207):
+/// `<android_dir>/adbkey`.
+pub fn adb_auth_get_userkey_path() -> Result<std::path::PathBuf, AuthError> {
+    Ok(adb_get_android_dir_path()?.join("adbkey"))
+}
+
+/// AOSP `generate_key()` (client/auth.cpp:61-107): write a fresh 2048-bit
+/// private key (PKCS#8 PEM) plus its `.pub` ADB public key string.
+/// Private key is written with 0600 permissions (umask 077 in AOSP).
+pub fn generate_key(file: &std::path::Path) -> Result<(), AuthError> {
+    let private_key = generate_rsa_key()?;
+    let pem = export_private_key_to_pem(&private_key)?;
+    let pubkey = encode_adb_public_key_string(
+        &RsaPublicKey::from(&private_key),
+        &default_key_label(),
+    )?;
+
+    use std::io::Write;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode_0600()
+        .open(file)?;
+    f.write_all(pem.as_bytes())?;
+    f.write_all(b"\n")?;
+    std::fs::write(
+        format!("{}.pub", file.display()),
+        format!("{}\n", String::from_utf8_lossy(&pubkey)),
+    )?;
+    Ok(())
+}
+
+/// Unix-only helper: create a file with 0600 from the start (AOSP uses
+/// umask 077 around the private key write).
+trait OpenOptionsMode0600 {
+    fn mode_0600(&mut self) -> &mut Self;
+}
+
+#[cfg(unix)]
+impl OpenOptionsMode0600 for std::fs::OpenOptions {
+    fn mode_0600(&mut self) -> &mut Self {
+        use std::os::unix::fs::OpenOptionsExt;
+        self.mode(0o600)
+    }
+}
+
+#[cfg(not(unix))]
+impl OpenOptionsMode0600 for std::fs::OpenOptions {
+    fn mode_0600(&mut self) -> &mut Self {
+        self
+    }
+}
+
+/// Default ADB public key label ("user@hostname" analog).
+pub fn default_key_label() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
+    format!("{user}@{host}")
+}
+
+/// AOSP `load_userkey()` (client/auth.cpp:209-226): load `$HOME/.android/adbkey`,
+/// generating it on first use when absent.
+pub fn load_userkey() -> Result<AdbAuth, AuthError> {
+    let path = adb_auth_get_userkey_path()?;
+    if !path.exists() {
+        generate_key(&path)?;
+    }
+    let pem = std::fs::read_to_string(&path)?;
+    let private_key = load_private_key_from_pem(&pem)?;
+    Ok(AdbAuth::new(private_key, &default_key_label()))
+}
+
+/// AOSP `get_vendor_keys()` (client/auth.cpp:228-244): split `ADB_VENDOR_KEYS`
+/// on the path separator, dropping empty entries.
+pub fn get_vendor_keys() -> Vec<std::path::PathBuf> {
+    let raw = match std::env::var("ADB_VENDOR_KEYS") {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    raw.split(':')
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+/// AOSP `adb_auth_init()` key loading (client/auth.cpp:422-434): the user key
+/// first, then each `ADB_VENDOR_KEYS` entry (file or directory of PEM keys).
+/// Returns every successfully loaded key in AOSP order (user key first).
+pub fn load_all_keys() -> Result<Vec<AdbAuth>, AuthError> {
+    let mut keys = vec![load_userkey()?];
+    keys.extend(load_vendor_keys_only());
+    Ok(keys)
+}
+
+/// Load only the ADB_VENDOR_KEYS entries (no user key, no side effects).
+pub fn load_vendor_keys_only() -> Vec<AdbAuth> {
+    let mut keys = Vec::new();
+    for path in get_vendor_keys() {
+        if path.is_dir() {
+            let mut entries: Vec<std::path::PathBuf> = match std::fs::read_dir(&path) {
+                Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
+                Err(_) => continue,
+            };
+            entries.sort();
+            for entry in entries {
+                if let Ok(pem) = std::fs::read_to_string(&entry) {
+                    if let Ok(k) = load_private_key_from_pem(&pem) {
+                        keys.push(AdbAuth::new(k, &default_key_label()));
+                    }
+                }
+            }
+        } else if let Ok(pem) = std::fs::read_to_string(&path) {
+            if let Ok(k) = load_private_key_from_pem(&pem) {
+                keys.push(AdbAuth::new(k, &default_key_label()));
+            }
+        }
+    }
+    keys
 }
 
 /// Sign ADB token (typically 20 bytes) using RSA private key (PKCS#1 v1.5 + SHA-1)
@@ -177,10 +323,15 @@ pub fn load_private_key_from_pem(pem_str: &str) -> Result<RsaPrivateKey, AuthErr
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
 
-    if let Ok(key) = RsaPrivateKey::from_pkcs8_pem(pem_str) {
+    // Tolerate trailing whitespace/newlines: files written with a final
+    // newline (and AOSP-written keys) must parse. AOSP `PEM_read_RSAPrivateKey`
+    // ignores trailing data after the last PEM block.
+    let trimmed = pem_str.trim_matches(|c: char| c.is_whitespace());
+
+    if let Ok(key) = RsaPrivateKey::from_pkcs8_pem(trimmed) {
         return Ok(key);
     }
-    if let Ok(key) = RsaPrivateKey::from_pkcs1_pem(pem_str) {
+    if let Ok(key) = RsaPrivateKey::from_pkcs1_pem(trimmed) {
         return Ok(key);
     }
     Err(AuthError::InvalidPublicKeyFormat(
@@ -220,6 +371,12 @@ impl AdbAuth {
         Ok(Self::new(private_key, label))
     }
 
+    /// AOSP `adb_auth_init()` semantics: load the persistent user key
+    /// (`$HOME/.android/adbkey`, generated on first use).
+    pub fn load_persistent() -> Result<Self, AuthError> {
+        load_userkey()
+    }
+
     pub fn public_key(&self) -> &RsaPublicKey {
         &self.public_key
     }
@@ -257,10 +414,78 @@ impl AdbAuth {
     }
 }
 
+/// AOSP client-side AUTH response state (client/auth.cpp `send_auth_response`
+/// + `atransport::NextKey`): answer each A_AUTH TOKEN with a SIGNATURE from
+/// the next available private key; when all keys are exhausted, send the
+/// user key's RSAPUBLICKEY once (kCsUnauthorized → framework confirmation).
+pub struct AuthResponder {
+    keys: Vec<AdbAuth>,
+    next_key: usize,
+    pubkey_sent: bool,
+}
+
+impl AuthResponder {
+    /// Build from the full AOSP key list (`adb_auth_init()` order:
+    /// user key first, then ADB_VENDOR_KEYS).
+    pub fn from_key_list(keys: Vec<AdbAuth>) -> Self {
+        Self {
+            keys,
+            next_key: 0,
+            pubkey_sent: false,
+        }
+    }
+
+    /// Build from a single key (test/helper convenience).
+    pub fn single(key: AdbAuth) -> Self {
+        Self::from_key_list(vec![key])
+    }
+
+    /// AOSP `send_auth_response`: given an A_AUTH TOKEN payload, produce the
+    /// next response. Returns:
+    /// - `Ok(Some((SIGNATURE header, payload)))` while keys remain;
+    /// - `Ok(Some((RSAKEY header, payload)))` once, when keys are exhausted;
+    /// - `Ok(None)` after the public key has been sent (AOSP keeps waiting for
+    ///   the framework decision; further TOKENs restart the key rotation).
+    pub fn respond_to_token(
+        &mut self,
+        token: &[u8],
+    ) -> Result<Option<(AdbMessageHeader, Vec<u8>)>, AuthError> {
+        if self.next_key < self.keys.len() {
+            let key = &self.keys[self.next_key];
+            self.next_key += 1;
+            return key.make_signature_message(token).map(Some);
+        }
+        if !self.pubkey_sent {
+            self.pubkey_sent = true;
+            return self.keys[0].make_rsakey_message().map(Some);
+        }
+        // All keys tried and public key already sent: restart rotation
+        // (matches AOSP staying in kCsUnauthorized until adbd re-tokens).
+        self.next_key = 0;
+        self.pubkey_sent = false;
+        let key = &self.keys[self.next_key];
+        self.next_key = 1;
+        key.make_signature_message(token).map(Some)
+    }
+
+    /// Number of private keys available for SIGNATURE responses.
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether the RSAPUBLICKEY fallback has been emitted.
+    pub fn pubkey_sent(&self) -> bool {
+        self.pubkey_sent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::header::AuthType;
+
+    /// HOME is process-global; tests that redirect it must serialize.
+    static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_rsa_key_generation_and_sign_verify() {
@@ -316,6 +541,25 @@ mod tests {
     }
 
     #[test]
+    fn test_pem_file_trailing_newline_roundtrip() {
+        use std::io::Write;
+        let k = generate_rsa_key().unwrap();
+        let pem = export_private_key_to_pem(&k).unwrap();
+        let path = std::env::temp_dir().join(format!("pem-probe-{}.pem", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(pem.as_bytes()).unwrap();
+            // AOSP-written PEM files end with a newline.
+            f.write_all(b"\n").unwrap();
+        }
+        let read_back = std::fs::read_to_string(&path).unwrap();
+        let re = load_private_key_from_pem(&read_back)
+            .expect("PEM with trailing newline must parse (AOSP PEM_read tolerates it)");
+        assert_eq!(re, k);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_pem_export_import_roundtrip() {
         let auth = AdbAuth::generate("testuser@testhost").unwrap();
         let pem = export_private_key_to_pem(auth.private_key()).unwrap();
@@ -341,5 +585,126 @@ mod tests {
         assert_eq!(key_hdr.data_length as usize, key_payload.len());
         assert_eq!(key_hdr.auth_type(), Some(AuthType::RsaKey));
         assert_eq!(*key_payload.last().unwrap(), 0); // Null byte suffix
+    }
+
+    #[test]
+    fn test_persistent_key_generate_load_roundtrip() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("adb-rs-test-{}", std::process::id()));
+        let prev_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let android_dir = adb_get_android_dir_path().unwrap();
+        assert!(android_dir.ends_with(".android"));
+
+        // First load generates the key (AOSP load_userkey semantics).
+        let first = load_userkey().unwrap();
+        let key_path = home.join(".android").join("adbkey");
+        assert!(key_path.exists());
+        assert!(key_path.with_extension("pub").exists());
+
+        // Second load returns the SAME key (persistence).
+        let second = load_userkey().unwrap();
+        let token = b"01234567890123456789";
+        let sig_a = first.build_signature_payload(token).unwrap();
+        let sig_b = second.build_signature_payload(token).unwrap();
+        assert_eq!(sig_a, sig_b, "persisted key must be reused across loads");
+
+        // Private key file must not be world-readable (AOSP umask 077).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "adbkey must be 0600, got {mode:o}");
+        }
+
+        // Restore HOME so other tests are unaffected.
+        if let Some(p) = prev_home {
+            std::env::set_var("HOME", p);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn test_vendor_keys_split_and_load_order() {
+        let _guard = HOME_MUTEX.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("adb-rs-vk-{}", std::process::id()));
+        let prev_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let k1 = AdbAuth::generate("vendor1@host").unwrap();
+        let k2 = AdbAuth::generate("vendor2@host").unwrap();
+        let dir = home.join("vendor-keys");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("k1.pem"),
+            export_private_key_to_pem(k1.private_key()).unwrap(),
+        )
+        .unwrap();
+        let single = home.join("k2.pem");
+        std::fs::write(
+            &single,
+            export_private_key_to_pem(k2.private_key()).unwrap(),
+        )
+        .unwrap();
+
+        std::env::set_var("ADB_VENDOR_KEYS", format!("{}::{}", dir.display(), single.display()));
+
+        let keys = load_all_keys().unwrap();
+        assert_eq!(keys.len(), 3, "user key + dir entry + file entry");
+        // Order: user key first (AOSP adb_auth_init), then vendor keys.
+        assert_eq!(keys[0].label(), default_key_label());
+
+        // Every vendor key must verify the same token against its own pubkey.
+        let token = b"vendor_keys_token20b";
+        for k in &keys[1..] {
+            let sig = k.build_signature_payload(token).unwrap();
+            assert!(sign_token(k.private_key(), token).is_ok());
+        }
+
+        // get_vendor_keys drops empty entries (':' split check).
+        std::env::set_var("ADB_VENDOR_KEYS", ":/a/path:");
+        let parsed = get_vendor_keys();
+        assert_eq!(parsed.len(), 1);
+
+        if let Some(p) = prev_home {
+            std::env::set_var("HOME", p);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn test_auth_responder_rotation_and_pubkey_fallback() {
+        let k1 = AdbAuth::generate("k1@host").unwrap();
+        let k2 = AdbAuth::generate("k2@host").unwrap();
+        let token = b"auth_responder_token!";
+
+        let mut responder = AuthResponder::from_key_list(vec![k1.clone(), k2.clone()]);
+        assert_eq!(responder.key_count(), 2);
+
+        // 1st TOKEN → SIGNATURE from k1
+        let (hdr1, p1) = responder.respond_to_token(token).unwrap().unwrap();
+        assert_eq!(hdr1.arg0, A_AUTH_SIGNATURE);
+        assert!(verify_token_signature(k1.public_key(), token, &p1).unwrap());
+
+        // 2nd TOKEN → SIGNATURE from k2
+        let (hdr2, p2) = responder.respond_to_token(token).unwrap().unwrap();
+        assert_eq!(hdr2.arg0, A_AUTH_SIGNATURE);
+        assert!(verify_token_signature(k2.public_key(), token, &p2).unwrap());
+
+        // 3rd TOKEN → keys exhausted → RSAPUBLICKEY (k1's, AOSP user key)
+        let (hdr3, p3) = responder.respond_to_token(token).unwrap().unwrap();
+        assert_eq!(hdr3.arg0, A_AUTH_RSAKEY);
+        assert!(responder.pubkey_sent());
+        let expected_pub = String::from_utf8(k1.make_rsakey_message().unwrap().1).unwrap();
+        assert_eq!(p3, expected_pub.into_bytes());
+
+        // Further TOKENs restart the rotation (AOSP stays unauthorized but
+        // keeps answering).
+        let (hdr4, _) = responder.respond_to_token(token).unwrap().unwrap();
+        assert_eq!(hdr4.arg0, A_AUTH_SIGNATURE);
+        assert!(!responder.pubkey_sent());
     }
 }

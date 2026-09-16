@@ -4,9 +4,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use clap::{Parser, Subcommand};
 use adb_protocol::{
-    AdbAuth, AdbMessageHeader, AdbServerTransport, ShellV2Packet, TcpTransport, Transport,
-    TransportError,
-    ADB_VERSION, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_STLS, A_WRTE, MAX_PAYLOAD_V2,
+    AdbAuth, AdbMessageHeader, AdbServerTransport, AuthType, ShellV2Packet, TcpTransport,
+    Transport, TransportError,
+    A_AUTH, ADB_VERSION, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_STLS, A_WRTE, MAX_PAYLOAD_V2,
     build_sync_send_req, build_sync_data_chunk, build_sync_done, SyncMessageHeader,
     SYNC_FAIL, SYNC_OKAY,
 };
@@ -186,18 +186,25 @@ pub struct DeviceInfo {
     pub banner: String,
 }
 
-/// Get or create a default ADB auth key (singleton).
+/// Get or create the persistent ADB auth key (singleton).
+/// AOSP semantics: `$HOME/.android/adbkey`, generated on first use and
+/// reused afterwards (adb_auth_init/load_userkey). Falls back to an
+/// ephemeral key only if the persistent store cannot be created/read.
 fn default_auth() -> &'static AdbAuth {
     static AUTH: OnceLock<AdbAuth> = OnceLock::new();
     AUTH.get_or_init(|| {
-        AdbAuth::generate("adb-rs@localhost").expect("Failed to generate ADB auth key")
+        AdbAuth::load_persistent()
+            .unwrap_or_else(|_| AdbAuth::generate("adb-rs@localhost").expect("Failed to generate ADB auth key"))
     })
 }
 
-/// Connect to adbd, perform CNXN handshake with A_STLS TLS upgrade support.
+/// Connect to adbd, perform CNXN handshake with RSA AUTH and A_STLS TLS upgrade support.
 ///
-/// If the device responds with A_STLS, the transport is upgraded to TLS
-/// using the auth key, and the CNXN handshake is retried over the encrypted channel.
+/// AOSP client semantics (adb.cpp handle_packet → A_AUTH/TOKEN, auth.cpp
+/// send_auth_response): answer each A_AUTH TOKEN with a SIGNATURE from the
+/// next key; when keys are exhausted send RSAPUBLICKEY once and wait. After
+/// successful auth (or no-auth), the device answers CNXN. If the device
+/// responds A_STLS, the transport is upgraded to TLS and CNXN is resent.
 #[cfg(feature = "tls")]
 fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     transport: T,
@@ -209,80 +216,112 @@ fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
 
     let mut transport: Box<dyn Transport> = Box::new(transport);
 
+    // AOSP adb_auth_init() key order: user key first, then ADB_VENDOR_KEYS.
+    // The caller-supplied auth IS the user key (default_auth loads the
+    // persistent identity); vendor keys are appended for rotation.
+    let mut responder = adb_protocol::AuthResponder::from_key_list({
+        let mut keys = vec![auth.clone()];
+        keys.extend(adb_protocol::auth::load_vendor_keys_only());
+        keys
+    });
+
     // Send initial CNXN
     let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
     transport.send_message(&cnxn_hdr, cnxn_payload)?;
 
-    // Read response
-    let (resp_hdr, payload) = transport.recv_message()?;
+    loop {
+        // Read response
+        let (resp_hdr, payload) = transport.recv_message()?;
 
-    if resp_hdr.command == A_CNXN {
-        // Normal path — no TLS required
-        let banner = String::from_utf8_lossy(&payload).to_string();
-        return Ok((DeviceInfo { banner }, transport));
-    }
+        match resp_hdr.command {
+            A_CNXN => {
+                // Normal path — no TLS required
+                let banner = String::from_utf8_lossy(&payload).to_string();
+                return Ok((DeviceInfo { banner }, transport));
+            }
+            A_AUTH if resp_hdr.auth_type() == Some(AuthType::Token) => {
+                // Device demands RSA auth: respond with SIGNATURE (or
+                // RSAPUBLICKEY after key exhaustion) and wait for CNXN.
+                if let Some((hdr, payload)) = responder.respond_to_token(&payload)? {
+                    transport.send_message(&hdr, &payload)?;
+                }
+                continue;
+            }
+            A_STLS => {
+                // TLS upgrade path
+                let rsa_pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key())
+                    .map_err(|e| format!("Failed to export RSA key: {e}"))?;
+                let (cert_der, key_der) = tls::generate_self_signed_cert(&rsa_pem)
+                    .map_err(|e| format!("Failed to generate self-signed cert: {e}"))?;
+                let config = tls::create_tls_config(cert_der, key_der)
+                    .map_err(|e| format!("Failed to create TLS config: {e}"))?;
 
-    if resp_hdr.command == A_STLS {
-        // TLS upgrade path
-        let rsa_pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key())
-            .map_err(|e| format!("Failed to export RSA key: {e}"))?;
-        let (cert_der, key_der) = tls::generate_self_signed_cert(&rsa_pem)
-            .map_err(|e| format!("Failed to generate self-signed cert: {e}"))?;
-        let config = tls::create_tls_config(cert_der, key_der)
-            .map_err(|e| format!("Failed to create TLS config: {e}"))?;
+                let tls_transport = AdbTlsTransport::new(transport, config, "adb")
+                    .map_err(|e| format!("TLS upgrade failed: {e}"))?;
 
-        let tls_transport = AdbTlsTransport::new(transport, config, "adb")
-            .map_err(|e| format!("TLS upgrade failed: {e}"))?;
+                // Re-send CNXN over TLS
+                let cnxn_hdr =
+                    AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
+                let mut tls_box: Box<dyn Transport> = Box::new(tls_transport);
+                tls_box.send_message(&cnxn_hdr, cnxn_payload)?;
 
-        // Re-send CNXN over TLS
-        let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-        let mut tls_box: Box<dyn Transport> = Box::new(tls_transport);
-        tls_box.send_message(&cnxn_hdr, cnxn_payload)?;
+                let (resp_hdr2, payload2) = tls_box.recv_message()?;
+                if resp_hdr2.command != A_CNXN {
+                    return Err(format!(
+                        "Unexpected handshake response after TLS upgrade: cmd={:#x}",
+                        resp_hdr2.command
+                    )
+                    .into());
+                }
 
-        let (resp_hdr2, payload2) = tls_box.recv_message()?;
-        if resp_hdr2.command != A_CNXN {
-            return Err(format!(
-                "Unexpected handshake response after TLS upgrade: cmd={:#x}",
-                resp_hdr2.command
-            )
-            .into());
+                let banner = String::from_utf8_lossy(&payload2).to_string();
+                return Ok((DeviceInfo { banner }, tls_box));
+            }
+            other => {
+                return Err(format!(
+                    "Unexpected handshake response: cmd={:#x}",
+                    other
+                )
+                .into());
+            }
         }
-
-        let banner = String::from_utf8_lossy(&payload2).to_string();
-        return Ok((DeviceInfo { banner }, tls_box));
     }
-
-    Err(format!(
-        "Unexpected handshake response: cmd={:#x}",
-        resp_hdr.command
-    )
-    .into())
 }
 
 /// Non-TLS fallback — A_STLS will return an error if the device requires TLS.
+/// RSA AUTH still works without the TLS feature.
 #[cfg(not(feature = "tls"))]
 fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     transport: T,
     cnxn_payload: &[u8],
-    _auth: &AdbAuth,
+    auth: &AdbAuth,
 ) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
     let mut transport: Box<dyn Transport> = Box::new(transport);
+    let mut responder = adb_protocol::AuthResponder::single(auth.clone());
     let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
 
     transport.send_message(&cnxn_hdr, cnxn_payload)?;
 
-    let (resp_hdr, payload) = transport.recv_message()?;
-    if resp_hdr.command == A_STLS {
-        return Err("Device requires TLS (A_STLS) but the `tls` feature is not enabled. \
-                    Rebuild with --features tls"
-            .into());
-    }
-    if resp_hdr.command != A_CNXN {
-        return Err(format!("Unexpected handshake response: cmd={:#x}", resp_hdr.command).into());
-    }
+    loop {
+        let (resp_hdr, payload) = transport.recv_message()?;
+        if resp_hdr.command == A_STLS {
+            return Err("Device requires TLS (A_STLS) but the `tls` feature is not enabled. \
+                        Rebuild with --features tls"
+                .into());
+        }
+        if resp_hdr.command == A_AUTH && resp_hdr.auth_type() == Some(AuthType::Token) {
+            if let Some((hdr, payload)) = responder.respond_to_token(&payload)? {
+                transport.send_message(&hdr, &payload)?;
+            }
+            continue;
+        }
+        if resp_hdr.command != A_CNXN {
+            return Err(format!("Unexpected handshake response: cmd={:#x}", resp_hdr.command).into());
+        }
 
-    let banner = String::from_utf8_lossy(&payload).to_string();
-    Ok((DeviceInfo { banner }, transport))
+        let banner = String::from_utf8_lossy(&payload).to_string();
+        return Ok((DeviceInfo { banner }, transport));
+    }
 }
 
 /// Open an adbd service (shell:, sync:, reboot:, etc.) via A_OPEN.
@@ -967,6 +1006,159 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adb_protocol::constants::{A_AUTH_RSAKEY, A_AUTH_SIGNATURE, A_AUTH_TOKEN};
+
+    /// Fake-adbd end-to-end AUTH conversation over a real TCP transport:
+    /// server sends A_AUTH TOKEN → client answers SIGNATURE → server accepts
+    /// → CNXN. Verifies the AOSP client auth loop in
+    /// `connect_and_handshake_with_tls_upgrade` (adb.cpp:457-474 semantics).
+    #[test]
+    fn test_handshake_auth_token_signature_loop() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Pre-generate the "user" key so both sides can reference it.
+        let auth = AdbAuth::generate("fake-adbd-test@localhost").unwrap();
+        let server_key = auth.clone();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 24];
+
+            // 1. Read client CNXN
+            sock.read_exact(&mut buf).unwrap();
+            let cnxn_hdr = AdbMessageHeader::decode(&buf).unwrap();
+            assert_eq!(cnxn_hdr.command, A_CNXN);
+            let mut cnxn_payload = vec![0u8; cnxn_hdr.data_length as usize];
+            if !cnxn_payload.is_empty() {
+                sock.read_exact(&mut cnxn_payload).unwrap();
+            }
+
+            // 2. Send A_AUTH TOKEN (20 bytes)
+            let token = b"fake_adbd_token_20!".to_vec();
+            let auth_hdr = AdbMessageHeader::new_auth(A_AUTH_TOKEN, &token);
+            let mut out = [0u8; 24];
+            auth_hdr.encode(&mut out);
+            sock.write_all(&out).unwrap();
+            sock.write_all(&token).unwrap();
+            sock.flush().unwrap();
+
+            // 3. Read client SIGNATURE — must verify against the user key
+            sock.read_exact(&mut buf).unwrap();
+            let sig_hdr = AdbMessageHeader::decode(&buf).unwrap();
+            assert_eq!(sig_hdr.command, A_AUTH);
+            assert_eq!(sig_hdr.arg0, A_AUTH_SIGNATURE);
+            let mut sig = vec![0u8; sig_hdr.data_length as usize];
+            sock.read_exact(&mut sig).unwrap();
+            assert!(adb_protocol::auth::verify_token_signature(
+                server_key.public_key(),
+                &token,
+                &sig
+            )
+            .unwrap());
+
+            // 4. Accept: send CNXN banner
+            let banner = b"device product::model fake-adbd".to_vec();
+            let ok_hdr = AdbMessageHeader::new(A_CNXN, 0x01000001, 256 * 1024, &banner);
+            ok_hdr.encode(&mut out);
+            sock.write_all(&out).unwrap();
+            sock.write_all(&banner).unwrap();
+            sock.flush().unwrap();
+        });
+
+        let transport = TcpTransport::connect_timeout(
+            &format!("127.0.0.1:{}", addr.port()),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let (info, _t) =
+            connect_and_handshake_with_tls_upgrade(transport, b"host::features=shell_v2,cmd", &auth)
+                .unwrap();
+        assert!(info.banner.contains("fake-adbd"));
+        server.join().unwrap();
+    }
+
+    /// Fake adbd that never accepts: the client must exhaust its keys, send
+    /// RSAPUBLICKEY, and keep waiting (no crash, no busy loop).
+    #[test]
+    fn test_handshake_auth_pubkey_fallback_then_wait() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let auth = AdbAuth::generate("unauth-test@localhost").unwrap();
+        let server_key = auth.clone();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 24];
+            sock.read_exact(&mut buf).unwrap();
+            let cnxn_hdr = AdbMessageHeader::decode(&buf).unwrap();
+            let mut p = vec![0u8; cnxn_hdr.data_length as usize];
+            if !p.is_empty() {
+                sock.read_exact(&mut p).unwrap();
+            }
+
+            let token = b"unauth_token_20byte!".to_vec();
+            let mut out = [0u8; 24];
+
+            // TOKEN #1 → expect SIGNATURE
+            AdbMessageHeader::new_auth(A_AUTH_TOKEN, &token).encode(&mut out);
+            sock.write_all(&out).unwrap();
+            sock.write_all(&token).unwrap();
+            sock.flush().unwrap();
+            sock.read_exact(&mut buf).unwrap();
+            let h = AdbMessageHeader::decode(&buf).unwrap();
+            assert_eq!(h.command, A_AUTH);
+            assert_eq!(h.arg0, A_AUTH_SIGNATURE);
+            let mut sig = vec![0u8; h.data_length as usize];
+            sock.read_exact(&mut sig).unwrap();
+            assert!(adb_protocol::auth::verify_token_signature(
+                server_key.public_key(),
+                &token,
+                &sig
+            )
+            .unwrap());
+
+            // TOKEN #2 (re-request; AOSP adbd re-sends TOKEN after a failed
+            // signature) → keys exhausted → expect RSAPUBLICKEY
+            AdbMessageHeader::new_auth(A_AUTH_TOKEN, &token).encode(&mut out);
+            sock.write_all(&out).unwrap();
+            sock.write_all(&token).unwrap();
+            sock.flush().unwrap();
+            sock.read_exact(&mut buf).unwrap();
+            let h2 = AdbMessageHeader::decode(&buf).unwrap();
+            assert_eq!(h2.command, A_AUTH);
+            assert_eq!(h2.arg0, A_AUTH_RSAKEY);
+            let mut pubkey = vec![0u8; h2.data_length as usize];
+            sock.read_exact(&mut pubkey).unwrap();
+            // Must parse as the user key's public key string.
+            let s = String::from_utf8(pubkey.clone()).unwrap();
+            let (parsed, _) =
+                adb_protocol::auth::parse_adb_public_key_string(&s).unwrap();
+            assert_eq!(parsed, *server_key.public_key());
+
+            // AOSP: after RSAPUBLICKEY the client waits for the framework;
+            // the server ends the conversation by closing.
+        });
+
+        let transport = TcpTransport::connect_timeout(
+            &format!("127.0.0.1:{}", addr.port()),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        // The client will block waiting for CNXN after sending RSAPUBLICKEY;
+        // when the fake server closes, recv fails — that failure is the
+        // expected outcome (NOT a panic).
+        let result =
+            connect_and_handshake_with_tls_upgrade(transport, b"host::", &auth);
+        assert!(result.is_err(), "server closed without CNXN; client must error");
+        server.join().unwrap();
+    }
 
     #[test]
     fn test_kill_server_when_not_running() {
