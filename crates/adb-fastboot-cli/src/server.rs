@@ -35,7 +35,9 @@ use adb_protocol::{Transport, TransportError};
 // ---------------------------------------------------------------------------
 
 const ADB_SERVER_PORT: u16 = 5037;
-const SERVER_VERSION: u32 = 0x01000001;
+/// AOSP adb.h:71 `#define ADB_SERVER_VERSION 41` — host:version replies
+/// with "%04x" of this decimal number (0x0029), NOT the protocol version.
+const SERVER_VERSION: u32 = 41;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
@@ -525,6 +527,14 @@ fn handle_client(
     let _ = client.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = client.set_nodelay(true);
 
+    // AOSP smart-socket state: the transport selection does NOT end command
+    // mode. After `host:transport:<serial>`, further hex-length commands are
+    // parsed; host services keep dispatching, and a device service (e.g.
+    // `root:`, `shell:id`) is converted into an A_OPEN on the selected
+    // transport and the connection becomes a raw stream bridge
+    // (sockets.cpp smart_socket_enqueue / connect_to_remote).
+    let mut selected: Option<String> = None;
+
     loop {
         let mut len_buf = [0u8; 4];
         if client.read_exact(&mut len_buf).is_err() {
@@ -535,7 +545,9 @@ fn handle_client(
         let cmd_len = usize::from_str_radix(len_str, 16)
             .map_err(|_| format!("Invalid hex length: {len_str}"))?;
 
-        if cmd_len == 0 || cmd_len > 4096 {
+        // AOSP sockets.cpp:800 — `len == 0 || len > MAX_PAYLOAD` kills the
+        // smart socket; MAX_PAYLOAD is 1 MiB, not 4 KiB.
+        if cmd_len == 0 || cmd_len > MAX_PAYLOAD_V2 as usize {
             return Err(format!("Invalid command length: {cmd_len}"));
         }
 
@@ -546,19 +558,60 @@ fn handle_client(
         let cmd = String::from_utf8(cmd_buf)
             .map_err(|_| "Command is not valid UTF-8".to_string())?;
 
-        let is_transport_cmd = cmd.starts_with("host:transport:");
+        if cmd.starts_with("host:") || cmd.starts_with("host-") {
+            dispatch_host_service(&mut client, &cmd, registry, running)?;
+            if let Some(serial) = transport_selection(&cmd, registry)? {
+                selected = Some(serial);
+            }
+            continue;
+        }
 
-        dispatch_host_service(&mut client, &cmd, registry, running)?;
-
-        if is_transport_cmd {
-            // dispatch_host_service already sent OKAY — now enter bridge mode.
-            // Move client into the bridge (this function is the last use).
-            let serial = cmd["host:transport:".len()..].to_string();
-            let _ = bridge_to_device(client, serial, registry)?;
-            // bridge always returns at this point, but in case of false…
-            return Ok(());
+        // Device service (shell:, root:, tcpip:, sync:, reboot:, ...).
+        match selected {
+            Some(ref serial) => {
+                let serial = serial.clone();
+                return bridge_device_service(client, &serial, &cmd, registry);
+            }
+            None => {
+                // AOSP: "device offline (no transport)" then close.
+                let msg = b"device offline (no transport)";
+                let len_hdr = format!("{:04x}", msg.len());
+                let _ = client
+                    .write_all(b"FAIL")
+                    .and_then(|_| client.write_all(len_hdr.as_bytes()))
+                    .and_then(|_| client.write_all(msg))
+                    .and_then(|_| client.flush());
+                return Ok(());
+            }
         }
     }
+}
+
+/// If `cmd` was a transport-selection host service that just succeeded,
+/// return the serial to bind for subsequent device services. Returns None
+/// for every other host command.
+fn transport_selection(cmd: &str, registry: &Arc<Mutex<TransportRegistry>>) -> Result<Option<String>, String> {
+    if let Some(serial) = cmd.strip_prefix("host:transport:") {
+        let exists = {
+            let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+            reg.find_by_serial(serial)
+                .map(|d| is_usable_state(d.state))
+                .unwrap_or(false)
+        };
+        return Ok(if exists { Some(serial.to_string()) } else { None });
+    }
+    if cmd == "host:transport-any" {
+        let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+        let found = reg
+            .devices
+            .iter()
+            .find(|d| is_usable_state(d.state))
+            .map(|d| d.serial.clone());
+        return Ok(found);
+    }
+    // host:transport-usb/-local are not dispatched yet (unknown host
+    // service → FAIL); never bind after a failed selection.
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,94 +1326,208 @@ fn handle_reverse(
 // Transport Bridge
 // ---------------------------------------------------------------------------
 
-fn bridge_to_device(
+/// AOSP smart-socket device-service bridge: the hex-length command `service`
+/// (e.g. `root:`, `tcpip:5555`, `shell:id`) becomes an A_OPEN on the device
+/// transport; after the device OKAYs it, the client connection is a raw byte
+/// stream mapped onto WRTE/OKAY frames (sockets.cpp connect_to_remote).
+///
+/// TCP devices get the full conversion. The legacy TCP relay
+/// (`bridge_to_device` → `bridge_tcp_to_tcp`) forwarded 24-byte ADB frames
+/// verbatim and therefore only works for clients that speak raw ADB to the
+/// server (our own adb-rs direct path) — an official AOSP client's
+/// hex-length service strings got forwarded into the frame relay as
+/// non-frame bytes and broke. USB devices keep the legacy frame relay; a
+/// real hex-service USB bridge needs transport cloning that UsbfsAdbDevice
+/// does not yet provide (tracked gap).
+fn bridge_device_service(
     client: TcpStream,
-    serial: String,
+    serial: &str,
+    service: &str,
     registry: &Arc<Mutex<TransportRegistry>>,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     let origin = {
         let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-        reg.find_by_serial(&serial).map(|d| d.origin)
+        reg.find_by_serial(serial).map(|d| d.origin)
     };
-
-    let is_tcp = matches!(origin, Some(DeviceOrigin::Tcp { .. }));
-
-    let result = match origin {
+    match origin {
         Some(DeviceOrigin::Tcp { addr }) => {
-            bridge_tcp_to_tcp(client, addr)
+            let result = service_bridge_tcp(client, addr, service);
+            // A bridge that ends usually means the device went away mid-use.
+            // AOSP removes the transport on disconnect; mirror that for TCP.
+            if result.is_ok() {
+                let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                if reg.remove_device(serial) {
+                    eprintln!("[adb-server] TCP device '{serial}' disconnected — removed from registry");
+                }
+            }
+            result
         }
         Some(DeviceOrigin::Usb) => {
             #[cfg(feature = "usb")]
             {
-                bridge_tcp_to_usb(client, &serial)
+                // Legacy frame relay (see docs on bridge_device_service):
+                // speaks raw ADB frames, not AOSP hex services.
+                let _ = service;
+                bridge_to_device_usb(client, serial).map(|_| ())
             }
             #[cfg(not(feature = "usb"))]
             {
-                drop(client);
                 Err("USB transport not supported (compile with --features usb)".to_string())
             }
         }
-        None => {
-            drop(client);
-            Err(format!("device '{serial}' not found"))
-        }
-    };
-
-    // After TCP bridge threads finish (device disconnected), remove the
-    // TCP device from the registry automatically. USB devices are handled
-    // by the inotify watcher / polling refresh_usb_devices instead.
-    if is_tcp && result.is_ok() {
-        let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-        if reg.remove_device(&serial) {
-            eprintln!(
-                "[adb-server] TCP device '{serial}' disconnected — removed from registry"
-            );
-        }
+        None => Err(format!("device '{serial}' not found")),
     }
-
-    result
 }
 
-/// Bridge TCP client -> TCP device (adbd). Simple byte-level proxy.
-fn bridge_tcp_to_tcp(mut client: TcpStream, addr: SocketAddr) -> Result<bool, String> {
-    let mut device = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+/// TCP service bridge: dial adbd, CNXN handshake, A_OPEN(service), then
+/// pump client bytes ⇄ device WRTE frames until either side closes.
+fn service_bridge_tcp(mut client: TcpStream, addr: SocketAddr, service: &str) -> Result<(), String> {
+    let device = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|e| format!("cannot connect to device at {addr}: {e}"))?;
     let _ = device.set_nodelay(true);
 
-    let mut client_clone = client
-        .try_clone()
-        .map_err(|e| format!("client clone failed: {e}"))?;
-    let mut device_clone = device
-        .try_clone()
-        .map_err(|e| format!("device clone failed: {e}"))?;
+    // CNXN on the device transport (server owns this handshake; the client
+    // never sees it — AOSP local_socket/remote_socket split).
+    let mut device = device;
+    let probe = b"host::features=shell_v2,cmd";
+    let cnxn = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, probe);
+    let mut hdr_buf = [0u8; 24];
+    cnxn.encode(&mut hdr_buf);
+    device
+        .write_all(&hdr_buf)
+        .and_then(|_| device.write_all(probe))
+        .and_then(|_| device.flush())
+        .map_err(|e| format!("CNXN send: {e}"))?;
+    device.read_exact(&mut hdr_buf).map_err(|e| format!("CNXN read: {e}"))?;
+    let resp = AdbMessageHeader::decode(&hdr_buf).map_err(|e| format!("CNXN decode: {e}"))?;
+    if resp.command != A_CNXN {
+        return Err("device did not answer CNXN".to_string());
+    }
+    if resp.data_length > 0 {
+        let mut banner = vec![0u8; resp.data_length as usize];
+        device.read_exact(&mut banner).map_err(|e| format!("banner: {e}"))?;
+    }
 
+    // A_OPEN(service) → OKAY(remote_id) or FAIL/CLSE.
+    let local_id = 1u32;
+    let open = AdbMessageHeader::new(A_OPEN, local_id, 0, service.as_bytes());
+    open.encode(&mut hdr_buf);
+    device
+        .write_all(&hdr_buf)
+        .and_then(|_| device.write_all(service.as_bytes()))
+        .and_then(|_| device.flush())
+        .map_err(|e| format!("OPEN send: {e}"))?;
+
+    let remote_id = loop {
+        device.read_exact(&mut hdr_buf).map_err(|e| format!("OPEN resp: {e}"))?;
+        let h = AdbMessageHeader::decode(&hdr_buf).map_err(|e| format!("OPEN decode: {e}"))?;
+        match h.command {
+            A_OKAY => break h.arg0,
+            A_CLSE => return Err(format!("service '{service}' refused by device")),
+            _ => continue,
+        }
+    };
+
+    // Tell the client its service opened.
+    client
+        .write_all(b"OKAY")
+        .and_then(|_| client.flush())
+        .map_err(|e| format!("client OKAY: {e}"))?;
+
+    // Bridges have no idle timeout (AOSP); the 30 s host-command read
+    // timeout must not kill a long-lived shell.
+    let _ = client.set_read_timeout(None);
+
+    let mut client_w = client.try_clone().map_err(|e| e.to_string())?;
+    let mut client_r = client;
+    let mut dev_w = device.try_clone().map_err(|e| e.to_string())?;
+    let mut dev_r = device;
+
+    // client → device: bytes become WRTE frames (device acks are consumed).
     let h1 = thread::spawn(move || -> io::Result<()> {
-        let mut buf = [0u8; 65536];
+        let mut buf = [0u8; 16384];
         loop {
-            let n = client_clone.read(&mut buf)?;
+            let n = client_r.read(&mut buf)?;
             if n == 0 {
+                let clse = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
+                let mut b24 = [0u8; 24];
+                clse.encode(&mut b24);
+                let _ = dev_w.write_all(&b24);
+                let _ = dev_w.flush();
                 return Ok(());
             }
-            device_clone.write_all(&buf[..n])?;
-            device_clone.flush()?;
+            let wrte = AdbMessageHeader::new(A_WRTE, local_id, remote_id, &buf[..n]);
+            // Header + payload in ONE write: the ack writer (device→client
+            // thread) shares this socket, and two write_all calls could be
+            // interleaved mid-frame.
+            let mut frame = Vec::with_capacity(24 + n);
+            let mut b24 = [0u8; 24];
+            wrte.encode(&mut b24);
+            frame.extend_from_slice(&b24);
+            frame.extend_from_slice(&buf[..n]);
+            if dev_w.write_all(&frame).is_err() || dev_w.flush().is_err() {
+                return Ok(());
+            }
         }
     });
 
+    // device → client: WRTE payloads stream out (each acked), CLSE ends.
     let h2 = thread::spawn(move || -> io::Result<()> {
-        let mut buf = [0u8; 65536];
+        let mut b24 = [0u8; 24];
         loop {
-            let n = device.read(&mut buf)?;
-            if n == 0 {
-                return Ok(());
+            if dev_r.read_exact(&mut b24).is_err() {
+                break;
             }
-            client.write_all(&buf[..n])?;
-            client.flush()?;
+            let Ok(hdr) = AdbMessageHeader::decode(&b24) else {
+                break;
+            };
+            match hdr.command {
+                A_WRTE => {
+                    let mut payload = vec![0u8; hdr.data_length as usize];
+                    if hdr.data_length > 0 && dev_r.read_exact(&mut payload).is_err() {
+                        break;
+                    }
+                    let ack = AdbMessageHeader::new(A_OKAY, remote_id, local_id, &[]);
+                    let mut ab = [0u8; 24];
+                    ack.encode(&mut ab);
+                    let _ = dev_r.write_all(&ab).map(|_| dev_r.flush());
+                    if client_w.write_all(&payload).is_err() || client_w.flush().is_err() {
+                        break;
+                    }
+                }
+                A_CLSE => {
+                    let ack = AdbMessageHeader::new(A_CLSE, remote_id, local_id, &[]);
+                    let mut ab = [0u8; 24];
+                    ack.encode(&mut ab);
+                    let _ = dev_r.write_all(&ab).map(|_| dev_r.flush());
+                    break;
+                }
+                A_OKAY => {}
+                _ => {}
+            }
         }
+        // AOSP local_socket_close: when the device side ends, the client
+        // must see EOF. Half-close toward the client so a blocked h1 reader
+        // can finish and the bridge terminates.
+        let _ = client_w.shutdown(std::net::Shutdown::Write);
+        Ok(())
     });
 
     let _ = h1.join();
     let _ = h2.join();
-    Ok(true)
+    Ok(())
+}
+
+/// Legacy USB frame relay: relays 24-byte ADB frames between the client
+/// socket and the USB transport (two independent usbfs handles, one per
+/// direction). Kept for the adb-rs CLI direct-USB path; an official AOSP
+/// client needs the hex-length → A_OPEN conversion (tracked gap).
+#[cfg(feature = "usb")]
+fn bridge_to_device_usb(
+    client: TcpStream,
+    serial: &str,
+) -> Result<bool, String> {
+    bridge_tcp_to_usb(client, serial)
 }
 
 /// Bridge TCP client <-> USB ADB device via usbfs.
@@ -1696,5 +1863,188 @@ mod tests {
 
         assert!(reg.remove_reverse("tcp:8080"));
         assert!(reg.list_reverses().is_empty());
+    }
+
+    /// AOSP-style server conversation: register a TCP device, then speak to
+    /// the server like the official adb client does —
+    /// host:version, host:transport:<serial>, and a hex-length *device*
+    /// service (`root:`). The server must convert the service into an
+    /// A_OPEN on the device transport (never forward the hex prefix raw),
+    /// ack the client, and stream the device payload back.
+    #[test]
+    fn test_smart_socket_device_service_becomes_aopen() {
+        use std::io::{Read, Write};
+
+        // ---- fake adbd on a TCP port -------------------------------------
+        let dev_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dev_addr = dev_listener.local_addr().unwrap();
+        let dev_thread = thread::spawn(move || {
+            let (mut sock, _) = dev_listener.accept().unwrap();
+            let mut buf = [0u8; 24];
+            // CNXN from the server
+            sock.read_exact(&mut buf).unwrap();
+            let cnxn = AdbMessageHeader::decode(&buf).unwrap();
+            assert_eq!(cnxn.command, A_CNXN);
+            let mut p = vec![0u8; cnxn.data_length as usize];
+            sock.read_exact(&mut p).unwrap();
+            let banner = b"device::features=shell_v2".to_vec();
+            let resp = AdbMessageHeader::new(A_CNXN, 0x01000001, 1024 * 1024, &banner);
+            let mut b = [0u8; 24];
+            resp.encode(&mut b);
+            sock.write_all(&b).unwrap();
+            sock.write_all(&banner).unwrap();
+            sock.flush().unwrap();
+
+            // A_OPEN("root:") — NOT hex-length text.
+            sock.read_exact(&mut b).unwrap();
+            let open = AdbMessageHeader::decode(&b).unwrap();
+            assert_eq!(open.command, A_OPEN);
+            let mut svc = vec![0u8; open.data_length as usize];
+            sock.read_exact(&mut svc).unwrap();
+            assert_eq!(&svc, b"root:");
+
+            // adbd acks the open with OKAY(remote_id=5) BEFORE streaming.
+            let mut b = [0u8; 24];
+            let okay = AdbMessageHeader::new(A_OKAY, 5, open.arg0, &[]);
+            okay.encode(&mut b);
+            sock.write_all(&b).unwrap();
+            sock.flush().unwrap();
+
+            // device output, then close the stream
+            let out = b"restarting adbd as root";
+            let wrte = AdbMessageHeader::new(A_WRTE, 5, open.arg0, out);
+            wrte.encode(&mut b);
+            sock.write_all(&b).unwrap();
+            sock.write_all(out).unwrap();
+            sock.flush().unwrap();
+            // consume the client's OKAY ack
+            let _ = sock.read_exact(&mut b);
+            let clse = AdbMessageHeader::new(A_CLSE, 5, open.arg0, &[]);
+            clse.encode(&mut b);
+            let _ = sock.write_all(&b);
+            let _ = sock.flush();
+        });
+
+        // ---- server under test -------------------------------------------
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+        let registry = Arc::new(Mutex::new(TransportRegistry {
+            devices: vec![DeviceEntry {
+                serial: dev_addr.to_string(),
+                state: DeviceState::Device,
+                origin: DeviceOrigin::Tcp { addr: dev_addr },
+                product: None,
+                model: None,
+                device_name: None,
+                transport_features: None,
+            }],
+            forwards: Vec::new(),
+            reverses: Vec::new(),
+        }));
+        let running = Arc::new(AtomicBool::new(true));
+        let reg2 = Arc::clone(&registry);
+        let run2 = Arc::clone(&running);
+        let server_thread = thread::spawn(move || {
+            let (client, _) = listener.accept().unwrap();
+            let _ = handle_client(client, &reg2, &run2);
+        });
+
+        let mut client = TcpStream::connect(srv_addr).unwrap();
+
+        // helper: send one hex-length host command, read status + payload
+        let mut txn = |client: &mut TcpStream, cmd: &str| -> Vec<u8> {
+            let req = format!("{:04x}{cmd}", cmd.len());
+            client.write_all(req.as_bytes()).unwrap();
+            client.flush().unwrap();
+            let mut status = [0u8; 4];
+            client.read_exact(&mut status).unwrap();
+            assert_eq!(&status, b"OKAY", "for {cmd}");
+            if cmd == "host:version" {
+                let mut len = [0u8; 4];
+                client.read_exact(&mut len).unwrap();
+                let n = usize::from_str_radix(std::str::from_utf8(&len).unwrap(), 16).unwrap();
+                let mut data = vec![0u8; n];
+                client.read_exact(&mut data).unwrap();
+                return data;
+            }
+            Vec::new()
+        };
+
+        // 1. host:version must report ADB_SERVER_VERSION = 41 → "0029"
+        let ver = txn(&mut client, "host:version");
+        assert_eq!(String::from_utf8_lossy(&ver), "0029");
+
+        // 2. transport selection (bare OKAY)
+        let serial = dev_addr.to_string();
+        let sel = format!("host:transport:{serial}");
+        client
+            .write_all(format!("{:04x}{sel}", sel.len()).as_bytes())
+            .unwrap();
+        client.flush().unwrap();
+        let mut okay = [0u8; 4];
+        client.read_exact(&mut okay).unwrap();
+        assert_eq!(&okay, b"OKAY");
+
+        // 3. device service as AOSP sends it: hex-length root:
+        let svc = "root:";
+        client
+            .write_all(format!("{:04x}{svc}", svc.len()).as_bytes())
+            .unwrap();
+        client.flush().unwrap();
+        client.read_exact(&mut okay).unwrap();
+        assert_eq!(&okay, b"OKAY");
+
+        // 4. the streamed device payload arrives raw
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"restarting adbd as root");
+
+        // Server-side bridge readers only see EOF once the client socket is
+        // dropped; join() would otherwise hang.
+        drop(client);
+        let _ = running;
+        server_thread.join().unwrap();
+        dev_thread.join().unwrap();
+    }
+
+    /// Device service before any transport selection must FAIL with the
+    /// AOSP wording, not crash or bridge.
+    #[test]
+    fn test_device_service_without_transport_fails_offline() {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = Arc::new(Mutex::new(TransportRegistry {
+            devices: Vec::new(),
+            forwards: Vec::new(),
+            reverses: Vec::new(),
+        }));
+        let running = Arc::new(AtomicBool::new(true));
+        let reg2 = Arc::clone(&registry);
+        let run2 = Arc::clone(&running);
+        let srv = thread::spawn(move || {
+            let (client, _) = listener.accept().unwrap();
+            let _ = handle_client(client, &reg2, &run2);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let svc = "root:";
+        client
+            .write_all(format!("{:04x}{svc}", svc.len()).as_bytes())
+            .unwrap();
+        client.flush().unwrap();
+        let mut status = [0u8; 4];
+        client.read_exact(&mut status).unwrap();
+        assert_eq!(&status, b"FAIL");
+        let mut len = [0u8; 4];
+        client.read_exact(&mut len).unwrap();
+        let n = usize::from_str_radix(std::str::from_utf8(&len).unwrap(), 16).unwrap();
+        let mut msg = vec![0u8; n];
+        client.read_exact(&mut msg).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&msg),
+            "device offline (no transport)"
+        );
+        let _ = srv.join();
     }
 }

@@ -396,57 +396,6 @@ fn recv_wrte_all(transport: &mut dyn Transport, local_id: u32) -> Result<Vec<u8>
     Ok(collected)
 }
 
-/// Read a sync response (expects OKAY or FAIL in SyncMessageHeader format).
-///
-/// Deprecated for the SEND flow: AOSP's adbd (`daemon/file_sync_service.cpp`
-/// `handle_send_file`) does NOT acknowledge a `SEND` request — it opens the
-/// file silently, consumes `DATA` until `DONE`, and only then emits a single
-/// `OKAY`/`FAIL`. Callers must stream SEND+DATA+DONE without waiting, then
-/// read exactly one terminal status via `SyncMessageReader`.
-fn recv_sync_response(transport: &mut dyn Transport, local_id: u32, _remote_id: u32) -> Result<(), String> {
-    loop {
-        let (hdr, payload) = match transport.recv_message() {
-            Ok(m) => m,
-            Err(e) => return Err(format!("recv sync response error: {e}")),
-        };
-        match hdr.command {
-            A_OKAY => {
-                // This is ack for our WRTE, keep reading
-            }
-            A_WRTE => {
-                // Ack the WRTE
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-
-                // Parse sync header
-                if payload.len() < 8 {
-                    return Err("Sync response too short".to_string());
-                }
-                let sync_hdr = match SyncMessageHeader::decode(&payload) {
-                    Ok(h) => h,
-                    Err(e) => return Err(format!("Bad sync header: {e}")),
-                };
-                match sync_hdr.id {
-                    SYNC_OKAY => return Ok(()),
-                    SYNC_FAIL => {
-                        let msg = String::from_utf8_lossy(&payload[8..]).to_string();
-                        return Err(format!("Sync FAIL: {}", msg));
-                    }
-                    other => {
-                        return Err(format!("Unexpected sync response id {:#x}", other));
-                    }
-                }
-            }
-            A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                return Err("Sync connection closed".to_string());
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Stream shell output (Shell v2 packets) to stdout/stderr until exit or CLSE.
 fn stream_shell_v2(
     transport: &mut dyn Transport,

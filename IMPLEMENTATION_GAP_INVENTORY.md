@@ -41,6 +41,19 @@ Landed since baseline `0e5e263` (no longer gaps):
   no longer fake-succeed, `install`'s post-SEND OKAY deadlock fixed;
   directory push/pull now fails explicitly (recursion remains missing).
   Daemon-faithful fake-adbd tests cover accept and FAIL paths.
+- Smart-socket command loop in the ADB server (`sockets.cpp`
+  `smart_socket_enqueue` semantics): the hex-length command layer stays
+  active for the whole connection; `host:transport:<serial>` /
+  `host:transport-any` bind a transport, and a following device service
+  (`root:`, `tcpip:`, `shell:...`, ...) is converted to A_OPEN on the
+  device transport with raw byte ⇄ WRTE/OKAY streaming — an official
+  AOSP client (adb, scrcpy, IDE) no longer has its hex prefix forwarded
+  as raw bytes to adbd. Device service without a selected transport
+  fails with AOSP's `device offline (no transport)`. `host:version` now
+  reports ADB_SERVER_VERSION 41 (`0029`), not the protocol version.
+  Command-length cap follows MAX_PAYLOAD (1 MiB), not 4 KiB. TCP path
+  only; the USB bridge keeps the legacy raw-frame relay (clone-free
+  constraint documented in `bridge_device_service`).
 
 ## Fastboot CLI — 12 gaps
 
