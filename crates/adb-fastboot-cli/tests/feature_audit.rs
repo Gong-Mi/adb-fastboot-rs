@@ -67,7 +67,7 @@ const MATRIX: &[FeatureStatus] = &[
         module: "ADB",
         feature: "Single-file push/pull",
         status: AcceptanceStatus::CliImplemented,
-        evidence: "CLI 有 push/pull，TCP fake-peer wire test 通过；真实设备未验证",
+        evidence: "SyncStream V1 push/pull 接通 CLI（SEND→DATA*→DONE→单一 OKAY/FAIL，AOSP daemon 语义）；daemon-faithful fake-adbd 测试覆盖 accept/FAIL 清理路径；真实设备未验证",
     },
     FeatureStatus {
         module: "ADB",
@@ -120,8 +120,8 @@ const MATRIX: &[FeatureStatus] = &[
     FeatureStatus {
         module: "ADB",
         feature: "Directory push/pull recursion",
-        status: AcceptanceStatus::CliImplemented,
-        evidence: "CLI 路径和 SYNC 递归代码存在；真实设备未验证",
+        status: AcceptanceStatus::TransportMissing,
+        evidence: "无实现：CLI push 遇目录显式报错；AOSP file_sync_client 的 do_sync_push/pull 递归（LIST+copyinfo 遍历、目录创建、-a 属性保留）未移植",
     },
     FeatureStatus {
         module: "Fastboot",

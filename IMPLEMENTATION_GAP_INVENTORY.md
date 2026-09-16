@@ -34,6 +34,13 @@ Landed since baseline `0e5e263` (no longer gaps):
   fake-adbd wire tests; real-device AUTH acceptance still pending).
 - Install/uninstall host workflows (`install`/`uninstall` CLI, APK push +
   `pm install` shell path).
+- SYNC single-file transfer wired to the CLI: `SyncStream` V1
+  push (SEND→DATA*→DONE, terminal OKAY/FAIL only after DONE per
+  `daemon/file_sync_service.cpp`), pull (RECV→DATA*→DONE with FAIL
+  partial-file cleanup), symlink push, polite QUIT+CLSE; `push`/`pull`
+  no longer fake-succeed, `install`'s post-SEND OKAY deadlock fixed;
+  directory push/pull now fails explicitly (recursion remains missing).
+  Daemon-faithful fake-adbd tests cover accept and FAIL paths.
 
 ## Fastboot CLI — 12 gaps
 

@@ -7,8 +7,8 @@ use adb_protocol::{
     AdbAuth, AdbMessageHeader, AdbServerTransport, AuthType, ShellV2Packet, TcpTransport,
     Transport, TransportError,
     A_AUTH, ADB_VERSION, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_STLS, A_WRTE, MAX_PAYLOAD_V2,
-    build_sync_send_req, build_sync_data_chunk, build_sync_done, SyncMessageHeader,
-    SYNC_FAIL, SYNC_OKAY,
+    build_sync_data_chunk, build_sync_done, build_sync_recv_req, build_sync_send_req,
+    saturating_mtime_u32, SyncMessageHeader, SYNC_FAIL, SYNC_OKAY,
 };
 
 mod server;
@@ -397,6 +397,12 @@ fn recv_wrte_all(transport: &mut dyn Transport, local_id: u32) -> Result<Vec<u8>
 }
 
 /// Read a sync response (expects OKAY or FAIL in SyncMessageHeader format).
+///
+/// Deprecated for the SEND flow: AOSP's adbd (`daemon/file_sync_service.cpp`
+/// `handle_send_file`) does NOT acknowledge a `SEND` request — it opens the
+/// file silently, consumes `DATA` until `DONE`, and only then emits a single
+/// `OKAY`/`FAIL`. Callers must stream SEND+DATA+DONE without waiting, then
+/// read exactly one terminal status via `SyncMessageReader`.
 fn recv_sync_response(transport: &mut dyn Transport, local_id: u32, _remote_id: u32) -> Result<(), String> {
     loop {
         let (hdr, payload) = match transport.recv_message() {
@@ -528,6 +534,260 @@ fn run_shell(
     let dest = format!("shell,v2,raw:{cmd}");
     let (local_id, remote_id) = open_service(transport, &dest, 1)?;
     stream_shell_v2(transport, local_id, remote_id, capture)
+}
+
+// ---------------------------------------------------------------------------
+// SYNC file transfer (AOSP client/file_sync_client.cpp parity, V1 protocol)
+// ---------------------------------------------------------------------------
+
+use adb_protocol::constants::{SYNC_DATA, SYNC_DONE, SYNC_QUIT};
+use byteorder::{ByteOrder as _, LittleEndian};
+
+/// Stream sync-protocol messages over an already-opened `sync:` service.
+/// Handles the WRTE/OKAY flow internally (each WRTE is ACKed immediately,
+/// AOSP `local_socket_ready_notify` semantics).
+pub struct SyncStream<'a> {
+    transport: &'a mut dyn Transport,
+    local_id: u32,
+    remote_id: u32,
+}
+
+impl<'a> SyncStream<'a> {
+    pub fn new(transport: &'a mut dyn Transport, local_id: u32, remote_id: u32) -> Self {
+        Self {
+            transport,
+            local_id,
+            remote_id,
+        }
+    }
+
+    /// Send one SYNC message (8-byte id/length header + optional payload)
+    /// as a single A_WRTE and wait for its A_OKAY ack.
+    pub fn send_msg(&mut self, id: u32, payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let mut buf = Vec::with_capacity(8 + payload.len());
+        let mut hdr = [0u8; 8];
+        LittleEndian::write_u32(&mut hdr[0..4], id);
+        LittleEndian::write_u32(&mut hdr[4..8], payload.len() as u32);
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(payload);
+        send_wrte(self.transport, self.local_id, self.remote_id, &buf)?;
+        Ok(())
+    }
+
+    /// Read exactly one SYNC message. A_OKAY acks for our own WRTEs are
+    /// consumed transparently; foreign WRTEs are ACKed and parsed.
+    pub fn recv_msg(&mut self) -> Result<(u32, Vec<u8>), Box<dyn std::error::Error>> {
+        loop {
+            let (hdr, payload) = self.transport.recv_message()?;
+            match hdr.command {
+                A_OKAY => continue,
+                A_WRTE => {
+                    let ack = AdbMessageHeader::new(A_OKAY, self.local_id, hdr.arg0, &[]);
+                    self.transport.send_message(&ack, &[])?;
+                    if payload.len() < 8 {
+                        return Err("SYNC message shorter than 8-byte header".into());
+                    }
+                    let id = LittleEndian::read_u32(&payload[0..4]);
+                    let len = LittleEndian::read_u32(&payload[4..8]) as usize;
+                    if len > payload.len() - 8 {
+                        return Err(format!(
+                            "SYNC {:#x} truncated: want {} bytes, got {}",
+                            id,
+                            len,
+                            payload.len() - 8
+                        )
+                        .into());
+                    }
+                    return Ok((id, payload[8..8 + len].to_vec()));
+                }
+                A_CLSE => {
+                    let ack = AdbMessageHeader::new(A_CLSE, self.local_id, hdr.arg0, &[]);
+                    let _ = self.transport.send_message(&ack, &[]);
+                    return Err("SYNC connection closed by device".into());
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Push one local file to the device (AOSP V1: SEND path,mode → DATA* →
+    /// DONE mtime → read exactly one terminal OKAY/FAIL). Returns bytes sent.
+    pub fn push_file(
+        &mut self,
+        local: &Path,
+        remote: &str,
+        mode: u32,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        use std::io::Read;
+
+        let meta = std::fs::symlink_metadata(local)
+            .map_err(|e| format!("cannot stat '{}': {e}", local.display()))?;
+
+        let mut payload = Vec::new();
+        build_sync_send_req(remote, mode, &mut payload)
+            .map_err(|e| format!("build SEND req: {e}"))?;
+        self.send_msg_from(&payload)?;
+
+        let total = meta.len();
+        if meta.is_symlink() {
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_link(local)?;
+                let t = target.to_string_lossy().into_owned();
+                let mut buf = Vec::new();
+                build_sync_data_chunk(t.as_bytes(), &mut buf)?;
+                self.send_msg_from(&buf)?;
+            }
+        } else {
+            let mut f = std::fs::File::open(local)
+                .map_err(|e| format!("cannot open '{}': {e}", local.display()))?;
+            let mut chunk = vec![0u8; adb_protocol::constants::SYNC_DATA_MAX];
+            loop {
+                let n = f.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                let mut buf = Vec::with_capacity(8 + n);
+                build_sync_data_chunk(&chunk[..n], &mut buf)?;
+                self.send_msg_from(&buf)?;
+            }
+        }
+
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| saturating_mtime_u32(d.as_secs() as i64))
+            .unwrap_or(0xFFFF_FFFF);
+        let mut buf = Vec::new();
+        build_sync_done(mtime, &mut buf)?;
+        self.send_msg_from(&buf)?;
+
+        let (id, msg) = self.recv_msg()?;
+        match id {
+            SYNC_OKAY => {}
+            SYNC_FAIL => {
+                return Err(format!(
+                    "device rejected push of {remote}: {}",
+                    String::from_utf8_lossy(&msg)
+                )
+                .into());
+            }
+            other => return Err(format!("unexpected SYNC reply after DONE: {other:#x}").into()),
+        }
+        let _ = total;
+        Ok(total)
+    }
+
+    /// Internal: send a pre-built SYNC byte buffer (8-byte header + payload
+    /// already serialized) as one WRTE, acked.
+    fn send_msg_from(&mut self, buf: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        send_wrte(self.transport, self.local_id, self.remote_id, buf)?;
+        Ok(())
+    }
+
+    /// Push an in-memory buffer to the device (used by `install`). Wire
+    /// order identical to `push_file`: SEND → DATA* → DONE → one OKAY/FAIL.
+    pub fn push_bytes(
+        &mut self,
+        remote: &str,
+        data: &[u8],
+        mode: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut buf = Vec::new();
+        build_sync_send_req(remote, mode, &mut buf)?;
+        self.send_msg_from(&buf)?;
+
+        const MAX_CHUNK: usize = 64 * 1024;
+        for chunk in data.chunks(MAX_CHUNK) {
+            let mut buf = Vec::with_capacity(8 + chunk.len());
+            build_sync_data_chunk(chunk, &mut buf)?;
+            self.send_msg_from(&buf)?;
+        }
+
+        let mut buf = Vec::new();
+        build_sync_done(0xFFFF_FFFF, &mut buf)?;
+        self.send_msg_from(&buf)?;
+
+        let (id, msg) = self.recv_msg()?;
+        match id {
+            SYNC_OKAY => Ok(()),
+            SYNC_FAIL => Err(format!(
+                "device rejected push of {remote}: {}",
+                String::from_utf8_lossy(&msg)
+            )
+            .into()),
+            other => Err(format!("unexpected SYNC reply after DONE: {other:#x}").into()),
+        }
+    }
+
+    /// Pull one remote file to a local path (AOSP V1 sync_recv_v1: send
+    /// RECV path → read DATA* until DONE, writing through; FAIL aborts).
+    pub fn pull_file(
+        &mut self,
+        remote: &str,
+        local: &Path,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        use std::io::Write;
+
+        let mut payload = Vec::new();
+        build_sync_recv_req(remote, &mut payload)?;
+        self.send_msg_from(&payload)?;
+
+        // AOSP unlinks any existing target first.
+        let _ = std::fs::remove_file(local);
+        let mut out = std::fs::File::create(local)
+            .map_err(|e| format!("cannot create '{}': {e}", local.display()))?;
+
+        let mut copied: u64 = 0;
+        loop {
+            let (id, data) = self.recv_msg()?;
+            match id {
+                SYNC_DATA => {
+                    out.write_all(&data)?;
+                    copied += data.len() as u64;
+                }
+                // V1 DONE carries mtime in the length field; recv_msg returns
+                // it as an empty payload. AOSP pull applies it only with -a
+                // (copy_attrs); not implemented yet, so we ignore it.
+                SYNC_DONE => break,
+                SYNC_FAIL => {
+                    let _ = std::fs::remove_file(local);
+                    return Err(format!(
+                        "pull {remote} failed: {}",
+                        String::from_utf8_lossy(&data)
+                    )
+                    .into());
+                }
+                SYNC_OKAY => {
+                    // Legacy AOSP quirk: pre-DONE OKAY must not terminate.
+                    return Err(format!("unexpected SYNC OKAY during recv of {remote}").into());
+                }
+                other => {
+                    let _ = std::fs::remove_file(local);
+                    return Err(format!("unexpected SYNC id {other:#x} during recv").into());
+                }
+            }
+        };
+        out.flush()?;
+        Ok(copied)
+    }
+
+    /// Close the sync stream politely (AOSP ~SyncConnection: QUIT, drain
+    /// until the device answers, then CLSE both ways).
+    pub fn quit(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut buf = Vec::new();
+        let mut hdr = [0u8; 8];
+        LittleEndian::write_u32(&mut hdr[0..4], SYNC_QUIT);
+        LittleEndian::write_u32(&mut hdr[4..8], 0);
+        buf.extend_from_slice(&hdr);
+        // QUIT: no reply is expected (AOSP just closes); send best-effort.
+        let wrte = AdbMessageHeader::new(A_WRTE, self.local_id, self.remote_id, &buf);
+        let _ = self.transport.send_message(&wrte, &buf);
+        let clse = AdbMessageHeader::new(A_CLSE, self.local_id, self.remote_id, &[]);
+        let _ = self.transport.send_message(&clse, &[]);
+        Ok(())
+    }
 }
 
 /// Ensure ADB server daemon is running on 127.0.0.1:5037.
@@ -709,10 +969,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (_info, mut transport) =
                 connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
 
-            let sync_dest = b"sync:";
-            let open_hdr = AdbMessageHeader::new(A_OPEN, 1, 0, sync_dest);
-            transport.send_message(&open_hdr, sync_dest)?;
-            println!("[adb-rs] Connected sync transport to {} for push '{}' -> '{}'", addr, local, remote);
+            let local_path = Path::new(local);
+            let meta = std::fs::symlink_metadata(local_path)
+                .map_err(|e| format!("cannot stat '{local}': {e}"))?;
+            if meta.is_dir() {
+                return Err("push of directories is not implemented (single files only)".into());
+            }
+
+            let (local_id, remote_id) = open_service(&mut transport, "sync:", 1)?;
+            let mut sync = SyncStream::new(&mut transport, local_id, remote_id);
+            // AOSP sends the local st_mode verbatim (file type bits included).
+            let mode = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    meta.mode()
+                }
+                #[cfg(not(unix))]
+                {
+                    0o100644
+                }
+            };
+            let bytes = sync.push_file(local_path, remote, mode)?;
+            sync.quit()?;
+            println!("{local} -> {remote} ({} bytes)", bytes);
         }
         Commands::Pull { remote, local } => {
             let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
@@ -725,10 +1005,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (_info, mut transport) =
                 connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
 
-            let sync_dest = b"sync:";
-            let open_hdr = AdbMessageHeader::new(A_OPEN, 1, 0, sync_dest);
-            transport.send_message(&open_hdr, sync_dest)?;
-            println!("[adb-rs] Connected sync transport to {} for pull '{}' -> '{}'", addr, remote, local);
+            // AOSP: if <dest> is an existing directory, pull into it using
+            // the remote basename.
+            let local_path = {
+                let p = Path::new(local);
+                if p.is_dir() {
+                    let base = remote.rsplit('/').next().filter(|s| !s.is_empty());
+                    match base {
+                        Some(b) => p.join(b),
+                        None => p.to_path_buf(),
+                    }
+                } else {
+                    p.to_path_buf()
+                }
+            };
+
+            let (local_id, remote_id) = open_service(&mut transport, "sync:", 1)?;
+            let mut sync = SyncStream::new(&mut transport, local_id, remote_id);
+            let bytes = sync.pull_file(remote, &local_path)?;
+            sync.quit()?;
+            println!("{remote} -> {} ({} bytes)", local_path.display(), bytes);
         }
         Commands::Reboot { target } => {
             let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
@@ -836,41 +1132,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Open sync: service
             let (local_id, remote_id) = open_service(&mut transport, "sync:", 1)?;
 
-            // Build SEND request
-            let mut send_buf = Vec::new();
-            build_sync_send_req(&remote_apk, 0o644, &mut send_buf)
-                .map_err(|e| format!("Build SEND req failed: {e}"))?;
+            // AOSP wire order (daemon/file_sync_service.cpp handle_send_file):
+            // SEND → DATA* → DONE, and only ONE terminal OKAY/FAIL after
+            // DONE. Waiting for OKAY after SEND would block forever.
             println!("[adb-rs] Pushing {file_name} ({} bytes) to {remote_apk} ...", apk_data.len());
-
-            // Send SEND request
-            send_wrte(&mut transport, local_id, remote_id, &send_buf)?;
-
-            // Expect SYNC_OKAY
-            recv_sync_response(&mut transport, local_id, remote_id)?;
-
-            // Send DATA chunks (max 64KB each)
-            const MAX_CHUNK: usize = 64 * 1024;
-            for chunk in apk_data.chunks(MAX_CHUNK) {
-                let mut data_buf = Vec::new();
-                build_sync_data_chunk(chunk, &mut data_buf)
-                    .map_err(|e| format!("Build DATA chunk failed: {e}"))?;
-                send_wrte(&mut transport, local_id, remote_id, &data_buf)?;
-            }
-
-            // Send DONE
-            let mut done_buf = Vec::new();
-            build_sync_done(0xFFFF_FFFF, &mut done_buf) // use max mtime
-                .map_err(|e| format!("Build DONE failed: {e}"))?;
-            send_wrte(&mut transport, local_id, remote_id, &done_buf)?;
-
-            // Expect SYNC_OKAY or SYNC_FAIL
-            recv_sync_response(&mut transport, local_id, remote_id)?;
-
-            // Close sync connection
-            let clse_hdr = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
-            transport.send_message(&clse_hdr, &[])?;
-            // Wait for CLSE ack
-            let _ = transport.recv_message();
+            let mut sync = SyncStream::new(&mut transport, local_id, remote_id);
+            sync.push_bytes(&remote_apk, &apk_data, 0o100644)?;
 
             println!("[adb-rs] Push complete. Installing {remote_apk} ...");
 
@@ -1007,6 +1274,264 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use adb_protocol::constants::{A_AUTH_RSAKEY, A_AUTH_SIGNATURE, A_AUTH_TOKEN};
+
+    /// Script a fake adbd `sync:` conversation per daemon semantics:
+    /// replies CNXN to the client handshake, OKAY to A_OPEN("sync:"),
+    /// then runs `script` against decoded sync messages.
+    /// Returns the join handle plus a shared buffer of observed sync ids.
+    struct FakeSyncDaemon {
+        listener: std::net::TcpListener,
+    }
+
+    impl FakeSyncDaemon {
+        fn bind() -> Self {
+            Self {
+                listener: std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            }
+        }
+
+        fn addr(&self) -> std::net::SocketAddr {
+            self.listener.local_addr().unwrap()
+        }
+
+        /// Accept one client, run the handshake + sync: open, and then
+        /// invoke `on_sync` with the message stream reader/writer.
+        fn serve<F>(self, f: F) -> std::thread::JoinHandle<Vec<u32>>
+        where
+            F: FnOnce(&mut dyn FnMut() -> (u32, Vec<u8>), &mut dyn FnMut(u32, &[u8])) -> Vec<u32>
+                + Send
+                + 'static,
+        {
+            use std::io::{Read, Write};
+            std::thread::spawn(move || {
+                let (sock, _) = self.listener.accept().unwrap();
+                let mut sock = sock;
+                let mut buf = [0u8; 24];
+
+                // client CNXN → server CNXN
+                sock.read_exact(&mut buf).unwrap();
+                let h = AdbMessageHeader::decode(&buf).unwrap();
+                assert_eq!(h.command, A_CNXN);
+                let mut p = vec![0u8; h.data_length as usize];
+                if !p.is_empty() {
+                    sock.read_exact(&mut p).unwrap();
+                }
+                let banner = b"device::ro.product.name=fake".to_vec();
+                let resp = AdbMessageHeader::new(A_CNXN, 0x01000001, 1024 * 1024, &banner);
+                let mut hdrb = [0u8; 24];
+                resp.encode(&mut hdrb);
+                sock.write_all(&hdrb).unwrap();
+                sock.write_all(&banner).unwrap();
+                sock.flush().unwrap();
+
+                // client A_OPEN("sync:") → OKAY(remote_id=7, local_id=client)
+                sock.read_exact(&mut buf).unwrap();
+                let open = AdbMessageHeader::decode(&buf).unwrap();
+                assert_eq!(open.command, A_OPEN);
+                let mut svc = vec![0u8; open.data_length as usize];
+                sock.read_exact(&mut svc).unwrap();
+                assert_eq!(&svc, b"sync:");
+                let okay = AdbMessageHeader::new(A_OKAY, 7, open.arg0, &[]);
+                okay.encode(&mut hdrb);
+                sock.write_all(&hdrb).unwrap();
+                sock.flush().unwrap();
+
+                // sync message pump (daemon side: reads SYNC requests from
+                // A_WRTE, writes A_OKAY acks and SYNC responses in A_WRTE).
+                let client_id = open.arg0;
+                let mut dsock = sock.try_clone().unwrap();
+                let mut rsock = sock.try_clone().unwrap();
+                let mut asock = sock.try_clone().unwrap();
+                let mut wsock = sock;
+                let mut reader = move || -> (u32, Vec<u8>) {
+                    let mut hb = [0u8; 24];
+                    rsock.read_exact(&mut hb).unwrap();
+                    let h = AdbMessageHeader::decode(&hb).unwrap();
+                    assert_eq!(h.command, A_WRTE);
+                    let mut pay = vec![0u8; h.data_length as usize];
+                    rsock.read_exact(&mut pay).unwrap();
+                    // ack every client WRTE (AOSP always acks)
+                    let ack = AdbMessageHeader::new(A_OKAY, 7, client_id, &[]);
+                    let mut ab = [0u8; 24];
+                    ack.encode(&mut ab);
+                    asock.write_all(&ab).unwrap();
+                    asock.flush().unwrap();
+                    (
+                        byteorder::LittleEndian::read_u32(&pay[0..4]),
+                        pay[8..].to_vec(),
+                    )
+                };
+                let mut writer = move |id: u32, payload: &[u8]| {
+                    let mut msg = Vec::with_capacity(8 + payload.len());
+                    let mut hb = [0u8; 8];
+                    byteorder::LittleEndian::write_u32(&mut hb[0..4], id);
+                    byteorder::LittleEndian::write_u32(&mut hb[4..8], payload.len() as u32);
+                    msg.extend_from_slice(&hb);
+                    msg.extend_from_slice(payload);
+                    let wr = AdbMessageHeader::new(A_WRTE, 7, client_id, &msg);
+                    let mut wb = [0u8; 24];
+                    wr.encode(&mut wb);
+                    wsock.write_all(&wb).unwrap();
+                    wsock.write_all(&msg).unwrap();
+                    wsock.flush().unwrap();
+                };
+                let out = f(&mut reader, &mut writer);
+                // AOSP adbd does not tear the socket down right after the
+                // last response: it keeps draining client WRTEs (which are
+                // acks for our DATA/DONE frames) until the client closes.
+                // Without this, the client's final ack hits a closed socket.
+                // A read timeout guarantees termination when the client is
+                // still alive (transport drops only at test end).
+                let _ = dsock.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
+                let mut drain = [0u8; 24];
+                loop {
+                    match dsock.read_exact(&mut drain) {
+                        Ok(()) => match AdbMessageHeader::decode(&drain) {
+                            Ok(h) => {
+                                let mut p = vec![0u8; h.data_length as usize];
+                                if h.data_length > 0 && dsock.read_exact(&mut p).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        },
+                        Err(_) => break,
+                    }
+                }
+                out
+            })
+        }
+    }
+
+    use byteorder::ByteOrder as _;
+
+    /// Connect a client transport + sync stream to the fake daemon.
+    fn client_to_sync_daemon(
+        addr: std::net::SocketAddr,
+    ) -> (
+        Box<dyn Transport>,
+        u32,
+        u32,
+    ) {
+        let transport = TcpTransport::connect_timeout(
+            &format!("127.0.0.1:{}", addr.port()),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let auth = AdbAuth::generate("sync-test@localhost").unwrap();
+        let (_info, mut transport) =
+            connect_and_handshake_with_tls_upgrade(transport, b"host::", &auth).unwrap();
+        let (lid, rid) = open_service(&mut transport, "sync:", 1).unwrap();
+        (transport, lid, rid)
+    }
+
+    /// AOSP daemon: SEND is NOT acknowledged. OKAY comes exactly once, after
+    /// DONE. A client that waits for OKAY after SEND blocks forever. This
+    /// test encodes that wire contract and drives SyncStream::push_bytes.
+    #[test]
+    fn test_sync_push_daemon_faithful_okay_only_after_done() {
+        let daemon = FakeSyncDaemon::bind();
+        let daddr = daemon.addr();
+        let handle = daemon.serve(|read, write| {
+            let mut seen = Vec::new();
+            // 1. SEND
+            let (id, payload) = read();
+            seen.push(id);
+            assert_eq!(id, SYNC_SEND_L);
+            let req = String::from_utf8_lossy(&payload).to_string();
+            assert!(req.starts_with("/data/local/tmp/x.bin,0o100644") || req.starts_with("/data/local/tmp/x.bin,33188"), "got {req}");
+            // ... NO OKAY here. Daemon opens file silently.
+
+            // 2. DATA*
+            loop {
+                let (id, payload) = read();
+                seen.push(id);
+                if id == SYNC_DONE_L {
+                    assert!(payload.is_empty());
+                    break;
+                }
+                assert_eq!(id, SYNC_DATA_L);
+                assert_eq!(&payload, b"PUSHED!");
+            }
+
+            // 3. OKAY after DONE
+            write(0x59414B4F /* OKAY */, &[]);
+            seen
+        });
+
+        let (mut transport, lid, rid) = client_to_sync_daemon(daddr);
+        let mut sync = SyncStream::new(&mut transport, lid, rid);
+        sync.push_bytes("/data/local/tmp/x.bin", b"PUSHED!", 0o100644)
+            .unwrap();
+        drop(sync);
+        let seen = handle.join().unwrap();
+        assert_eq!(
+            seen,
+            vec![SYNC_SEND_L, SYNC_DATA_L, SYNC_DONE_L],
+            "push must be SEND → DATA → DONE with no interleaved waits"
+        );
+    }
+
+    const SYNC_SEND_L: u32 = 0x444E4553; // "SEND"
+    const SYNC_DATA_L: u32 = 0x41544144; // "DATA"
+    const SYNC_DONE_L: u32 = 0x454E4F44; // "DONE"
+
+    /// pull_file must drain DATA chunks until DONE and write exactly the
+    /// concatenated bytes; FAIL must abort without leaving a partial file
+    /// when the open fails mid-transfer.
+    #[test]
+    fn test_sync_pull_writes_all_data_until_done() {
+        let daemon = FakeSyncDaemon::bind();
+        let daddr = daemon.addr();
+        let handle = daemon.serve(|read, write| {
+            let mut seen = Vec::new();
+            let (id, payload) = read();
+            seen.push(id);
+            assert_eq!(id, 0x56434552u32 /* RECV */);
+            assert_eq!(payload, b"/remote/file.bin");
+            // reply DATA chunks with mtime=123456 DONE terminator
+            write(SYNC_DATA_L, b"AAAA");
+            write(SYNC_DATA_L, b"BBBB");
+            write(SYNC_DONE_L, &[]); // daemon sets length=0 for DONE on recv
+            seen
+        });
+
+        let out = std::env::temp_dir().join(format!("pull-test-{}", std::process::id()));
+        let (mut transport, lid, rid) = client_to_sync_daemon(daddr);
+        {
+            let mut sync = SyncStream::new(&mut transport, lid, rid);
+            let n = sync.pull_file("/remote/file.bin", &out).unwrap();
+            assert_eq!(n, 8);
+        }
+        assert_eq!(std::fs::read(&out).unwrap(), b"AAAABBBB");
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(handle.join().unwrap(), vec![0x56434552u32]);
+    }
+
+    /// FAIL from the device during pull: the partial local file must be
+    /// removed and the error surfaced.
+    #[test]
+    fn test_sync_pull_fail_removes_partial_file() {
+        let daemon = FakeSyncDaemon::bind();
+        let daddr = daemon.addr();
+        let handle = daemon.serve(|read, write| {
+            let (id, _) = read();
+            assert_eq!(id, 0x56434552u32);
+            write(SYNC_DATA_L, b"PARTIAL");
+            write(0x4C494146u32 /* FAIL */, b"open failed");
+            vec![id]
+        });
+
+        let out = std::env::temp_dir().join(format!("pull-fail-{}", std::process::id()));
+        let (mut transport, lid, rid) = client_to_sync_daemon(daddr);
+        {
+            let mut sync = SyncStream::new(&mut transport, lid, rid);
+            let err = sync.pull_file("/remote/x", &out).unwrap_err().to_string();
+            assert!(err.contains("pull /remote/x failed"), "got {err}");
+        }
+        assert!(!out.exists(), "partial file must be cleaned up on FAIL");
+        let _ = handle.join();
+    }
 
     /// Fake-adbd end-to-end AUTH conversation over a real TCP transport:
     /// server sends A_AUTH TOKEN → client answers SIGNATURE → server accepts
