@@ -6,16 +6,16 @@ This file separates design/implementation work from device acceptance. Passing u
 
 ## Current count
 
-There are 30 identified design items that are not fully landed in code:
+There are 28 identified design items that are not fully landed in code:
 
-- ADB: 9
+- ADB: 8
 - Fastboot CLI: 12
 - Fastboot protocol/image: 5
 - AIDL: 4
 
 The count is an implementation-gap count, not an acceptance score.
 
-## ADB — 9 gaps
+## ADB — 8 gaps
 
 1. Complete `A_STLS` upgrade state machine.
 2. TLS transport integration and plaintext fallback state handling.
@@ -25,7 +25,15 @@ The count is an implementation-gap count, not an acceptance score.
 6. ADB server USB watcher and hotplug lifecycle.
 7. Complete USB claim/reset/permission lifecycle.
 8. `exec-out`, PTY, and transport-feature parity.
-9. Install/uninstall host workflows.
+
+Landed since baseline `0e5e263` (no longer gaps):
+
+- RSA AUTH client loop: persistent user key (`$HOME/.android/adbkey`,
+  generated on first use), `ADB_VENDOR_KEYS` rotation, A_AUTH TOKEN →
+  SIGNATURE → RSAPUBLICKEY fallback in the connect handshake (`ed9f488`,
+  fake-adbd wire tests; real-device AUTH acceptance still pending).
+- Install/uninstall host workflows (`install`/`uninstall` CLI, APK push +
+  `pm install` shell path).
 
 ## Fastboot CLI — 12 gaps
 
