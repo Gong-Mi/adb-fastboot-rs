@@ -608,6 +608,13 @@ pub struct SyncStream<'a> {
     transport: &'a mut dyn Transport,
     local_id: u32,
     remote_id: u32,
+    /// Bytes received in WRTE payloads but not yet consumed by a sync
+    /// message parser. Needed because adbd frames by its read buffer, not
+    /// by sync message: LIST replies (many 20+namelen DENT records) can
+    /// share WRTEs or span them. `recv_msg` (one-message-per-WRTE) stays
+    /// valid for request/response steps where the daemon writes a single
+    /// message and nothing else is in flight.
+    pending: Vec<u8>,
 }
 
 impl<'a> SyncStream<'a> {
@@ -616,7 +623,35 @@ impl<'a> SyncStream<'a> {
             transport,
             local_id,
             remote_id,
+            pending: Vec::new(),
         }
+    }
+
+    /// Take exactly `n` bytes from the sync byte stream, pulling more
+    /// WRTEs as needed (A_OKAYs consumed, A_WRTEs acked, A_CLSE = error).
+    fn read_sync_bytes(&mut self, n: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        while self.pending.len() < n {
+            let (hdr, payload) = self.transport.recv_message()?;
+            match hdr.command {
+                A_OKAY => continue, // pure acks carry no sync bytes
+                A_WRTE => {
+                    let ack = AdbMessageHeader::new(A_OKAY, self.local_id, hdr.arg0, &[]);
+                    self.transport.send_message(&ack, &[])?;
+                    self.pending.extend_from_slice(&payload);
+                }
+                A_CLSE => {
+                    let ack = AdbMessageHeader::new(A_CLSE, self.local_id, hdr.arg0, &[]);
+                    let _ = self.transport.send_message(&ack, &[]);
+                    return Err(format!(
+                        "SYNC stream closed by device with {} buffered bytes (wanted {n})",
+                        self.pending.len()
+                    )
+                    .into());
+                }
+                _ => continue,
+            }
+        }
+        Ok(self.pending.drain(..n).collect())
     }
 
     /// Send one SYNC message (8-byte id/length header + optional payload)
@@ -632,40 +667,24 @@ impl<'a> SyncStream<'a> {
         Ok(())
     }
 
-    /// Read exactly one SYNC message. A_OKAY acks for our own WRTEs are
-    /// consumed transparently; foreign WRTEs are ACKed and parsed.
+    /// Read exactly one SYNC message from the byte stream (id u32 + len u32
+    /// + len payload bytes, AOSP `ReadFdExactly` discipline). WRTE framing
+    /// is irrelevant to correctness now that reads go through
+    /// `read_sync_bytes`: one frame may carry several messages (LIST's
+    /// DENTs) and one message may span frames; both are handled.
     pub fn recv_msg(&mut self) -> Result<(u32, Vec<u8>), Box<dyn std::error::Error>> {
-        loop {
-            let (hdr, payload) = self.transport.recv_message()?;
-            match hdr.command {
-                A_OKAY => continue,
-                A_WRTE => {
-                    let ack = AdbMessageHeader::new(A_OKAY, self.local_id, hdr.arg0, &[]);
-                    self.transport.send_message(&ack, &[])?;
-                    if payload.len() < 8 {
-                        return Err("SYNC message shorter than 8-byte header".into());
-                    }
-                    let id = LittleEndian::read_u32(&payload[0..4]);
-                    let len = LittleEndian::read_u32(&payload[4..8]) as usize;
-                    if len > payload.len() - 8 {
-                        return Err(format!(
-                            "SYNC {:#x} truncated: want {} bytes, got {}",
-                            id,
-                            len,
-                            payload.len() - 8
-                        )
-                        .into());
-                    }
-                    return Ok((id, payload[8..8 + len].to_vec()));
-                }
-                A_CLSE => {
-                    let ack = AdbMessageHeader::new(A_CLSE, self.local_id, hdr.arg0, &[]);
-                    let _ = self.transport.send_message(&ack, &[]);
-                    return Err("SYNC connection closed by device".into());
-                }
-                _ => continue,
-            }
+        let head = self.read_sync_bytes(8)?;
+        let id = LittleEndian::read_u32(&head[0..4]);
+        let len = LittleEndian::read_u32(&head[4..8]) as usize;
+        if len > 64 * 1024 * 1024 {
+            return Err(format!("SYNC {id:#x} claims implausible length {len}").into());
         }
+        let payload = if len == 0 {
+            Vec::new()
+        } else {
+            self.read_sync_bytes(len)?
+        };
+        Ok((id, payload))
     }
 
     /// Push one local file to the device (AOSP V1: SEND path,mode → DATA* →
@@ -781,6 +800,11 @@ impl<'a> SyncStream<'a> {
 
     /// Pull one remote file to a local path (AOSP V1 sync_recv_v1: send
     /// RECV path → read DATA* until DONE, writing through; FAIL aborts).
+    ///
+    /// DONE is parsed from the 8-byte head directly: in V1 the length
+    /// field carries the file's MTIME, not a payload size
+    /// (daemon `msg.data.size = mtime`), so a generic id+len+body read
+    /// would try to consume a timestamp's worth of bytes and hang.
     pub fn pull_file(
         &mut self,
         remote: &str,
@@ -799,21 +823,24 @@ impl<'a> SyncStream<'a> {
 
         let mut copied: u64 = 0;
         loop {
-            let (id, data) = self.recv_msg()?;
+            let head = self.read_sync_bytes(8)?;
+            let id = LittleEndian::read_u32(&head[0..4]);
+            let len = LittleEndian::read_u32(&head[4..8]) as usize;
             match id {
                 SYNC_DATA => {
+                    let data = self.read_sync_bytes(len)?;
                     out.write_all(&data)?;
                     copied += data.len() as u64;
                 }
-                // V1 DONE carries mtime in the length field; recv_msg returns
-                // it as an empty payload. AOSP pull applies it only with -a
-                // (copy_attrs); not implemented yet, so we ignore it.
+                // V1 DONE: len field is the remote mtime. AOSP pull applies
+                // it only with -a (copy_attrs); not implemented yet.
                 SYNC_DONE => break,
                 SYNC_FAIL => {
+                    let msg = self.read_sync_bytes(len.min(4096))?;
                     let _ = std::fs::remove_file(local);
                     return Err(format!(
                         "pull {remote} failed: {}",
-                        String::from_utf8_lossy(&data)
+                        String::from_utf8_lossy(&msg)
                     )
                     .into());
                 }
@@ -826,9 +853,246 @@ impl<'a> SyncStream<'a> {
                     return Err(format!("unexpected SYNC id {other:#x} during recv").into());
                 }
             }
-        };
+        }
         out.flush()?;
         Ok(copied)
+    }
+
+    /// V1 `STAT` on a remote path (AOSP `sync_stat_fallback`). The reply is
+    /// a FIXED 16-byte `sync_stat_v1` struct (id, mode, size, mtime —
+    /// file_sync_protocol.h:49), NOT an 8+payload frame: `do_stat` writes
+    /// `sizeof(sync_stat_v1)` bytes. Returns `None` for the AOSP "does not
+    /// exist" reply (all-zero mode/size/mtime, which the daemon sends for
+    /// missing paths) — ENOENT and protocol errors must not be conflated.
+    pub fn stat_v1(&mut self, remote: &str) -> Result<Option<adb_protocol::SyncStatResponse>, Box<dyn std::error::Error>> {
+        let mut buf = Vec::new();
+        adb_protocol::build_sync_stat_req(remote, &mut buf)?;
+        self.send_msg_from(&buf)?;
+        let head = self.read_sync_bytes(16)?;
+        let id = LittleEndian::read_u32(&head[0..4]);
+        if id != adb_protocol::constants::SYNC_STAT {
+            return Err(format!("unexpected reply {id:#x} to STAT, want STAT").into());
+        }
+        let resp = adb_protocol::SyncStatResponse::decode(&head[4..16])
+            .map_err(|e| format!("malformed STAT reply for {remote}: {e}"))?;
+        Ok(resp.exists().then_some(resp))
+    }
+
+    /// V1 `LIST` on a remote directory (AOSP `sync_ls`,
+    /// file_sync_client.cpp FinishLsImpl + daemon do_list): the reply is a
+    /// *byte stream* of fixed 20-byte `sync_dent_v1` records (id, mode,
+    /// size, mtime, namelen) each followed by `namelen` name bytes,
+    /// terminated by a 20-byte DONE (id=DONE, rest zeroed). WRTE framing
+    /// carries no message boundaries (adbd forwards whatever its read
+    /// buffer yields — multiple DENTs may share one WRTE, one DENT may
+    /// span two), so parse from the stream buffer, not per-WRTE.
+    /// A missing directory replies with an empty listing (daemon opendir
+    /// failure falls through to DONE), matching AOSP.
+    pub fn list_dir(&mut self, remote: &str) -> Result<Vec<adb_protocol::SyncDentResponse>, Box<dyn std::error::Error>> {
+        let mut buf = Vec::new();
+        adb_protocol::build_sync_list_req(remote, &mut buf)?;
+        self.send_msg_from(&buf)?;
+        let mut entries = Vec::new();
+        loop {
+            let head = self.read_sync_bytes(20)?;
+            let id = LittleEndian::read_u32(&head[0..4]);
+            match id {
+                adb_protocol::constants::SYNC_DENT => {
+                    let namelen = LittleEndian::read_u32(&head[16..20]) as usize;
+                    // AOSP enforces NAME_MAX: `if (len > 255) return false`
+                    // (FinishLsImpl, char buf[256]).
+                    if namelen > 255 {
+                        return Err(format!(
+                            "DENT namelen {namelen} exceeds NAME_MAX in listing of {remote}"
+                        )
+                        .into());
+                    }
+                    let name_bytes = self.read_sync_bytes(namelen)?;
+                    // Re-assemble the full 20+namelen record for the
+                    // codec-level decoder (keeps one source of truth).
+                    let mut rec = head.clone();
+                    rec.extend_from_slice(&name_bytes);
+                    let dent = adb_protocol::SyncDentResponse::decode(&rec).map_err(|e| {
+                        format!("malformed DENT in listing of {remote}: {e}")
+                    })?;
+                    entries.push(dent);
+                }
+                adb_protocol::constants::SYNC_DONE => break, // rest zeroed (20-byte do_list DONE)
+                adb_protocol::constants::SYNC_FAIL => {
+                    // SendSyncFail is 8+len ({FAIL, len} + message); we have
+                    // consumed a 20-byte head, so the message began 8 bytes
+                    // in — recover it from the tail and read the remainder.
+                    let len = LittleEndian::read_u32(&head[4..8]) as usize;
+                    let mut detail = head[8..].to_vec();
+                    if len > 12 && len <= 4096 {
+                        detail.extend_from_slice(&self.read_sync_bytes(len - 12)?);
+                    }
+                    let detail = String::from_utf8_lossy(&detail[..detail.len().min(len)]).into_owned();
+                    return Err(format!("cannot list {remote}: {detail}").into());
+                }
+                other => {
+                    return Err(format!("unexpected SYNC id {other:#x} during LIST of {remote}").into())
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Recursive directory push (AOSP `local_build_list` +
+    /// `copy_local_dir_remote` V1 path, file_sync_client.cpp:1288-1327,
+    /// 1336-1447). Directory creation is a SEND side effect: the daemon
+    /// runs `secure_mkdirs(Dirname(path))` before opening each file
+    /// (daemon/file_sync_service.cpp:366,485), so no explicit mkdir is
+    /// needed on the V1 path. AOSP's `mkdir` -via-shell workaround for the
+    /// Android-P bug (b/110953234) is deliberately not ported: it only
+    /// matters for devices lacking `fixed_push_mkdir`, and it cannot
+    /// create directories whose SEND target is a leaf file.
+    ///
+    /// Special files (anything other than regular/symlink) are skipped with
+    /// a warning, matching AOSP `should_push_file`. Returns (files, bytes).
+    pub fn push_dir(&mut self, local: &Path, remote: &str) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+        use std::collections::VecDeque;
+
+        let mut stack = VecDeque::new();
+        stack.push_back((local.to_path_buf(), remote.to_string()));
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+
+        while let Some((ldir, rdir)) = stack.pop_front() {
+            let rd = std::fs::read_dir(&ldir)
+                .map_err(|e| format!("cannot open '{}': {e}", ldir.display()))?;
+            let mut subdirs = Vec::new();
+            for entry in rd {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    eprintln!("[adb-rs] warning: skipping non-UTF-8 name in {}", ldir.display());
+                    continue;
+                };
+                let lpath = entry.path();
+                let rpath = format!("{rdir}/{name}");
+                let meta = std::fs::symlink_metadata(&lpath)
+                    .map_err(|e| format!("cannot lstat '{}': {e}", lpath.display()))?;
+                let ftype = meta.file_type();
+                if ftype.is_dir() {
+                    subdirs.push((lpath.clone(), rpath));
+                } else if ftype.is_file() || ftype.is_symlink() {
+                    // AOSP sends the local st_mode verbatim. The mode string
+                    // form "{path},{mode}" is what build_sync_send_req writes.
+                    let mode = {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            meta.mode()
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            if ftype.is_symlink() { 0o120777 } else { 0o100644 }
+                        }
+                    };
+                    let n = self.push_file(&lpath, &rpath, mode)?;
+                    files += 1;
+                    bytes += n;
+                    println!("pushed: {} -> {}", lpath.display(), rpath);
+                } else {
+                    eprintln!(
+                        "[adb-rs] skipping special file '{}' (mode = 0o{:o})",
+                        lpath.display(),
+                        {
+                            #[cfg(unix)]
+                            { use std::os::unix::fs::MetadataExt; meta.mode() }
+                            #[cfg(not(unix))]
+                            { 0 }
+                        }
+                    );
+                }
+            }
+            // Recurse breadth-first like AOSP's dirlist loop.
+            for sd in subdirs {
+                stack.push_back(sd);
+            }
+        }
+        Ok((files, bytes))
+    }
+
+    /// Recursive directory pull (AOSP `remote_build_list` +
+    /// `copy_remote_dir_local` V1 path, file_sync_client.cpp:1547-1662).
+    /// LIST each remote dir; symlink entries get an extra `STAT`
+    /// (follow-link) to decide dir-vs-file exactly like AOSP's linklist
+    /// pass; dirs are created locally before their contents, files pulled
+    /// with RECV. Special files (non regular/symlink) skipped with a
+    /// warning per `should_pull_file`. Returns (files, bytes).
+    pub fn pull_dir(&mut self, remote: &str, local: &Path) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+        use std::collections::VecDeque;
+
+        std::fs::create_dir_all(local)
+            .map_err(|e| format!("cannot create '{}': {e}", local.display()))?;
+
+        let mut stack = VecDeque::new();
+        stack.push_back((remote.to_string(), local.to_path_buf()));
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+
+        const S_IFMT: u32 = 0o170000;
+        const S_IFDIR: u32 = 0o040000;
+        const S_IFLNK: u32 = 0o120000;
+        const S_IFREG: u32 = 0o100000;
+
+        while let Some((rdir, ldir)) = stack.pop_front() {
+            std::fs::create_dir_all(&ldir)
+                .map_err(|e| format!("failed to create directory '{}': {e}", ldir.display()))?;
+            for dent in self.list_dir(&rdir)? {
+                let name = dent.name.clone();
+                if name == "." || name == ".." {
+                    continue; // AOSP IsDotOrDotDot guard, kept defensive
+                }
+                let rpath = format!("{rdir}/{name}");
+                let lpath = ldir.join(&name);
+                match dent.mode & S_IFMT {
+                    S_IFDIR => stack.push_back((rpath, lpath)),
+                    S_IFLNK => {
+                        // AOSP: a symlink is a directory if its *target*
+                        // stats as one (linklist pass, file_sync_client.cpp
+                        // :1584-1596; daemon do_stat uses stat() = follow).
+                        // Stat failure: warn and skip, like AOSP. Otherwise
+                        // the entry is pulled as a regular RECV, which the
+                        // daemon serves by following the link (content copy
+                        // of the target — exactly what AOSP materializes).
+                        match self.stat_v1(&rpath)? {
+                            None => {
+                                eprintln!("[adb-rs] warning: stat failed for path {rpath}, skipping");
+                            }
+                            Some(st) if st.mode & S_IFMT == S_IFDIR => {
+                                stack.push_back((rpath, lpath))
+                            }
+                            Some(_) => {
+                                let n = self.pull_file(&rpath, &lpath)?;
+                                files += 1;
+                                bytes += n;
+                                println!("pulled: {rpath} -> {}", lpath.display());
+                            }
+                        }
+                    }
+                    S_IFREG => {
+                        let n = self.pull_file(&rpath, &lpath)?;
+                        // AOSP applies mtime+mode only with `pull -a`
+                        // (set_time_and_mode); V1 default leaves the local
+                        // file as created (umask), so we don't chmod.
+                        files += 1;
+                        bytes += n;
+                        println!("pulled: {rpath} -> {}", lpath.display());
+                    }
+                    m => {
+                        // AOSP should_pull_file also allows S_ISBLK/S_ISCHR
+                        // (RECV streams the device); we deliberately skip
+                        // them: a character device like /dev/zero streams
+                        // forever over plain pull.
+                        eprintln!("[adb-rs] skipping special file '{rpath}' (mode = 0o{m:o})");
+                    }
+                }
+            }
+        }
+        Ok((files, bytes))
     }
 
     /// Close the sync stream politely (AOSP ~SyncConnection: QUIT, drain
@@ -1059,12 +1323,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let local_path = Path::new(local);
             let meta = std::fs::symlink_metadata(local_path)
                 .map_err(|e| format!("cannot stat '{local}': {e}"))?;
-            if meta.is_dir() {
-                return Err("push of directories is not implemented (single files only)".into());
-            }
 
             let (local_id, remote_id) = open_service(&mut transport, "sync:", 1)?;
             let mut sync = SyncStream::new(&mut transport, local_id, remote_id);
+
+            // AOSP do_sync_push resolves the destination once up front:
+            // existing-directory targets receive the source basename
+            // (file_sync_client.cpp:1461-1534).
+            const S_IFMT: u32 = 0o170000;
+            const S_IFDIR: u32 = 0o040000;
+            let dst_stat = sync.stat_v1(remote)?;
+            let dst_isdir = dst_stat.map(|s| s.mode & S_IFMT == S_IFDIR).unwrap_or(false);
+
+            let final_remote = if dst_isdir {
+                let base = local_path.file_name().and_then(|s| s.to_str());
+                match base {
+                    Some(b) => format!("{remote}/{}", b.trim_end_matches('/')),
+                    None => remote.to_string(),
+                }
+            } else {
+                remote.to_string()
+            };
+
+            if meta.is_dir() {
+                let (files, bytes) = sync.push_dir(local_path, &final_remote)?;
+                sync.quit()?;
+                println!("pushed: {local} -> {final_remote} ({files} files, {bytes} bytes)");
+                return Ok(());
+            }
             // AOSP sends the local st_mode verbatim (file type bits included).
             let mode = {
                 #[cfg(unix)]
@@ -1077,9 +1363,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     0o100644
                 }
             };
-            let bytes = sync.push_file(local_path, remote, mode)?;
+            let bytes = sync.push_file(local_path, &final_remote, mode)?;
             sync.quit()?;
-            println!("{local} -> {remote} ({} bytes)", bytes);
+            println!("{local} -> {final_remote} ({bytes} bytes)");
         }
         Commands::Pull { remote, local } => {
             let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
@@ -1109,6 +1395,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let (local_id, remote_id) = open_service(&mut transport, "sync:", 1)?;
             let mut sync = SyncStream::new(&mut transport, local_id, remote_id);
+
+            // AOSP do_sync_pull: decide from the *source* whether this is a
+            // recursive pull (file_sync_client.cpp:1664+); existing local
+            // directories receive the remote basename (already computed in
+            // local_path above).
+            const S_IFMT: u32 = 0o170000;
+            const S_IFDIR: u32 = 0o040000;
+            if let Some(st) = sync.stat_v1(remote)? {
+                if st.mode & S_IFMT == S_IFDIR {
+                    let (files, bytes) = sync.pull_dir(remote, &local_path)?;
+                    sync.quit()?;
+                    println!("pulled: {remote} -> {} ({files} files, {bytes} bytes)", local_path.display());
+                    return Ok(());
+                }
+            }
             let bytes = sync.pull_file(remote, &local_path)?;
             sync.quit()?;
             println!("{remote} -> {} ({} bytes)", local_path.display(), bytes);
@@ -1361,6 +1662,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use adb_protocol::constants::{A_AUTH_RSAKEY, A_AUTH_SIGNATURE, A_AUTH_TOKEN};
+    use adb_protocol::constants::{SYNC_DATA, SYNC_DENT, SYNC_LIST, SYNC_RECV, SYNC_SEND};
 
     /// Script a fake adbd `sync:` conversation per daemon semantics:
     /// replies CNXN to the client handshake, OKAY to A_OPEN("sync:"),
@@ -1661,6 +1963,296 @@ mod tests {
         stream_raw_from(&mut transport, lid, rid, &mut src).unwrap();
         let received = daemon.join().unwrap();
         assert_eq!(received, data, "exec-in must deliver stdin byte-exact");
+    }
+
+    /// Pull a remote *tree* (recursive). The fake daemon scripts AOSP's
+    /// exact `do_list` byte layout — fixed 20-byte DENT records + name
+    /// bytes, terminated by a zeroed 20-byte DONE — and deliberately
+    /// fragments the reply stream across WRTEs in the nastest pattern the
+    /// transport can produce (two DENTs coalesced in one frame, one DENT
+    /// SPLIT mid-record across two frames), which a per-WRTE message
+    /// parser would fail. Then RECVs each file. The client must rebuild
+    /// the tree byte-exactly.
+    #[test]
+    fn test_sync_pull_dir_recursive_stream_fractured_list_replies() {
+        use std::io::{Read as _, Write as _};
+
+        let _ = std::fs::remove_dir_all("/data/data/com.termux/files/home/test-sync-pull");
+        fn dent_bytes(mode: u32, size: u32, name: &str) -> Vec<u8> {
+            let mut v = Vec::new();
+            let mut h = [0u8; 20];
+            LittleEndian::write_u32(&mut h[0..4], SYNC_DENT);
+            LittleEndian::write_u32(&mut h[4..8], mode);
+            LittleEndian::write_u32(&mut h[8..12], size);
+            LittleEndian::write_u32(&mut h[12..16], 1234);
+            LittleEndian::write_u32(&mut h[16..20], name.len() as u32);
+            v.extend_from_slice(&h);
+            v.extend_from_slice(name.as_bytes());
+            v
+        }
+
+        fn done_record() -> Vec<u8> {
+            let mut d = [0u8; 20];
+            LittleEndian::write_u32(&mut d[0..4], SYNC_DONE); // id + zeroed rest (do_list)
+            d.to_vec()
+        }
+
+        const S_IFDIR: u32 = 0o040000;
+        const S_IFREG: u32 = 0o100000;
+        let mut root_ls = dent_bytes(S_IFREG, 4, "a.txt");
+        root_ls.extend_from_slice(&dent_bytes(S_IFDIR, 0, "sub"));
+        root_ls.extend_from_slice(&done_record());
+        let root_ls_done = root_ls;
+        let sub_ls = dent_bytes(S_IFREG, 3, "b.txt");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let daemon = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 24];
+            sock.read_exact(&mut buf).unwrap();
+            let h = AdbMessageHeader::decode(&buf).unwrap();
+            let mut p = vec![0u8; h.data_length as usize];
+            sock.read_exact(&mut p).unwrap();
+            let banner = b"device::ro.product.name=fake".to_vec();
+            let mut hb = [0u8; 24];
+            AdbMessageHeader::new(A_CNXN, 0x01000001, 1024 * 1024, &banner).encode(&mut hb);
+            sock.write_all(&hb).unwrap();
+            sock.write_all(&banner).unwrap();
+            // A_OPEN("sync:") -> OKAY
+            sock.read_exact(&mut buf).unwrap();
+            let open = AdbMessageHeader::decode(&buf).unwrap();
+            let mut svc = vec![0u8; open.data_length as usize];
+            sock.read_exact(&mut svc).unwrap();
+            assert_eq!(&svc, b"sync:");
+            let cid = open.arg0;
+            AdbMessageHeader::new(A_OKAY, 7, cid, &[]).encode(&mut hb);
+            sock.write_all(&hb).unwrap();
+
+            let mut wrte = |d: &[u8], sock: &mut std::net::TcpStream| {
+                let w = AdbMessageHeader::new(A_WRTE, 7, cid, d);
+                let mut b = [0u8; 24];
+                w.encode(&mut b);
+                sock.write_all(&b).unwrap();
+                sock.write_all(d).unwrap();
+                sock.flush().unwrap();
+                let _ = sock.read_exact(&mut b); // drain OKAY
+            };
+
+            let mut read_msg = |sock: &mut std::net::TcpStream| -> Option<(u32, Vec<u8>)> {
+                loop {
+                    let mut b = [0u8; 24];
+                    match sock.read_exact(&mut b) {
+                        Ok(()) => {}
+                        Err(_) => return None, // client finished + quit
+                    }
+                    let hdr = match AdbMessageHeader::decode(&b) {
+                        Ok(h) => h,
+                        Err(_) => return None,
+                    };
+                    if hdr.command == A_OKAY {
+                        continue; // client acks for our frames — not sync traffic
+                    }
+                    if hdr.command == A_CLSE {
+                        return None; // client polite close
+                    }
+                    assert_eq!(hdr.command, A_WRTE);
+                    let mut pay = vec![0u8; hdr.data_length as usize];
+                    sock.read_exact(&mut pay).unwrap();
+                    let ack = AdbMessageHeader::new(A_OKAY, 7, hdr.arg0, &[]);
+                    ack.encode(&mut b);
+                    sock.write_all(&b).unwrap();
+                    return Some((LittleEndian::read_u32(&pay[0..4]), pay[8..].to_vec()));
+                }
+            };
+
+            // Dispatch like the real daemon: LIST reply = fractured DENT
+            // stream (two DENTs coalesced, DONE split mid-record across two
+            // WRTEs); RECV = DATA+DONE(mtime-in-len). The client interleaves
+            // file RECVs and subdir LISTs breadth-first, so drive on request
+            // id rather than a fixed script order.
+            let mut next_listing: Option<Vec<u8>> = Some(root_ls_done.clone());
+            let mut recv_count = 0;
+            while let Some((id, body)) = read_msg(&mut sock) {
+                match id {
+                    _ if id == SYNC_LIST => {
+                        let stream = next_listing.take().unwrap_or_else(|| {
+                            let mut s = sub_ls.clone();
+                            s.extend_from_slice(&done_record());
+                            s
+                        });
+                        if stream.len() > 30 && next_listing.is_none() && recv_count == 0 {
+                            // fracture the root listing (worst case)
+                            wrte(&stream[..30], &mut sock);
+                            wrte(&stream[30..], &mut sock);
+                        } else {
+                            wrte(&stream, &mut sock);
+                        }
+                    }
+                    _ if id == SYNC_RECV => {
+                        recv_count += 1;
+                        let path = String::from_utf8_lossy(&body).into_owned();
+                        let content: &[u8] = if path.ends_with("a.txt") { b"aaaa" } else { b"bbb" };
+                        let mut data = Vec::new();
+                        let mut dh = [0u8; 8];
+                        LittleEndian::write_u32(&mut dh[0..4], SYNC_DATA);
+                        LittleEndian::write_u32(&mut dh[4..8], content.len() as u32);
+                        data.extend_from_slice(&dh);
+                        data.extend_from_slice(content);
+                        wrte(&data, &mut sock);
+                        let mut dn = [0u8; 8];
+                        LittleEndian::write_u32(&mut dn[0..4], SYNC_DONE);
+                        LittleEndian::write_u32(&mut dn[4..8], 7); // V1 mtime-in-length
+                        wrte(&dn, &mut sock);
+                    }
+                    _ if id == SYNC_QUIT => break,
+                    other => panic!("unexpected sync request {other:#x}"),
+                }
+            }
+        });
+
+        let transport =
+            TcpTransport::connect_timeout(&format!("127.0.0.1:{}", addr.port()), Duration::from_secs(3))
+                .unwrap();
+        let auth = AdbAuth::generate("syncdir-test@localhost").unwrap();
+        let (_info, mut transport) =
+            connect_and_handshake_with_tls_upgrade(transport, b"host::", &auth).unwrap();
+        let (lid, rid) = open_service(&mut transport, "sync:", 1).unwrap();
+        let mut sync = SyncStream::new(&mut transport, lid, rid);
+        let (files, bytes) = sync
+            .pull_dir("/r", Path::new("/data/data/com.termux/files/home/test-sync-pull"))
+            .unwrap();
+        assert_eq!(files, 2);
+        assert_eq!(bytes, 7);
+        assert_eq!(
+            std::fs::read("/data/data/com.termux/files/home/test-sync-pull/a.txt").unwrap(),
+            b"aaaa"
+        );
+        assert_eq!(
+            std::fs::read("/data/data/com.termux/files/home/test-sync-pull/sub/b.txt").unwrap(),
+            b"bbb"
+        );
+        sync.quit().unwrap();
+        daemon.join().unwrap();
+    }
+
+    /// Push a local *tree*: the client walks subdirs breadth-first and
+    /// issues one SEND→DATA*→DONE per regular file/symlink (daemon creates
+    /// dirs as a SEND side effect via secure_mkdirs — do_list parity was
+    /// proven in the pull test; here we assert the wire conversation for
+    /// nested paths and the special-file skip policy).
+    #[test]
+    fn test_sync_push_dir_nested_tree_wire() {
+        use std::io::{Read as _, Write as _};
+
+        let root = std::path::PathBuf::from("/data/data/com.termux/files/home/test-sync-push-src");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+        std::fs::write(root.join("a.txt"), b"AAA").unwrap();
+        std::fs::write(root.join("sub/deep/b.txt"), b"BB").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", root.join("link")).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let daemon = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 24];
+            sock.read_exact(&mut buf).unwrap();
+            let h = AdbMessageHeader::decode(&buf).unwrap();
+            let mut p = vec![0u8; h.data_length as usize];
+            sock.read_exact(&mut p).unwrap();
+            let banner = b"device::ro.product.name=fake".to_vec();
+            let mut hb = [0u8; 24];
+            AdbMessageHeader::new(A_CNXN, 0x01000001, 1024 * 1024, &banner).encode(&mut hb);
+            sock.write_all(&hb).unwrap();
+            sock.write_all(&banner).unwrap();
+            sock.read_exact(&mut buf).unwrap();
+            let open = AdbMessageHeader::decode(&buf).unwrap();
+            let mut svc = vec![0u8; open.data_length as usize];
+            sock.read_exact(&mut svc).unwrap();
+            assert_eq!(&svc, b"sync:");
+            let cid = open.arg0;
+            // Ack the A_OPEN — without this the client's open_service blocks
+            // waiting for OKAY while read_sync blocks waiting for a WRTE.
+            AdbMessageHeader::new(A_OKAY, 7, cid, &[]).encode(&mut hb);
+            sock.write_all(&hb).unwrap();
+
+            let mut read_sync = |sock: &mut std::net::TcpStream| -> (u32, Vec<u8>) {
+                loop {
+                    let mut b = [0u8; 24];
+                    sock.read_exact(&mut b).unwrap();
+                    let hdr = AdbMessageHeader::decode(&b).unwrap();
+                    if hdr.command == A_OKAY {
+                        continue; // client acks our data frames; skip them
+                    }
+                    if hdr.command == A_CLSE {
+                        return (A_CLSE, Vec::new());
+                    }
+                    assert_eq!(hdr.command, A_WRTE);
+                    let mut pay = vec![0u8; hdr.data_length as usize];
+                    sock.read_exact(&mut pay).unwrap();
+                    let ack = AdbMessageHeader::new(A_OKAY, 7, hdr.arg0, &[]);
+                    ack.encode(&mut b);
+                    sock.write_all(&b).unwrap();
+                    return (LittleEndian::read_u32(&pay[0..4]), pay[8..].to_vec());
+                }
+            };
+            let mut ok = |sock: &mut std::net::TcpStream, cid: u32| {
+                let mut b = [0u8; 24];
+                let mut o = Vec::new();
+                let mut oh = [0u8; 8];
+                LittleEndian::write_u32(&mut oh[0..4], SYNC_OKAY);
+                LittleEndian::write_u32(&mut oh[4..8], 0);
+                o.extend_from_slice(&oh);
+                AdbMessageHeader::new(A_WRTE, 7, cid, &o).encode(&mut b);
+                sock.write_all(&b).unwrap();
+                sock.write_all(&o).unwrap();
+                sock.flush().unwrap();
+            };
+
+            let mut sends = Vec::new();
+            let mut expect_done = false;
+            loop {
+                let (id, body) = match read_sync(&mut sock) {
+                    r if r.0 == A_CLSE => break,
+                    r => r,
+                };
+                match id {
+                    s if s == SYNC_SEND => {
+                        sends.push(String::from_utf8_lossy(&body).into_owned());
+                        expect_done = true;
+                    }
+                    d if d == SYNC_DATA && expect_done => {}
+                    d if d == SYNC_DONE && expect_done => {
+                        ok(&mut sock, cid);
+                        expect_done = false;
+                    }
+                    q if q == SYNC_QUIT => break,
+                    other => panic!("unexpected sync id {other:#x}"),
+                }
+            }
+            sends.sort();
+            sends
+        });
+
+        let transport =
+            TcpTransport::connect_timeout(&format!("127.0.0.1:{}", addr.port()), Duration::from_secs(3))
+                .unwrap();
+        let auth = AdbAuth::generate("pushdir-test@localhost").unwrap();
+        let (_info, mut transport) =
+            connect_and_handshake_with_tls_upgrade(transport, b"host::", &auth).unwrap();
+        let (lid, rid) = open_service(&mut transport, "sync:", 1).unwrap();
+        let mut sync = SyncStream::new(&mut transport, lid, rid);
+        let (files, _bytes) = sync.push_dir(&root, "/dst").unwrap();
+        assert_eq!(files, 3); // a.txt, sub/deep/b.txt, link(symlink)
+        sync.quit().unwrap();
+        let sends = daemon.join().unwrap();
+        let paths: Vec<&str> = sends.iter().map(|s| s.rsplit_once(',').unwrap().0).collect();
+        assert!(paths.contains(&"/dst/a.txt"), "{paths:?}");
+        assert!(paths.contains(&"/dst/sub/deep/b.txt"), "{paths:?}");
+        assert!(paths.contains(&"/dst/link"), "{paths:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// AOSP daemon: SEND is NOT acknowledged. OKAY comes exactly once, after

@@ -132,8 +132,14 @@ const MATRIX: &[FeatureStatus] = &[
     FeatureStatus {
         module: "ADB",
         feature: "Directory push/pull recursion",
-        status: AcceptanceStatus::TransportMissing,
-        evidence: "无实现：CLI push 遇目录显式报错；AOSP file_sync_client 的 do_sync_push/pull 递归（LIST+copyinfo 遍历、目录创建、-a 属性保留）未移植",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "V1 路径递归已接通 CLI：SyncStream 读路径改为字节流解析（read_sync_bytes，仿 AOSP ReadFdExactly）——LIST 回复按 20 字节 DENT+namelen 流式重组，覆盖两 DENT 合并一 WRTE、一 DENT 跨两 WRTE 的恶意分片（fake-adbd 测试证明）；push_dir 广度优先遍历（目录由 SEND 的 secure_mkdirs 副作用创建，特殊文件跳过告警，AOSP should_push_file 语义）；pull_dir 用 LIST+LINK 的 STAT 跟链判定目录，缺目录回空列表；do_sync_push/pull 的目标为已存在目录时追加源 basename（STAT 先行）。-a 属性保留（DONE mtime、set_time_and_mode）未做。真实设备未验证",
+    },
+    FeatureStatus {
+        module: "ADB",
+        feature: "V1 STAT/LIST sync codec in CLI",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "stat_v1 读固定 16 字节 sync_stat_v1（file_sync_protocol.h:49），全零 mode/size/mtime 判为不存在（与 ENOENT 不混）；list_dir 解析 DENT 流并以 20 字节零填充 DONE 收尾，FAIL 从已消费头 8 字节后恢复消息体；namelen>255 按 AOSP NAME_MAX 拒绝。协议级 V2 codec 仍为未接线死代码",
     },
     FeatureStatus {
         module: "Fastboot",

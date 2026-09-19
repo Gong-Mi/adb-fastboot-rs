@@ -40,9 +40,22 @@ Landed since baseline `0e5e263` (no longer gaps):
   push (SEND→DATA*→DONE, terminal OKAY/FAIL only after DONE per
   `daemon/file_sync_service.cpp`), pull (RECV→DATA*→DONE with FAIL
   partial-file cleanup), symlink push, polite QUIT+CLSE; `push`/`pull`
-  no longer fake-succeed, `install`'s post-SEND OKAY deadlock fixed;
-  directory push/pull now fails explicitly (recursion remains missing).
+  no longer fake-succeed, `install`'s post-SEND OKAY deadlock fixed.
   Daemon-faithful fake-adbd tests cover accept and FAIL paths.
+- Recursive directory push/pull on the V1 sync path (working tree,
+  pending commit): `SyncStream` reads are now byte-stream based
+  (`read_sync_bytes`, AOSP `ReadFdExactly` discipline) instead of
+  one-message-per-WRTE — LIST replies are parsed as fixed 20-byte DENT
+  records + name bytes across arbitrary WRTE fragmentation (coalesced
+  and split-mid-record patterns proven by fake-adbd tests). `push_dir`
+  walks breadth-first (dirs created as SEND `secure_mkdirs` side
+  effect, special files skipped per `should_push_file`); `pull_dir`
+  lists remote dirs and uses link-follow `STAT` to classify symlinked
+  dirs (`stat_v1` fixed-16-byte reply, all-zero = missing, not
+  conflated with ENOENT); push/pull resolve an existing-directory
+  destination to `dir/<basename>` like `do_sync_push`/`do_sync_pull`.
+  `-a` timestamp/attr preservation still missing. Real-device
+  acceptance pending.
 - Smart-socket command loop in the ADB server (`sockets.cpp`
   `smart_socket_enqueue` semantics): the hex-length command layer stays
   active for the whole connection; `host:transport:<serial>` /
