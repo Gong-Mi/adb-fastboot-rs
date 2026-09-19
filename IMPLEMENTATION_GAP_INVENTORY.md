@@ -24,7 +24,9 @@ The count is an implementation-gap count, not an acceptance score.
 5. mDNS discovery (`_adb-tls-pairing`, `_adb-tls-connect`).
 6. ADB server USB watcher and hotplug lifecycle.
 7. Complete USB claim/reset/permission lifecycle.
-8. `exec-out`, PTY, and transport-feature parity.
+8. PTY allocation parity (`adb shell -x` raw mode, `-t/-T`, window-size
+   change is covered by the shell-v2 row; transport-feature parity landed
+   with the feature-negotiation centralization slice).
 
 Landed since baseline `0e5e263` (no longer gaps):
 
@@ -68,6 +70,16 @@ Landed since baseline `0e5e263` (no longer gaps):
   `shell_service_string`: a device that does not advertise `shell_v2`
   gets an explicit actionable error instead of a silently-CLSEd
   `shell,v2,raw:` open (V1 shell fallback remains gap 8's parity item).
+
+- exec-out/exec-in CLI (`Commands::ExecOut`/`ExecIn`): open the raw
+  `exec:` service exactly like AOSP (argv[1] raw + `escape_arg` per
+  remaining arg — adb_utils.cpp:81-102 ported to
+  `adb-protocol/src/adb_utils.rs`); `stream_raw_to` writes WRTE payloads
+  byte-exact to stdout without shell-v2 demuxing (the whole point:
+  binary like `screencap -p` stays intact), `stream_raw_from` feeds
+  stdin with per-WRTE OKAY flow control and a closing CLSE for EOF.
+  Fake-adbd wire tests cover both directions. Real-device acceptance
+  still pending.
 
 ## Fastboot CLI — 12 gaps
 

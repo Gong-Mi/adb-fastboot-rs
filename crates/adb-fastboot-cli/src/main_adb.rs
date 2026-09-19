@@ -38,6 +38,16 @@ pub enum Commands {
     Shell {
         command: Vec<String>,
     },
+    /// Run remote command with raw stdout stream (no PTY / shell-v2 framing;
+    /// binary output stays byte-exact, like AOSP `adb exec-out`)
+    ExecOut {
+        command: Vec<String>,
+    },
+    /// Run remote command feeding local stdin to its raw stdin
+    /// (AOSP `adb exec-in`)
+    ExecIn {
+        command: Vec<String>,
+    },
     /// Push local file to device
     Push {
         local: String,
@@ -472,6 +482,88 @@ fn stream_shell_v2(
         }
     }
     Ok(captured)
+}
+
+/// Stream a raw (non-shell-v2) service until EOF/CLSE, writing bytes to a
+/// sink, mirroring AOSP `copy_to_file` for `exec:` streams
+/// (client/commandline.cpp:1802-1827; daemon side `StartSubprocess(...,
+/// kRaw, kNone)` at services.cpp:360-363 — payload is the program's raw
+/// stdout, no framing, so binary output stays byte-exact).
+///
+/// Each WRTE is ACKed immediately (AOSP `local_socket_ready` per-frame
+/// semantics). Returns the total bytes written.
+fn stream_raw_to<W: std::io::Write>(
+    transport: &mut dyn Transport,
+    local_id: u32,
+    remote_id: u32,
+    sink: &mut W,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut remote_id = remote_id;
+    let mut total = 0usize;
+    loop {
+        let (hdr, payload) = match transport.recv_message() {
+            Ok(msg) => msg,
+            Err(TransportError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("stream error: {e}").into()),
+        };
+        match hdr.command {
+            A_OKAY => {
+                remote_id = hdr.arg0;
+            }
+            A_WRTE => {
+                let ack = AdbMessageHeader::new(A_OKAY, local_id, remote_id, &[]);
+                transport.send_message(&ack, &[])?;
+                sink.write_all(&payload)?;
+                total += payload.len();
+            }
+            A_CLSE => {
+                let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
+                let _ = transport.send_message(&ack, &[]);
+                break;
+            }
+            _ => {}
+        }
+    }
+    sink.flush()?;
+    Ok(total)
+}
+
+/// Feed stdin to the service until EOF, mirroring AOSP `exec-in`'s
+/// `copy_to_file(STDIN_FILENO, fd)`: each chunk is a WRTE awaiting an
+/// OKAY ack (flow control), then a final A_CLSE signals EOF to the device.
+/// Reading stops at a 0-length read (real EOF) — never on WouldBlock, which
+/// would truncate piped data that has not arrived yet.
+fn stream_raw_from<R: std::io::Read>(
+    transport: &mut dyn Transport,
+    local_id: u32,
+    remote_id: u32,
+    source: &mut R,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = vec![0u8; MAX_PAYLOAD_V2 as usize];
+    loop {
+        let n = match source.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("stdin read error: {e}").into()),
+        };
+        let wrte = AdbMessageHeader::new(A_WRTE, local_id, remote_id, &buf[..n]);
+        transport.send_message(&wrte, &buf[..n])?;
+        // wait for the OKAY before the next chunk (AOSP local_socket_ready);
+        // the reply's arg0 is the *peer's* id, so match on any OKAY like the
+        // existing send_wrte does, not on our local_id.
+        loop {
+            let (hdr, _) = transport.recv_message()?;
+            match hdr.command {
+                A_OKAY => break,
+                A_CLSE => return Ok(()),
+                _ => {}
+            }
+        }
+    }
+    let clse = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
+    let _ = transport.send_message(&clse, &[]);
+    Ok(())
 }
 
 /// Open shell connection and stream output to stdout.
@@ -919,6 +1011,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let (_lid, remote_id) = open_service(&mut transport, &dest, 1)?;
             stream_shell_v2(&mut transport, _lid, remote_id, false)?;
+        }
+        Commands::ExecOut { command } | Commands::ExecIn { command } => {
+            let exec_in = matches!(cli.command, Commands::ExecIn { .. });
+            if command.is_empty() {
+                eprintln!("usage: adb-rs {} command [ARGS...]", if exec_in { "exec-in" } else { "exec-out" });
+                std::process::exit(1);
+            }
+            let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+                transport,
+                &host_cnxn_payload(),
+                default_auth(),
+            )?;
+
+            // AOSP exec-in/exec-out open the raw `exec:` service — no shell-v2
+            // framing, no PTY, and no banner feature gate (commandline.cpp:1802).
+            let dest = adb_protocol::exec_service_string(command);
+            let (local_id, remote_id) = open_service(&mut transport, &dest, 1)?;
+            if exec_in {
+                let stdin = std::io::stdin();
+                let mut lock = stdin.lock();
+                stream_raw_from(&mut transport, local_id, remote_id, &mut lock)?;
+            } else {
+                let stdout = std::io::stdout();
+                let mut lock = stdout.lock();
+                stream_raw_to(&mut transport, local_id, remote_id, &mut lock)?;
+            }
         }
         Commands::Push { local, remote } => {
             let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
@@ -1385,6 +1510,157 @@ mod tests {
             connect_and_handshake_with_tls_upgrade(transport, &host_cnxn_payload(), &auth).unwrap();
         let (lid, rid) = open_service(&mut transport, "sync:", 1).unwrap();
         (transport, lid, rid)
+    }
+
+    /// Handshake a client transport against a raw fake-adbd socket that has
+    /// already answered CNXN and OKAYed an A_OPEN for `expect_dest`. Returns
+    /// the client transport plus (local_id, remote_id) for the open stream.
+    /// The daemon side is scripted by the caller thread via `sock`.
+    fn fake_exec_daemon_accept(
+        listener: &std::net::TcpListener,
+        expect_dest: &[u8],
+    ) -> std::net::TcpStream {
+        use std::io::{Read as _, Write as _};
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 24];
+        // client CNXN → CNXN reply
+        sock.read_exact(&mut buf).unwrap();
+        let h = AdbMessageHeader::decode(&buf).unwrap();
+        assert_eq!(h.command, A_CNXN);
+        let mut p = vec![0u8; h.data_length as usize];
+        if !p.is_empty() {
+            sock.read_exact(&mut p).unwrap();
+        }
+        let banner = b"device::ro.product.name=fake".to_vec();
+        let resp = AdbMessageHeader::new(A_CNXN, 0x01000001, 1024 * 1024, &banner);
+        let mut hb = [0u8; 24];
+        resp.encode(&mut hb);
+        sock.write_all(&hb).unwrap();
+        sock.write_all(&banner).unwrap();
+        // client A_OPEN(dest) → OKAY
+        sock.read_exact(&mut buf).unwrap();
+        let open = AdbMessageHeader::decode(&buf).unwrap();
+        assert_eq!(open.command, A_OPEN);
+        let mut svc = vec![0u8; open.data_length as usize];
+        sock.read_exact(&mut svc).unwrap();
+        assert_eq!(svc, expect_dest, "fake-adbd got wrong service string");
+        let okay = AdbMessageHeader::new(A_OKAY, 7, open.arg0, &[]);
+        okay.encode(&mut hb);
+        sock.write_all(&hb).unwrap();
+        sock.flush().unwrap();
+        sock
+    }
+
+    /// exec-out wire contract: the client opens `exec:` + raw program +
+    /// escape_arg'ed args, streams RAW WRTE payloads to the sink byte-exact
+    /// (no shell-v2 parsing even when bytes happen to look like v2 packets),
+    /// acks every WRTE, and stops at CLSE.
+    #[test]
+    fn test_exec_out_streams_raw_bytes_byte_exact() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The exact service string AOSP would build for: adb exec-out screencap -p
+        let expect = b"exec:screencap '-p'".to_vec();
+        // Binary-ish payload containing CRLF and shell-v2 lookalike bytes:
+        // a v2 demuxer would corrupt these — stream_raw_to must not touch them.
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0x00, 0x2d];
+        let png_expected = png.clone();
+
+        let daemon = std::thread::spawn(move || {
+            let mut sock = fake_exec_daemon_accept(&listener, &expect);
+            let mut hb = [0u8; 24];
+            // WRTE raw chunk 1
+            let wr = AdbMessageHeader::new(A_WRTE, 7, 1, &png[..5]);
+            wr.encode(&mut hb);
+            sock.write_all(&hb).unwrap();
+            sock.write_all(&png[..5]).unwrap();
+            // daemon expects the client's OKAY ack
+            sock.read_exact(&mut hb).unwrap();
+            let ack = AdbMessageHeader::decode(&hb).unwrap();
+            assert_eq!(ack.command, A_OKAY);
+            // WRTE raw chunk 2
+            let wr = AdbMessageHeader::new(A_WRTE, 7, 1, &png[5..]);
+            wr.encode(&mut hb);
+            sock.write_all(&hb).unwrap();
+            sock.write_all(&png[5..]).unwrap();
+            let mut drain = [0u8; 24];
+            let _ = sock.read_exact(&mut drain); // ack (best effort)
+            // CLSE ends the stream
+            let clse = AdbMessageHeader::new(A_CLSE, 7, 1, &[]);
+            clse.encode(&mut hb);
+            sock.write_all(&hb).unwrap();
+            sock.flush().unwrap();
+        });
+
+        let transport =
+            TcpTransport::connect_timeout(&format!("127.0.0.1:{}", addr.port()), Duration::from_secs(3))
+                .unwrap();
+        let auth = AdbAuth::generate("exec-test@localhost").unwrap();
+        let (_info, mut transport) =
+            connect_and_handshake_with_tls_upgrade(transport, b"host::", &auth).unwrap();
+        let args: Vec<String> = ["screencap", "-p"].iter().map(|s| s.to_string()).collect();
+        let dest = adb_protocol::exec_service_string(&args);
+        let (lid, rid) = open_service(&mut transport, &dest, 1).unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        let total = stream_raw_to(&mut transport, lid, rid, &mut sink).unwrap();
+        assert_eq!(total as usize, png_expected.len());
+        assert_eq!(sink, png_expected, "exec-out must be byte-exact raw");
+        daemon.join().unwrap();
+    }
+
+    /// exec-in wire contract: chunks (cap MAX_PAYLOAD_V2) sent as WRTE each
+    /// awaiting OKAY before the next, then a final A_CLSE signals stdin EOF.
+    #[test]
+    fn test_exec_in_feeds_stdin_and_closes() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expect = b"exec:cat 'a b'".to_vec();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+
+        let daemon = std::thread::spawn(move || {
+            let mut sock = fake_exec_daemon_accept(&listener, &expect);
+            let mut received = Vec::new();
+            let mut hb = [0u8; 24];
+            loop {
+                match sock.read_exact(&mut hb) {
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+                let h = match AdbMessageHeader::decode(&hb) {
+                    Ok(h) => h,
+                    Err(_) => break,
+                };
+                if h.command == A_CLSE {
+                    break; // stdin EOF from the client
+                }
+                assert_eq!(h.command, A_WRTE);
+                let mut pay = vec![0u8; h.data_length as usize];
+                sock.read_exact(&mut pay).unwrap();
+                received.extend_from_slice(&pay);
+                let mut bufout = [0u8; 24];
+                let ack = AdbMessageHeader::new(A_OKAY, 7, h.arg0, &[]);
+                ack.encode(&mut bufout);
+                sock.write_all(&bufout).unwrap();
+                sock.flush().unwrap();
+            }
+            received
+        });
+
+        let transport =
+            TcpTransport::connect_timeout(&format!("127.0.0.1:{}", addr.port()), Duration::from_secs(3))
+                .unwrap();
+        let auth = AdbAuth::generate("exec-test@localhost").unwrap();
+        let (_info, mut transport) =
+            connect_and_handshake_with_tls_upgrade(transport, b"host::", &auth).unwrap();
+        let args: Vec<String> = ["cat", "a b"].iter().map(|s| s.to_string()).collect();
+        let dest = adb_protocol::exec_service_string(&args);
+        let (lid, rid) = open_service(&mut transport, &dest, 1).unwrap();
+        let mut src = std::io::Cursor::new(data.clone());
+        stream_raw_from(&mut transport, lid, rid, &mut src).unwrap();
+        let received = daemon.join().unwrap();
+        assert_eq!(received, data, "exec-in must deliver stdin byte-exact");
     }
 
     /// AOSP daemon: SEND is NOT acknowledged. OKAY comes exactly once, after

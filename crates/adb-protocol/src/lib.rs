@@ -1,3 +1,4 @@
+pub mod adb_utils;
 pub mod auth;
 pub mod compress;
 pub mod constants;
@@ -17,6 +18,7 @@ pub mod usb_android;
 #[cfg(feature = "usb-android")]
 pub use usb_android::{DeviceCandidate, UsbAndroidError, UsbfsAdbDevice};
 
+pub use adb_utils::{escape_arg, exec_service_string};
 pub use auth::*;
 pub use compress::*;
 pub use constants::*;

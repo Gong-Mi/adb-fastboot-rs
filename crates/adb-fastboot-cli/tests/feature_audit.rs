@@ -65,6 +65,12 @@ const MATRIX: &[FeatureStatus] = &[
     },
     FeatureStatus {
         module: "ADB",
+        feature: "exec-out / exec-in raw streams",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "CLI exec-out/exec-in 打开 AOSP 的 exec: 服务（无 PTY/shell-v2 帧）；服务串由 exec_service_string 构造（argv[1] 原样、其余 escape_arg，commandline.cpp:1807-1813）；fake-adbd 线级测试证明逐字节 raw 透传（含 CRLF 与 v2 外观字节）与 WRTE/OKAY 流控、尾部 CLSE；真实设备未验证",
+    },
+    FeatureStatus {
+        module: "ADB",
         feature: "STAT_V2 / LSTAT_V2 protocol",
         status: AcceptanceStatus::ProtocolImplemented,
         evidence: "SYNC 报文格式已实现；仅协议级证据",
