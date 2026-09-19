@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod compress;
 pub mod constants;
+pub mod features;
 pub mod header;
 pub mod pairing;
 pub mod shell_v2;
@@ -19,6 +20,10 @@ pub use usb_android::{DeviceCandidate, UsbAndroidError, UsbfsAdbDevice};
 pub use auth::*;
 pub use compress::*;
 pub use constants::*;
+pub use features::{
+    can_use_feature, features_to_string, host_cnxn_payload, host_supported_features,
+    parse_banner_features,
+};
 pub use header::{AdbMessageHeader, AuthType, HeaderError};
 pub use pairing::{
     validate_pairing_code, PairingCipher, PairingClient, PairingError, PairingPacket,

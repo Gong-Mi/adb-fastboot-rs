@@ -832,7 +832,8 @@ fn dispatch_host_service(
             let _ = test_stream.set_nodelay(true);
 
             // Probe with CNXN
-            let probe = b"host::";
+            let probe = adb_protocol::features::host_cnxn_payload();
+            let probe = probe.as_slice();
             let cnxn = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, probe);
             let mut hdr_buf = [0u8; 24];
             cnxn.encode(&mut hdr_buf);
@@ -925,10 +926,14 @@ fn dispatch_host_service(
         }
 
         // -- host:host-features ---------------------------------------------
+        // AOSP (adb.cpp:1443-1452) reports supported_features(); report
+        // exactly the features this binary implements (features.rs) so
+        // clients never trust abb/abb_exec/push_sync we cannot execute.
         "host:host-features" => {
-            let features =
-                "shell_v2,cmd,abb,abb_exec,remount_shell_v2,fixed_push_symlink_target,fixed_push_mkdir";
-            ok_str(client, features)
+            let features = adb_protocol::features::features_to_string(
+                adb_protocol::features::host_supported_features(),
+            );
+            ok_str(client, &features)
         }
 
         // -- host:jdwp -------------------------------------------------------
@@ -1022,7 +1027,8 @@ fn forward_connection_to_device(
     let _ = device_stream.set_nodelay(true);
     let _ = client_conn.set_nodelay(true);
 
-    let probe = b"host::";
+    let probe = adb_protocol::features::host_cnxn_payload();
+    let probe = probe.as_slice();
     let cnxn = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, probe);
     let mut hdr_buf = [0u8; 24];
     cnxn.encode(&mut hdr_buf);
@@ -1389,7 +1395,8 @@ fn service_bridge_tcp(mut client: TcpStream, addr: SocketAddr, service: &str) ->
     // CNXN on the device transport (server owns this handshake; the client
     // never sees it — AOSP local_socket/remote_socket split).
     let mut device = device;
-    let probe = b"host::features=shell_v2,cmd";
+    let probe = adb_protocol::features::host_cnxn_payload();
+    let probe = probe.as_slice();
     let cnxn = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, probe);
     let mut hdr_buf = [0u8; 24];
     cnxn.encode(&mut hdr_buf);

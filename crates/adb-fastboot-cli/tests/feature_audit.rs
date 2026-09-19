@@ -55,7 +55,13 @@ const MATRIX: &[FeatureStatus] = &[
         module: "ADB",
         feature: "Shell v2 / window-size change",
         status: AcceptanceStatus::ProtocolImplemented,
-        evidence: "协议报文与 CLI shell 路径有测试覆盖；未替代真实设备验收",
+        evidence: "协议报文与 CLI shell 路径有测试覆盖；shell/logcat/bugreport/install 均经 shell_service_string 按 device banner 门控 shell_v2（缺 shell_v2 显式报错，不静默开 v2 服务串）；未替代真实设备验收",
+    },
+    FeatureStatus {
+        module: "ADB",
+        feature: "Feature negotiation (CNXN banner / host-features)",
+        status: AcceptanceStatus::ProtocolImplemented,
+        evidence: "features.rs: parse_banner_features 为 AOSP parse_banner 忠实移植，can_use_feature 双向交集；host CNXN payload 与 host:host-features 只报 host_supported_features()（已端到端实现的能力，不再假报 abb/abb_exec/push_sync）；单元覆盖，真实设备 banner 未验证",
     },
     FeatureStatus {
         module: "ADB",
@@ -78,8 +84,8 @@ const MATRIX: &[FeatureStatus] = &[
     FeatureStatus {
         module: "ADB",
         feature: "RSA key auth (A_AUTH signature/RSAKEY)",
-        status: AcceptanceStatus::ProtocolImplemented,
-        evidence: "认证消息生成/握手路径已实现；真实授权设备未验证",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "握手循环应答 A_AUTH TOKEN（签名轮换→RSAKEY 回退），持久 user key + ADB_VENDOR_KEYS；fake-adbd 端到端覆盖 accept/耗尽路径；真实授权设备未验证",
     },
     FeatureStatus {
         module: "ADB",

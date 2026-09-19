@@ -8,7 +8,7 @@ use adb_protocol::{
     Transport, TransportError,
     A_AUTH, ADB_VERSION, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_STLS, A_WRTE, MAX_PAYLOAD_V2,
     build_sync_data_chunk, build_sync_done, build_sync_recv_req, build_sync_send_req,
-    saturating_mtime_u32, SyncMessageHeader, SYNC_FAIL, SYNC_OKAY,
+    host_cnxn_payload, saturating_mtime_u32, SYNC_FAIL, SYNC_OKAY,
 };
 
 mod server;
@@ -477,12 +477,29 @@ fn stream_shell_v2(
 /// Open shell connection and stream output to stdout.
 fn run_shell(
     transport: &mut dyn Transport,
+    banner: &str,
     cmd: &str,
     capture: bool,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    let dest = format!("shell,v2,raw:{cmd}");
+    let dest = shell_service_string(banner, cmd)?;
     let (local_id, remote_id) = open_service(transport, &dest, 1)?;
     stream_shell_v2(transport, local_id, remote_id, capture)
+}
+
+/// Build the shell service string gated on the device's advertised feature
+/// set, mirroring AOSP `CanUseFeature(*features, kFeatureShell2)`
+/// (commandline.cpp:704, 1138). This client only speaks shell v2; when the
+/// device banner lacks `shell_v2` we must not silently open `shell,v2,raw:`
+/// (adbd would just CLSE it) — fail with an actionable message instead.
+/// (V1 shell fallback is a tracked gap.)
+fn shell_service_string(banner: &str, cmd: &str) -> Result<String, String> {
+    let feats = adb_protocol::features::parse_banner_features(banner);
+    if !adb_protocol::features::can_use_feature(&feats, "shell_v2") {
+        return Err(format!(
+            "device does not advertise shell_v2 (banner: {banner}); shell V1 fallback is not implemented"
+        ));
+    }
+    Ok(format!("shell,v2,raw:{cmd}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -847,9 +864,9 @@ fn host_command(
 fn shell_over_adbd(cmd: &str, addr: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let transport = TcpTransport::connect_timeout(addr, Duration::from_secs(3))
         .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-    let (_info, mut transport) =
-        connect_and_handshake_with_tls_upgrade(transport, b"host::features=shell_v2,cmd", default_auth())?;
-    let captured = run_shell(&mut transport, cmd, true)?;
+    let (info, mut transport) =
+        connect_and_handshake_with_tls_upgrade(transport, &host_cnxn_payload(), default_auth())?;
+    let captured = run_shell(&mut transport, &info.banner, cmd, true)?;
     Ok(captured.unwrap_or_default())
 }
 
@@ -871,7 +888,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(transport) = open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(2)) {
                         if let Ok((device_info, _)) = connect_and_handshake_with_tls_upgrade(
                             transport,
-                            b"host::features=shell_v2,cmd",
+                            &host_cnxn_payload(),
                             default_auth(),
                         ) {
                             println!("{}\tdevice ({})", direct_addr, device_info.banner.trim());
@@ -891,18 +908,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             };
-            let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+            let (info, mut transport) = connect_and_handshake_with_tls_upgrade(
                 transport,
-                b"host::features=shell_v2,cmd",
+                &host_cnxn_payload(),
                 default_auth(),
             )?;
 
             let cmd_str = command.join(" ");
-            let dest = if cmd_str.is_empty() {
-                "shell,v2,raw:".to_string()
-            } else {
-                format!("shell,v2,raw:{}", cmd_str)
-            };
+            let dest = shell_service_string(&info.banner, &cmd_str)?;
 
             let (_lid, remote_id) = open_service(&mut transport, &dest, 1)?;
             stream_shell_v2(&mut transport, _lid, remote_id, false)?;
@@ -916,7 +929,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let (_info, mut transport) =
-                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
+                connect_and_handshake_with_tls_upgrade(transport, &host_cnxn_payload(), default_auth())?;
 
             let local_path = Path::new(local);
             let meta = std::fs::symlink_metadata(local_path)
@@ -952,7 +965,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let (_info, mut transport) =
-                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
+                connect_and_handshake_with_tls_upgrade(transport, &host_cnxn_payload(), default_auth())?;
 
             // AOSP: if <dest> is an existing directory, pull into it using
             // the remote basename.
@@ -984,7 +997,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let (_info, mut transport) =
-                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
+                connect_and_handshake_with_tls_upgrade(transport, &host_cnxn_payload(), default_auth())?;
 
             let target_str = target.as_deref().unwrap_or("");
             let dest = format!("reboot:{}", target_str);
@@ -1075,8 +1088,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Connect to adbd
             let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-            let (_info, mut transport) =
-                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
+            let (info, mut transport) =
+                connect_and_handshake_with_tls_upgrade(transport, &host_cnxn_payload(), default_auth())?;
 
             // Open sync: service
             let (local_id, remote_id) = open_service(&mut transport, "sync:", 1)?;
@@ -1092,7 +1105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Run pm install via shell
             let install_cmd = format!("pm install -r \"{remote_apk}\"");
-            let result = run_shell(&mut transport, &install_cmd, true)?;
+            let result = run_shell(&mut transport, &info.banner, &install_cmd, true)?;
             let output = result.unwrap_or_default();
             let output_str = String::from_utf8_lossy(&output).trim().to_string();
 
@@ -1105,20 +1118,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Clean up temp APK
-            let _ = run_shell(&mut transport, &format!("rm -f \"{remote_apk}\""), false);
+            let _ = run_shell(&mut transport, &info.banner, &format!("rm -f \"{remote_apk}\""), false);
         }
 
         Commands::Uninstall { package } => {
             let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-            let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+            let (info, mut transport) = connect_and_handshake_with_tls_upgrade(
                 transport,
-                b"host::features=shell_v2,cmd",
+                &host_cnxn_payload(),
                 default_auth(),
             )?;
 
             let cmd = format!("pm uninstall {package}");
-            let result = run_shell(&mut transport, &cmd, true)?;
+            let result = run_shell(&mut transport, &info.banner, &cmd, true)?;
             let output = result.unwrap_or_default();
             let output_str = String::from_utf8_lossy(&output).trim().to_string();
 
@@ -1134,9 +1147,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Logcat { args } => {
             let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-            let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+            let (info, mut transport) = connect_and_handshake_with_tls_upgrade(
                 transport,
-                b"host::features=shell_v2,cmd",
+                &host_cnxn_payload(),
                 default_auth(),
             )?;
 
@@ -1145,7 +1158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 format!("logcat {}", args.join(" "))
             };
-            let dest = format!("shell,v2,raw:{logcat_cmd}");
+            let dest = shell_service_string(&info.banner, &logcat_cmd)?;
             let (local_id, remote_id) = open_service(&mut transport, &dest, 1)?;
             stream_shell_v2(&mut transport, local_id, remote_id, false)?;
         }
@@ -1153,13 +1166,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Bugreport { output } => {
             let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-            let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+            let (info, mut transport) = connect_and_handshake_with_tls_upgrade(
                 transport,
-                b"host::features=shell_v2,cmd",
+                &host_cnxn_payload(),
                 default_auth(),
             )?;
 
-            let dest = "shell,v2,raw:bugreport".to_string();
+            let dest = shell_service_string(&info.banner, "bugreport")?;
             println!("[adb-rs] Capturing bugreport from {addr} ...");
             let (local_id, remote_id) = open_service(&mut transport, &dest, 1)?;
             let captured = stream_shell_v2(&mut transport, local_id, remote_id, true)?;
@@ -1369,7 +1382,7 @@ mod tests {
         .unwrap();
         let auth = AdbAuth::generate("sync-test@localhost").unwrap();
         let (_info, mut transport) =
-            connect_and_handshake_with_tls_upgrade(transport, b"host::", &auth).unwrap();
+            connect_and_handshake_with_tls_upgrade(transport, &host_cnxn_payload(), &auth).unwrap();
         let (lid, rid) = open_service(&mut transport, "sync:", 1).unwrap();
         (transport, lid, rid)
     }
@@ -1549,7 +1562,7 @@ mod tests {
         )
         .unwrap();
         let (info, _t) =
-            connect_and_handshake_with_tls_upgrade(transport, b"host::features=shell_v2,cmd", &auth)
+            connect_and_handshake_with_tls_upgrade(transport, &host_cnxn_payload(), &auth)
                 .unwrap();
         assert!(info.banner.contains("fake-adbd"));
         server.join().unwrap();
@@ -1629,7 +1642,7 @@ mod tests {
         // when the fake server closes, recv fails — that failure is the
         // expected outcome (NOT a panic).
         let result =
-            connect_and_handshake_with_tls_upgrade(transport, b"host::", &auth);
+            connect_and_handshake_with_tls_upgrade(transport, &host_cnxn_payload(), &auth);
         assert!(result.is_err(), "server closed without CNXN; client must error");
         server.join().unwrap();
     }

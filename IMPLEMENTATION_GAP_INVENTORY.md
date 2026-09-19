@@ -54,6 +54,20 @@ Landed since baseline `0e5e263` (no longer gaps):
   Command-length cap follows MAX_PAYLOAD (1 MiB), not 4 KiB. TCP path
   only; the USB bridge keeps the legacy raw-frame relay (clone-free
   constraint documented in `bridge_device_service`).
+- Feature negotiation centralization (`adb-protocol/src/features.rs`):
+  `parse_banner_features` is a faithful port of AOSP `parse_banner`
+  (adb.cpp:350-383) and `can_use_feature` the two-sided intersection
+  (transport.cpp:1265-1268). The host CNXN payload and the
+  `host:host-features` reply now come from a single
+  `host_supported_features()` list containing only capabilities this
+  binary implements end-to-end — the server no longer falsely reports
+  `abb`/`abb_exec`/`push_sync`/`fixed_push_mkdir` it cannot execute, and
+  no call site hard-codes a feature string anymore. Client shell paths
+  (`shell`, `logcat`, `bugreport`, `install`'s `pm install`,
+  `shell_over_adbd`) gate on the device banner via
+  `shell_service_string`: a device that does not advertise `shell_v2`
+  gets an explicit actionable error instead of a silently-CLSEd
+  `shell,v2,raw:` open (V1 shell fallback remains gap 8's parity item).
 
 ## Fastboot CLI — 12 gaps
 
