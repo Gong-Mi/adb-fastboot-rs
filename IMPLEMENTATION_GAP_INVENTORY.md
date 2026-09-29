@@ -6,7 +6,7 @@ This file separates design/implementation work from device acceptance. Passing u
 
 ## Current count
 
-There are 29 identified design items that are not fully landed in code:
+There are 28 identified design items that are not fully landed in code:
 
 - ADB: 8
 - Fastboot CLI: 12
@@ -19,12 +19,86 @@ The count is an implementation-gap count, not an acceptance score.
 
 1. Complete `A_STLS` upgrade state machine.
 2. TLS transport integration and plaintext fallback state handling.
-3. Pairing TLS/client/certificate persistence lifecycle.
-4. mDNS discovery (`_adb-tls-pairing`, `_adb-tls-connect`).
-5. ADB server USB watcher and hotplug lifecycle.
-6. Complete USB claim/reset/permission lifecycle.
-7. `exec-out`, PTY, and transport-feature parity.
-8. Install/uninstall host workflows.
+3. Curve25519/BoringSSL-compatible SPAKE2 primitive.
+4. Pairing TLS/client/certificate persistence lifecycle.
+5. mDNS discovery (`_adb-tls-pairing`, `_adb-tls-connect`).
+6. ADB server USB watcher and hotplug lifecycle.
+7. Complete USB claim/reset/permission lifecycle.
+8. PTY allocation parity (`adb shell -x` raw mode, `-t/-T`, window-size
+   change is covered by the shell-v2 row; transport-feature parity landed
+   with the feature-negotiation centralization slice).
+
+Landed since baseline `0e5e263` (no longer gaps):
+
+- RSA AUTH client loop: persistent user key (`$HOME/.android/adbkey`,
+  generated on first use), `ADB_VENDOR_KEYS` rotation, A_AUTH TOKEN →
+  SIGNATURE → RSAPUBLICKEY fallback in the connect handshake (`ed9f488`,
+  fake-adbd wire tests; real-device AUTH acceptance still pending).
+- Install/uninstall host workflows (`install`/`uninstall` CLI, APK push +
+  `pm install` shell path).
+- SYNC single-file transfer wired to the CLI: `SyncStream` V1
+  push (SEND→DATA*→DONE, terminal OKAY/FAIL only after DONE per
+  `daemon/file_sync_service.cpp`), pull (RECV→DATA*→DONE with FAIL
+  partial-file cleanup), symlink push, polite QUIT+CLSE; `push`/`pull`
+  no longer fake-succeed, `install`'s post-SEND OKAY deadlock fixed.
+  Daemon-faithful fake-adbd tests cover accept and FAIL paths.
+- Recursive directory push/pull on the V1 sync path: `SyncStream` reads
+  are byte-stream based (`read_sync_bytes`, AOSP `ReadFdExactly`
+  discipline) instead of one-message-per-WRTE — LIST replies are parsed
+  as fixed 20-byte DENT records + name bytes across arbitrary WRTE
+  fragmentation (coalesced and split-mid-record patterns proven by
+  fake-adbd tests). `push_dir` walks breadth-first (dirs created as SEND
+  `secure_mkdirs` side effect, special files skipped per
+  `should_push_file`); `pull_dir` lists remote dirs and uses
+  link-follow `STAT` to classify symlinked dirs (`stat_v1` fixed-16-byte
+  reply, all-zero = missing, not conflated with ENOENT); push/pull
+  resolve an existing-directory destination to `dir/<basename>` like
+  `do_sync_push`/`do_sync_pull`. `-a` timestamp/attr preservation still
+  missing. Real-device acceptance pending.
+- Smart-socket command loop in the ADB server (`sockets.cpp`
+  `smart_socket_enqueue` semantics): the hex-length command layer stays
+  active for the whole connection; `host:transport:<serial>` /
+  `host:transport-any` bind a transport, and a following device service
+  (`root:`, `tcpip:`, `shell:...`, ...) is converted to A_OPEN on the
+  device transport with raw byte ⇄ WRTE/OKAY streaming — an official
+  AOSP client (adb, scrcpy, IDE) no longer has its hex prefix forwarded
+  as raw bytes to adbd. Device service without a selected transport
+  fails with AOSP's `device offline (no transport)`. `host:version` now
+  reports ADB_SERVER_VERSION 41 (`0029`), not the protocol version.
+  Command-length cap follows MAX_PAYLOAD (1 MiB), not 4 KiB. TCP path
+  only; the USB bridge keeps the legacy raw-frame relay (clone-free
+  constraint documented in `bridge_device_service`).
+- Feature negotiation centralization (`adb-protocol/src/features.rs`):
+  `parse_banner_features` is a faithful port of AOSP `parse_banner`
+  (adb.cpp:350-383) and `can_use_feature` the two-sided intersection
+  (transport.cpp:1265-1268). The host CNXN payload and the
+  `host:host-features` reply now come from a single
+  `host_supported_features()` list containing only capabilities this
+  binary implements end-to-end — the server no longer falsely reports
+  `abb`/`abb_exec`/`push_sync`/`fixed_push_mkdir` it cannot execute, and
+  no call site hard-codes a feature string anymore. Client shell paths
+  (`shell`, `logcat`, `bugreport`, `install`'s `pm install`,
+  `shell_over_adbd`) gate on the device banner via
+  `shell_service_string`: a device that does not advertise `shell_v2`
+  gets an explicit actionable error instead of a silently-CLSEd
+  `shell,v2,raw:` open (V1 shell fallback remains gap 8's parity item).
+- exec-out/exec-in CLI (`Commands::ExecOut`/`ExecIn`): open the raw
+  `exec:` service exactly like AOSP (argv[1] raw + `escape_arg` per
+  remaining arg — adb_utils.cpp:81-102 ported to
+  `adb-protocol/src/adb_utils.rs`); `stream_raw_to` writes WRTE payloads
+  byte-exact to stdout without shell-v2 demuxing (the whole point:
+  binary like `screencap -p` stays intact), `stream_raw_from` feeds
+  stdin with per-WRTE OKAY flow control and a closing CLSE for EOF.
+  Fake-adbd wire tests cover both directions. Real-device acceptance
+  still pending.
+- Line reconciliation (2026-09-29): the Sep line (origin/main, 7 commits)
+  was merged into the full line as the base. `features.rs` /
+  `adb_utils.rs` / the auth key lifecycle (`load_persistent`,
+  `AuthResponder`, vendor keys) landed in `adb-protocol/src/crypto/key.rs`
+  with `auth.rs` as a re-export shim; the full line's client/server module
+  trees remain canonical. `host_cnxn_payload()` replaced all hard-coded
+  CNXN banners; `host:host-features` now reports
+  `features::host_supported_features()` dynamically.
 
 ## Fastboot CLI — 12 gaps
 

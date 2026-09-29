@@ -55,7 +55,19 @@ const MATRIX: &[FeatureStatus] = &[
         module: "ADB",
         feature: "Shell v2 / window-size change",
         status: AcceptanceStatus::ProtocolImplemented,
-        evidence: "协议报文与 CLI shell 路径有测试覆盖；未替代真实设备验收",
+        evidence: "协议报文与 CLI shell 路径有测试覆盖；shell/logcat/bugreport/install 均经 shell_service_string 按 device banner 门控 shell_v2（缺 shell_v2 显式报错，不静默开 v2 服务串）；未替代真实设备验收",
+    },
+    FeatureStatus {
+        module: "ADB",
+        feature: "Feature negotiation (CNXN banner / host-features)",
+        status: AcceptanceStatus::ProtocolImplemented,
+        evidence: "features.rs: parse_banner_features 为 AOSP parse_banner 忠实移植，can_use_feature 双向交集；host CNXN payload 与 host:host-features 只报 host_supported_features()（已端到端实现的能力，不再假报 abb/abb_exec/push_sync）；单元覆盖，真实设备 banner 未验证",
+    },
+    FeatureStatus {
+        module: "ADB",
+        feature: "exec-out / exec-in raw streams",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "CLI exec-out/exec-in 打开 AOSP 的 exec: 服务（无 PTY/shell-v2 帧）；服务串由 exec_service_string 构造（argv[1] 原样、其余 escape_arg，commandline.cpp:1807-1813）；fake-adbd 线级测试证明逐字节 raw 透传（含 CRLF 与 v2 外观字节）与 WRTE/OKAY 流控、尾部 CLSE；真实设备未验证",
     },
     FeatureStatus {
         module: "ADB",
@@ -67,7 +79,7 @@ const MATRIX: &[FeatureStatus] = &[
         module: "ADB",
         feature: "Single-file push/pull",
         status: AcceptanceStatus::CliImplemented,
-        evidence: "CLI 有 push/pull，TCP fake-peer wire test 通过；真实设备未验证",
+        evidence: "SyncStream V1 push/pull 接通 CLI（SEND→DATA*→DONE→单一 OKAY/FAIL，AOSP daemon 语义）；daemon-faithful fake-adbd 测试覆盖 accept/FAIL 清理路径；真实设备未验证",
     },
     FeatureStatus {
         module: "ADB",
@@ -78,8 +90,8 @@ const MATRIX: &[FeatureStatus] = &[
     FeatureStatus {
         module: "ADB",
         feature: "RSA key auth (A_AUTH signature/RSAKEY)",
-        status: AcceptanceStatus::ProtocolImplemented,
-        evidence: "认证消息生成/握手路径已实现；真实授权设备未验证",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "握手循环应答 A_AUTH TOKEN（签名轮换→RSAKEY 回退），持久 user key + ADB_VENDOR_KEYS；fake-adbd 端到端覆盖 accept/耗尽路径；真实授权设备未验证",
     },
     FeatureStatus {
         module: "ADB",
@@ -127,7 +139,13 @@ const MATRIX: &[FeatureStatus] = &[
         module: "ADB",
         feature: "Directory push/pull recursion",
         status: AcceptanceStatus::CliImplemented,
-        evidence: "CLI 路径和 SYNC 递归代码存在；真实设备未验证",
+        evidence: "V1 路径递归已接通 CLI：SyncStream 读路径改为字节流解析（read_sync_bytes，仿 AOSP ReadFdExactly）——LIST 回复按 20 字节 DENT+namelen 流式重组，覆盖两 DENT 合并一 WRTE、一 DENT 跨两 WRTE 的恶意分片（fake-adbd 测试证明）；push_dir 广度优先遍历（目录由 SEND 的 secure_mkdirs 副作用创建，特殊文件跳过告警，AOSP should_push_file 语义）；pull_dir 用 LIST+LINK 的 STAT 跟链判定目录，缺目录回空列表；do_sync_push/pull 的目标为已存在目录时追加源 basename（STAT 先行）。-a 属性保留（DONE mtime、set_time_and_mode）未做。真实设备未验证",
+    },
+    FeatureStatus {
+        module: "ADB",
+        feature: "V1 STAT/LIST sync codec in CLI",
+        status: AcceptanceStatus::CliImplemented,
+        evidence: "stat_v1 读固定 16 字节 sync_stat_v1（file_sync_protocol.h:49），全零 mode/size/mtime 判为不存在（与 ENOENT 不混）；list_dir 解析 DENT 流并以 20 字节零填充 DONE 收尾，FAIL 从已消费头 8 字节后恢复消息体；namelen>255 按 AOSP NAME_MAX 拒绝。协议级 V2 codec 仍为未接线死代码",
     },
     FeatureStatus {
         module: "Fastboot",

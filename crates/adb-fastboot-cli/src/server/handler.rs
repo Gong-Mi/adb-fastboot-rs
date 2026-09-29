@@ -422,9 +422,13 @@ pub(crate) fn dispatch_host_service(
 
         // -- host:host-features ---------------------------------------------
         "host:host-features" => {
-            let features =
-                "shell_v2,cmd,abb,abb_exec,remount_shell_v2,fixed_push_symlink_target,fixed_push_mkdir";
-            ok_str(client, features)
+            // AOSP (adb.cpp:1443-1452) reports supported_features(); report
+            // exactly the features this binary implements (features.rs) so
+            // clients gate shell-v2/sync-v2 on what we actually speak.
+            let features = adb_protocol::features::features_to_string(
+                adb_protocol::features::host_supported_features(),
+            );
+            ok_str(client, &features)
         }
 
         // -- host:jdwp -------------------------------------------------------

@@ -1,7 +1,9 @@
+pub mod adb_utils;
 pub mod auth;
 pub mod compress;
 pub mod constants;
 pub mod crypto;
+pub mod features;
 pub mod header;
 pub mod mdns;
 pub mod pairing;
@@ -22,9 +24,14 @@ pub mod usb_android;
 #[cfg(feature = "usb-android")]
 pub use usb_android::{DeviceCandidate, UsbAndroidError, UsbfsAdbDevice};
 
+pub use adb_utils::{escape_arg, exec_service_string};
 pub use auth::*;
 pub use compress::*;
 pub use constants::*;
+pub use features::{
+    can_use_feature, features_to_string, host_cnxn_payload, host_supported_features,
+    parse_banner_features,
+};
 pub use header::{AdbMessageHeader, AuthType, HeaderError};
 pub use mdns::{parse_txt_record, AdbMdnsService, AdbMdnsServiceType, MdnsError};
 pub use pairing::{

@@ -9,6 +9,7 @@ use adb_protocol::{
     ADB_VERSION, A_AUTH, A_AUTH_TOKEN,
     A_CLSE, A_CNXN, A_OPEN, A_STLS, MAX_PAYLOAD_V2,
     build_sync_send_req, build_sync_data_chunk, build_sync_done,
+    host_cnxn_payload,
 };
 
 mod server;
@@ -116,6 +117,11 @@ pub enum Commands {
     /// ShellV2 packet headers or stderr multiplexing.
     #[command(name = "exec-out")]
     ExecOut {
+        command: Vec<String>,
+    },
+    /// Run remote command feeding local stdin to its raw stdin
+    /// (AOSP `adb exec-in`)
+    ExecIn {
         command: Vec<String>,
     },
     /// Push local file to device
@@ -414,19 +420,24 @@ pub struct DeviceInfo {
 }
 
 /// Get or create the persistent ADB host identity.
+///
+/// AOSP semantics (adb_auth_init/load_userkey): `$HOME/.android/adbkey`,
+/// generated on first use and reused afterwards. Falls back to an ephemeral
+/// key only if the persistent store cannot be created/read. On Android,
+/// AOSP_HOST_ADB_KEY_DIRS-style fallbacks are handled by adb_protocol's
+/// key loader; HyperOS persistence is handled by `persist_adb_pubkey`.
 pub fn default_auth() -> &'static AdbAuth {
     static AUTH: OnceLock<AdbAuth> = OnceLock::new();
     AUTH.get_or_init(|| {
-        load_or_create_auth().expect("Failed to load or create persistent ADB auth key")
+        AdbAuth::load_persistent()
+            .unwrap_or_else(|_| AdbAuth::generate("adb-rs@localhost").expect("Failed to generate ADB auth key"))
     })
 }
 
 fn adb_key_dirs() -> Vec<PathBuf> {
-    // Priority order for ADB key directories.
-    // 1. $HOME/.android  — standard ADB location, same as system ADB.
-    //    When run via `su -c HOME=...`, this picks up the system ADB's key,
-    //    giving the same device fingerprint and reusing any prior authorization.
-    // 2. /sdcard/.android — fallback writable from both normal UID and root.
+    // Kept for callers/tests that inspect ADB key directory candidates.
+    // The active loader is adb_protocol's AdbAuth::load_persistent()
+    // ($HOME/.android/adbkey); this list documents the Android fallbacks.
     let home = std::env::var("HOME").unwrap_or_default();
     let mut dirs = Vec::with_capacity(2);
     if !home.is_empty() {
@@ -436,6 +447,7 @@ fn adb_key_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+#[allow(dead_code)]
 fn load_or_create_auth() -> Result<AdbAuth, Box<dyn std::error::Error>> {
     let dirs = adb_key_dirs();
 
@@ -571,56 +583,60 @@ pub fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     cnxn_payload: &[u8],
     auth: &AdbAuth,
 ) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
-    use adb_protocol::tls;
-    use adb_protocol::AdbTlsTransport;
-
     let mut transport: Box<dyn Transport> = Box::new(transport);
+
+    // AOSP client semantics (adb.cpp handle_packet → A_AUTH/TOKEN, auth.cpp
+    // send_auth_response): answer each A_AUTH TOKEN with a SIGNATURE from the
+    // next key; when keys are exhausted send RSAPUBLICKEY once and wait.
+    let mut responder = adb_protocol::AuthResponder::single(auth.clone());
 
     // Send initial CNXN
     let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
     transport.send_message(&cnxn_hdr, cnxn_payload)?;
 
-    // Read response. Legacy USB adbd may require RSA AUTH before CNXN/STLS.
-    let (mut resp_hdr, mut payload) = transport.recv_message()?;
-    let mut sent_signature = false;
-    let mut sent_public_key = false;
-    while resp_hdr.command == A_AUTH {
-        if resp_hdr.arg0 != A_AUTH_TOKEN {
-            return Err(format!("Unsupported AUTH request type: {}", resp_hdr.arg0).into());
-        }
-        if payload.len() != 20 {
-            return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
-        }
+    loop {
+        let (resp_hdr, payload) = transport.recv_message()?;
 
-        let (auth_hdr, auth_payload) = if !sent_signature {
-            sent_signature = true;
-            auth.make_signature_message(&payload)?
-        } else if !sent_public_key {
-            sent_public_key = true;
-            auth.make_rsakey_message()?
-        } else {
-            return Err("adbd rejected the ADB RSA key after signature and public-key exchange".into());
-        };
-        transport.send_message(&auth_hdr, &auth_payload)?;
-        (resp_hdr, payload) = transport.recv_message()?;
+        match resp_hdr.command {
+            A_CNXN => {
+                // Normal path — no TLS required
+                let banner = String::from_utf8_lossy(&payload).to_string();
+
+                // Persist the public key so future SIGNATURE verifications
+                // succeed without requiring another authorization dialog
+                // (HyperOS does not always persist via AdbDebuggingManager).
+                #[cfg(target_os = "android")]
+                if responder.pubkey_sent() {
+                    persist_adb_pubkey(auth)?;
+                }
+
+                return Ok((DeviceInfo { banner }, transport));
+            }
+            A_AUTH if resp_hdr.arg0 == A_AUTH_TOKEN => {
+                if payload.len() != 20 {
+                    return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
+                }
+                if let Some((hdr, auth_payload)) = responder.respond_to_token(&payload)? {
+                    transport.send_message(&hdr, &auth_payload)?;
+                }
+                continue;
+            }
+            A_STLS => break, // TLS upgrade path below
+            _ => {
+                return Err(format!(
+                    "Unexpected handshake response: cmd={:#x}",
+                    resp_hdr.command
+                )
+                .into());
+            }
+        }
     }
 
-    if resp_hdr.command == A_CNXN {
-        // Normal path — no TLS required
-        let banner = String::from_utf8_lossy(&payload).to_string();
+    // A_STLS received — upgrade to TLS and re-send CNXN.
+    {
+        use adb_protocol::tls;
+        use adb_protocol::AdbTlsTransport;
 
-        // Persist the public key so future SIGNATURE verifications succeed
-        // without requiring another authorization dialog.
-        #[cfg(target_os = "android")]
-        if sent_public_key {
-            persist_adb_pubkey(auth)?;
-        }
-
-        return Ok((DeviceInfo { banner }, transport));
-    }
-
-    if resp_hdr.command == A_STLS {
-        // TLS upgrade path
         let rsa_pem = match adb_protocol::auth::export_private_key_to_pem(auth.private_key()) {
             Ok(pem) => pem,
             Err(e) => return Err(format!("Failed to export RSA key: {e}").into()),
@@ -629,28 +645,24 @@ pub fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[adb-auth] TLS cert generation failed (falling back to non-TLS): {e}");
-                // Fallback: CNXN succeeded (auth already done), just skip TLS
-                return Ok((DeviceInfo { banner: String::from_utf8_lossy(&payload).to_string() }, transport));
+                return Ok((DeviceInfo { banner: String::new() }, transport));
             }
         };
         let config = match tls::create_tls_config(cert_der, key_der) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[adb-auth] TLS config creation failed (falling back to non-TLS): {e}");
-                return Ok((DeviceInfo { banner: String::from_utf8_lossy(&payload).to_string() }, transport));
+                return Ok((DeviceInfo { banner: String::new() }, transport));
             }
         };
 
         let tls_transport = match AdbTlsTransport::new(transport, config, "adb") {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[adb-auth] TLS upgrade failed (falling back to non-TLS): {e}");
-                // The AUTH already succeeded before A_STLS, use the plain transport
-                // Re-wrap for send_message
+                eprintln!("[adb-auth] TLS upgrade failed: {e}");
                 return Err(format!("TLS upgrade failed: {e}").into());
             }
         };
-
 
         // Re-send CNXN over TLS
         let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
@@ -667,14 +679,8 @@ pub fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
         }
 
         let banner = String::from_utf8_lossy(&payload2).to_string();
-        return Ok((DeviceInfo { banner }, tls_box));
+        Ok((DeviceInfo { banner }, tls_box))
     }
-
-    Err(format!(
-        "Unexpected handshake response: cmd={:#x}",
-        resp_hdr.command
-    )
-    .into())
 }
 
 /// Non-TLS fallback — A_STLS will return an error if the device requires TLS.
@@ -685,58 +691,42 @@ fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     auth: &AdbAuth,
 ) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
     let mut transport: Box<dyn Transport> = Box::new(transport);
+    let mut responder = adb_protocol::AuthResponder::single(auth.clone());
     let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
 
     transport.send_message(&cnxn_hdr, cnxn_payload)?;
 
-    let (mut resp_hdr, mut payload) = transport.recv_message()?;
-    let mut sent_signature = false;
-    let mut sent_public_key = false;
-    while resp_hdr.command == A_AUTH {
-        if resp_hdr.arg0 != A_AUTH_TOKEN {
-            return Err(format!("Unsupported AUTH request type: {}", resp_hdr.arg0).into());
+    loop {
+        let (resp_hdr, payload) = transport.recv_message()?;
+        if resp_hdr.command == A_STLS {
+            return Err("Device requires TLS (A_STLS) but the `tls` feature is not enabled. \
+                        Rebuild with --features tls"
+                .into());
         }
-        if payload.len() != 20 {
-            return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
+        if resp_hdr.command == A_AUTH && resp_hdr.arg0 == A_AUTH_TOKEN {
+            if payload.len() != 20 {
+                return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
+            }
+            if let Some((hdr, auth_payload)) = responder.respond_to_token(&payload)? {
+                transport.send_message(&hdr, &auth_payload)?;
+            }
+            continue;
+        }
+        if resp_hdr.command != A_CNXN {
+            return Err(format!("Unexpected handshake response: cmd={:#x}", resp_hdr.command).into());
         }
 
-        let (auth_hdr, auth_payload) = if !sent_signature {
-            sent_signature = true;
-            auth.make_signature_message(&payload)?
-        } else if !sent_public_key {
-            sent_public_key = true;
-            auth.make_rsakey_message()?
-        } else {
-            return Err("adbd rejected the ADB RSA key after signature and public-key exchange".into());
-        };
-        transport.send_message(&auth_hdr, &auth_payload)?;
-        (resp_hdr, payload) = transport.recv_message()?;
-    }
-
-    if resp_hdr.command == A_CNXN {
         let banner = String::from_utf8_lossy(&payload).to_string();
 
         // Persist the public key so future SIGNATURE verifications succeed
         // without requiring another authorization dialog.
         #[cfg(target_os = "android")]
-        if sent_public_key {
+        if responder.pubkey_sent() {
             persist_adb_pubkey(auth)?;
         }
 
         return Ok((DeviceInfo { banner }, transport));
     }
-
-    if resp_hdr.command == A_STLS {
-        return Err("Device requires TLS (A_STLS) but the `tls` feature is not enabled. \
-                    Rebuild with --features tls"
-            .into());
-    }
-
-    Err(format!(
-        "Unexpected handshake response: cmd={:#x}",
-        resp_hdr.command
-    )
-    .into())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -758,7 +748,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Ok(transport) = open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(2)) {
                             if let Ok((device_info, _)) = connect_and_handshake_with_tls_upgrade(
                                 transport,
-                                b"host::features=shell_v2,cmd",
+                                &host_cnxn_payload(),
                                 default_auth(),
                             ) {
                                 println!("{}\\tdevice ({})", direct_addr, device_info.banner.trim());
@@ -822,7 +812,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let (_info, mut transport) = match connect_and_handshake_with_tls_upgrade(
                 transport,
-                b"host::features=shell_v2,cmd",
+                &host_cnxn_payload(),
                 default_auth(),
             ) {
                 Ok(result) => result,
@@ -835,7 +825,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                     connect_and_handshake_with_tls_upgrade(
                         retry_transport,
-                        b"host::features=shell_v2,cmd",
+                        &host_cnxn_payload(),
                         default_auth(),
                     )?
                 }
@@ -845,11 +835,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (_lid, remote_id) = protocol::open_service(&mut transport, &shell_service, 1)?;
             shell::stream_shell_v2(&mut transport, _lid, remote_id, false)?;
         }
-        Commands::ExecOut { command } => {
-            let cmd_str = command.join(" ");
+        Commands::ExecOut { command } | Commands::ExecIn { command } => {
+            // AOSP commandline.cpp:1802: exec-in/exec-out open the raw `exec:`
+            // service — no shell-v2 framing, no PTY. ADB escape rules apply
+            // to the command arguments (exec_service_string).
+            let exec_in = matches!(cli.command, Commands::ExecIn { .. });
+            let exec_service = if exec_in {
+                adb_protocol::exec_service_string(command)
+            } else {
+                format!("exec:{}", command.join(" "))
+            };
 
             // Priority 1: ADB server (port 5037) — same pattern as shell.
-            let exec_service = format!("exec:{cmd_str}");
             let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
             if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
                 if server.switch_transport(cli.serial.as_deref()).is_ok() {
@@ -857,7 +854,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     server.send_host_request(&exec_service)?;
                     server.read_status()?; // OKAY -> server created A_OPEN, device OK'd
                     // Raw forwarding mode — exec: outputs raw bytes, no ShellV2 framing
-                    exec_out::stream_raw_server(&mut server, false)?;
+                    if exec_in {
+                        exec_out::stream_raw_from_server(&mut server)?;
+                    } else {
+                        exec_out::stream_raw_server(&mut server, false)?;
+                    }
                     return Ok(());
                 }
             }
@@ -872,7 +873,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let (_info, mut transport) = match connect_and_handshake_with_tls_upgrade(
                 transport,
-                b"host::features=shell_v2,cmd",
+                &host_cnxn_payload(),
                 default_auth(),
             ) {
                 Ok(result) => result,
@@ -885,14 +886,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                     connect_and_handshake_with_tls_upgrade(
                         retry_transport,
-                        b"host::features=shell_v2,cmd",
+                        &host_cnxn_payload(),
                         default_auth(),
                     )?
                 }
                 Err(e) => return Err(e),
             };
 
-            exec_out::run_exec_out(&mut transport, &cmd_str)?;
+            if exec_in {
+                exec_out::run_exec_in(&mut transport, &exec_service)?;
+            } else {
+                exec_out::run_exec_out_service(&mut transport, &exec_service)?;
+            }
         }
         Commands::Push { local, remote, sync, algorithm, no_compress } => {
             let serial = cli.serial.as_deref();
@@ -1308,7 +1313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
             let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
                 transport,
-                b"host::features=shell_v2,cmd",
+                &host_cnxn_payload(),
                 default_auth(),
             )?;
 
@@ -1331,7 +1336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
             let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
                 transport,
-                b"host::features=shell_v2,cmd",
+                &host_cnxn_payload(),
                 default_auth(),
             )?;
 
@@ -1350,7 +1355,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
             let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
                 transport,
-                b"host::features=shell_v2,cmd",
+                &host_cnxn_payload(),
                 default_auth(),
             )?;
 
