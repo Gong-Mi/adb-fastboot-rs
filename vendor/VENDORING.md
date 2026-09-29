@@ -27,6 +27,12 @@ build dependency.
 - Files: pairing_auth.{h,cpp}, aes_128_gcm.{h,cpp}, aes_128_gcm_siv.{h,cpp}
 - Build: compiled as a small static archive `adb_pairing_auth` against the
   vendored BoringSSL headers; Rust binds the C API in `pairing_auth.h`.
+- Target split (`crates/adb-protocol/build.rs`): Android/Termux keeps the
+  `aarch64-linux-android30` clang target, `$PREFIX` headers/libs, and
+  `c++_shared`; host Linux/macOS builds the same C sources natively and links
+  the host C++ runtime. Do not feed Android sysroot paths to a glibc host
+  compiler. CI verifies default, `--all-features`, and `--no-default-features`
+  on Ubuntu; local Termux verifies the Android target.
 
 ## crates/adb-mdns
 
@@ -46,5 +52,14 @@ build dependency.
   3. nix feature "net" added for if_indextoname/InterfaceFlags.
 - Dependencies (crates.io, no C): socket2, log, simple-dns, zerocopy,
   libc, anyhow, nix, if-addrs, mio — matches AOSP Cargo.toml.
-- Verification: cargo check 0 errors; 37 unit tests passed; adbmdns_start
-  FFI symbol present in rlib (llvm-nm).
+- Verification: cargo check 0 errors; 38 unit tests passed; `adbmdns_start`
+  FFI symbol present in rlib (llvm-nm). A safe Rust adapter
+  `zeroconf::start_discovery(Fn(AdbMdnsUpdate, DiscoveredService))` now copies
+  callback pointers into owned strings/IP/TXT records and enters the same AOSP
+  zero-config worker without requiring C-ABI callbacks from the server.
+  `adb-fastboot-cli/server/mdns_backend.rs` applies Create/Update/Delete to
+  `TransportRegistry`; seven state tests cover duplicate creates, metadata and
+  address refresh, delete, serial changes, multiple service types, USB serial
+  collision, and pairing-service exclusion. Runner starts it unless
+  `ADB_MDNS=0`. This is verified at the state-machine and host-service wire
+  layers; no live multicast/device test is claimed.

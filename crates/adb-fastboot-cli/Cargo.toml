@@ -22,6 +22,7 @@ tls = ["adb-protocol/tls", "dep:rustls"]
 
 [dependencies]
 adb-protocol = { path = "../adb-protocol" }
+adb-mdns = { path = "../adb-mdns" }
 fastboot-protocol = { path = "../fastboot-protocol", default-features = false }
 clap = { version = "4.4", features = ["derive"] }
 thiserror = "1.0"

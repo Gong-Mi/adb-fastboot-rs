@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use adb_protocol::{AdbMessageHeader, ADB_VERSION, A_AUTH, A_AUTH_TOKEN, A_CNXN, MAX_PAYLOAD_V2};
+use adb_protocol::mdns::AdbMdnsService;
 #[cfg(feature = "usb")]
 use adb_protocol::Transport;
 
@@ -90,6 +91,10 @@ pub(crate) struct DeviceEntry {
 
 pub(crate) struct TransportRegistry {
     pub devices: Vec<DeviceEntry>,
+    /// Live AOSP mDNS records keyed by instance + service type. Kept
+    /// separately from generic TCP transports so `host:mdns:services`
+    /// reports actual DNS-SD records instead of inferring them from devices.
+    pub mdns_services: std::collections::HashMap<String, AdbMdnsService>,
     pub forwards: Vec<ForwardRule>,
     pub reverses: Vec<ReverseRule>,
     pub next_id: u64,
@@ -141,6 +146,7 @@ impl TransportRegistry {
     pub(crate) fn new() -> Self {
         let mut reg = Self {
             devices: Vec::new(),
+            mdns_services: std::collections::HashMap::new(),
             forwards: Vec::new(),
             reverses: Vec::new(),
             next_id: 1,

@@ -53,6 +53,10 @@ pub fn run_server_with_listener(listener: TcpListener, ack_reply_fd: Option<i32>
     let running = Arc::new(AtomicBool::new(true));
     let registry = Arc::new(Mutex::new(TransportRegistry::new()));
 
+    // AOSP packages/modules/adb starts zero-config discovery independently
+    // of USB hotplug; callbacks feed Create/Update/Delete into this registry.
+    crate::server::mdns_backend::start_discovery(Arc::clone(&registry));
+
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(ADB_SERVER_PORT);
     eprintln!(
         "[adb-server] Listening on 127.0.0.1:{port} (version {:08x})",

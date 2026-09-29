@@ -439,30 +439,29 @@ pub(crate) fn dispatch_host_service(
             let sub = &c["host:mdns:".len()..];
             match sub {
                 "check" => {
-                    ok_str(client, "mdns daemon version [adb-rs discovery 0.0.0]")
+                    if std::env::var("ADB_MDNS").is_ok_and(|v| v == "0") {
+                        ok_str(client, "ERROR: mdns discovery disabled")
+                    } else {
+                        ok_str(client, "mdns daemon version [adb discovery 0.0.0]")
+                    }
                 }
                 "services" => {
-                    let mut out = String::new();
                     let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-                    for dev in &reg.devices {
-                        let addr = match &dev.origin {
-                            crate::server::models::DeviceOrigin::Tcp { addr } => {
-                                format!("{}:{}", addr.ip(), addr.port())
-                            }
-                            _ => continue,
+                    let mut rows = Vec::new();
+                    for service in reg.mdns_services.values() {
+                        let Some(address) = service.addresses.first() else {
+                            continue;
                         };
-                        // Derive the mdns service type from the AOSP instance
-                        // name format adb-<serial>-<service>._tcp (the
-                        // registry has no dedicated service field yet — the
-                        // adb-mdns callback integration will add one).
-                        let service = if dev.serial.contains("_adb._tcp") {
-                            "_adb._tcp."
-                        } else {
-                            "_adb-tls-connect._tcp."
-                        };
-                        out.push_str(&format!("{}\t{}\t{}\n", dev.serial, service, addr));
+                        rows.push(format!(
+                            "{}\t{}.\t{}:{}\n",
+                            service.instance_name,
+                            service.service_type.service_name(),
+                            address,
+                            service.port
+                        ));
                     }
-                    ok_str(client, &out)
+                    rows.sort();
+                    ok_str(client, &rows.concat())
                 }
                 _ => fail(client, &format!("unsupported mdns service: {sub}")),
             }
@@ -768,11 +767,24 @@ mod tests {
 
     #[test]
     fn test_mdns_services_lists_tcp_devices_only() {
+        use adb_protocol::mdns::{AdbMdnsService, AdbMdnsServiceType};
+        use std::net::{IpAddr, Ipv4Addr};
+
         let registry = Arc::new(Mutex::new(TransportRegistry::new()));
         {
             let mut reg = registry.lock().unwrap();
-            reg.devices.push(tcp_device("adb-emu1-_adb-tls-connect._tcp", 5555));
-            reg.devices.push(tcp_device("adb-emu2-_adb._tcp", 5556));
+            let mut tls = AdbMdnsService::new(
+                AdbMdnsServiceType::TlsConnect,
+                "adb-emu1-_adb-tls-connect._tcp",
+                5555,
+            );
+            tls.addresses.push(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+            reg.mdns_services.insert("tls".into(), tls);
+            let mut classic = AdbMdnsService::new(AdbMdnsServiceType::Classic, "adb-emu2-_adb._tcp", 5556);
+            classic.addresses.push(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+            reg.mdns_services.insert("classic".into(), classic);
+            // Generic TCP and USB devices are not automatically DNS-SD records.
+            reg.devices.push(tcp_device("plain-tcp", 5557));
             // USB devices must NOT appear in the mDNS table.
             reg.devices.push(DeviceEntry {
                 serial: "usb-serial-1".to_string(),
@@ -804,31 +816,32 @@ mod tests {
     }
 
     #[test]
-    fn test_mdns_services_reflects_create_update_delete() {
-        // Create: register a TCP device → appears in the table.
+    fn test_mdns_services_reflects_cached_records() {
+        use adb_protocol::mdns::{AdbMdnsService, AdbMdnsServiceType};
+        use std::net::IpAddr;
+
+        // Create: cache a DNS-SD record → appears in the wire table.
         let registry = Arc::new(Mutex::new(TransportRegistry::new()));
-        registry
-            .lock()
-            .unwrap()
-            .upsert_tcp_device("192.168.1.9:5555".parse().unwrap(), "adb-d1-_adb._tcp".to_string());
+        let mut service = AdbMdnsService::new(AdbMdnsServiceType::Classic, "adb-d1-_adb._tcp", 5555);
+        service.addresses.push(IpAddr::V4("192.168.1.9".parse().unwrap()));
+        registry.lock().unwrap().mdns_services.insert("classic-d1".into(), service);
         let (status, payload) = run_host_service("host:mdns:services", Arc::clone(&registry));
         assert_eq!(status, "OKAY");
         let text = String::from_utf8(payload).unwrap();
         assert!(text.contains("adb-d1-_adb._tcp\t_adb._tcp.\t192.168.1.9:5555"), "{text}");
 
-        // Update: same serial, new port → table shows the new address.
-        registry
-            .lock()
-            .unwrap()
-            .upsert_tcp_device("192.168.1.9:6666".parse().unwrap(), "adb-d1-_adb._tcp".to_string());
+        // Update: DNS-SD record metadata/address changes are reflected.
+        let mut updated = AdbMdnsService::new(AdbMdnsServiceType::Classic, "adb-d1-_adb._tcp", 6666);
+        updated.addresses.push(IpAddr::V4("192.168.1.9".parse().unwrap()));
+        registry.lock().unwrap().mdns_services.insert("classic-d1".into(), updated);
         let (status, payload) = run_host_service("host:mdns:services", Arc::clone(&registry));
         assert_eq!(status, "OKAY");
         let text = String::from_utf8(payload).unwrap();
         assert!(text.contains("192.168.1.9:6666"), "{text}");
         assert!(!text.contains("192.168.1.9:5555"), "stale address still listed: {text}");
 
-        // Delete: remove the device → empty table again.
-        assert!(registry.lock().unwrap().remove_device("adb-d1-_adb._tcp"));
+        // Delete: remove the DNS-SD record → empty table again.
+        assert!(registry.lock().unwrap().mdns_services.remove("classic-d1").is_some());
         let (status, payload) = run_host_service("host:mdns:services", registry);
         assert_eq!(status, "OKAY");
         assert!(payload.is_empty());

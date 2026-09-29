@@ -22,6 +22,7 @@ pub mod fdevent;
 pub mod forward;
 pub mod handler;
 pub mod models;
+pub mod mdns_backend;
 pub mod runner;
 pub mod services;
 pub mod smart_socket;

@@ -22,7 +22,7 @@
 //! adb mDNS implementation.
 
 use log::error;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{c_char, CString};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
@@ -45,7 +45,7 @@ use zero_config_driver::ZeroConfigDriver;
 // TODO: Use bindgen to auto-generate rust from this file.
 /// The state of an update event
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdbMdnsUpdate {
     /// A Resource Record was created
     Create = 1,
@@ -53,6 +53,18 @@ pub enum AdbMdnsUpdate {
     Update = 2,
     /// A Resource Record was deleted
     Delete = 3,
+}
+
+/// Owned, safe Rust view of one service record emitted by the AOSP mDNS stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredService {
+    pub instance_name: String,
+    pub service_type: String,
+    pub host_name: String,
+    pub ipv4_addresses: Vec<Ipv4Addr>,
+    pub ipv6_addresses: Vec<Ipv6Addr>,
+    pub port: u16,
+    pub txt_records: BTreeMap<String, String>,
 }
 
 /// Struct used to send txt key/value pair over the bridge.
@@ -135,6 +147,71 @@ pub unsafe extern "C" fn register(cb: EventCallback) {
         },
     );
     *G_EVENT_CALLBACK.lock().unwrap() = Some(wrapped);
+}
+
+/// Start the AOSP zero-config mDNS engine with an owned Rust callback.
+///
+/// The callback is invoked for every Create/Update/Delete record and receives
+/// owned strings, addresses, and TXT fields (no FFI pointer lifetime leaks).
+/// This function installs the callback and launches the background discovery
+/// threads; it returns after startup, not when discovery stops.
+pub fn start_discovery<F>(callback: F)
+where
+    F: Fn(AdbMdnsUpdate, DiscoveredService) + Send + Sync + 'static,
+{
+    let wrapped = Box::new(
+        move |event: AdbMdnsUpdate,
+              instance_name: &str,
+              service_type: &str,
+              hostname: &str,
+              ipv4s: &HashSet<Ipv4Addr>,
+              ipv6s: &HashSet<Ipv6Addr>,
+              port: u16,
+              txt_attributes: &TxtAttributes| {
+            let (event, service) = own_callback_event(
+                event,
+                instance_name,
+                service_type,
+                hostname,
+                ipv4s,
+                ipv6s,
+                port,
+                txt_attributes,
+            );
+            callback(event, service);
+        },
+    );
+    *G_EVENT_CALLBACK.lock().unwrap() = Some(wrapped);
+    run();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn own_callback_event(
+    event: AdbMdnsUpdate,
+    instance_name: &str,
+    service_type: &str,
+    hostname: &str,
+    ipv4s: &HashSet<Ipv4Addr>,
+    ipv6s: &HashSet<Ipv6Addr>,
+    port: u16,
+    txt_attributes: &TxtAttributes,
+) -> (AdbMdnsUpdate, DiscoveredService) {
+    let mut ipv4_addresses: Vec<_> = ipv4s.iter().copied().collect();
+    let mut ipv6_addresses: Vec<_> = ipv6s.iter().copied().collect();
+    ipv4_addresses.sort_unstable();
+    ipv6_addresses.sort_unstable();
+    (
+        event,
+        DiscoveredService {
+            instance_name: instance_name.to_owned(),
+            service_type: service_type.to_owned(),
+            host_name: hostname.to_owned(),
+            ipv4_addresses,
+            ipv6_addresses,
+            port,
+            txt_records: txt_attributes.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        },
+    )
 }
 
 // TODO Documentation
@@ -319,4 +396,44 @@ pub unsafe extern "C" fn adbmdns_start(
         register(event_callback);
     }
     run();
+}
+
+#[cfg(test)]
+mod owned_callback_tests {
+    use super::*;
+
+    #[test]
+    fn callback_event_owns_and_deterministically_orders_service_info() {
+        let mut ipv4 = HashSet::new();
+        ipv4.insert(Ipv4Addr::new(10, 0, 0, 2));
+        ipv4.insert(Ipv4Addr::new(10, 0, 0, 1));
+        let mut ipv6 = HashSet::new();
+        ipv6.insert(Ipv6Addr::LOCALHOST);
+        let txt = BTreeMap::from([
+            ("serial".to_owned(), "SERIAL-1".to_owned()),
+            ("v".to_owned(), "1".to_owned()),
+        ]);
+
+        let (event, info) = own_callback_event(
+            AdbMdnsUpdate::Update,
+            "adb-SERIAL-1-_adb-tls-connect._tcp.local.",
+            "_adb-tls-connect._tcp.local.",
+            "device.local.",
+            &ipv4,
+            &ipv6,
+            5555,
+            &txt,
+        );
+
+        assert_eq!(event, AdbMdnsUpdate::Update);
+        assert_eq!(info.instance_name, "adb-SERIAL-1-_adb-tls-connect._tcp.local.");
+        assert_eq!(info.ipv4_addresses, vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)]);
+        assert_eq!(info.ipv6_addresses, vec![Ipv6Addr::LOCALHOST]);
+        assert_eq!(info.port, 5555);
+        assert_eq!(info.txt_records.get("serial").map(String::as_str), Some("SERIAL-1"));
+
+        // The owned service survives mutation/drop of callback-owned inputs.
+        ipv4.clear();
+        assert_eq!(info.ipv4_addresses.len(), 2);
+    }
 }
