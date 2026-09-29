@@ -39,7 +39,7 @@ Android.bp 权威分母: 67 host 侧 .cpp / 456 函数定义。名字级差分 4
    Rust 用 enum/模块树实现 AOSP vtable/单体语义，不需逐名补。
 2. 真空集中: mDNS 后端(openscreen-discovery 等价)、incremental/fastdeploy 管线(protobuf)、
    install streamed/multi-package 分支、console 网络层、auth inotify、sysdeps 小函数。
-3. 「创建依赖库」候选: (a) mDNS 后端 crate（openscreen-discovery 等价，独立可测）;
+3. 「创建依赖库」落地: (a) ✅ crates/adb-mdns @ ce2a9df — AOSP 26Q2 已用纯 Rust zeroconf 栈取代 openscreen, 原样搬入 (37 tests passed, adbmdns_start FFI 验证); 待接 client/transport_mdns.rs;
    (b) incremental 管线 crate（需 vendored protobuf 生成代码，或 prost 轻依赖）。
 4. 建议顺序: 先真空里对可用性影响最大且可独立验收的 console 网络层(小)、sysdeps 小函数(小)、
    再 mDNS 后端(中)，最后 incremental(大,依赖 protobuf)。install 分支与 auth inotify 居中。
