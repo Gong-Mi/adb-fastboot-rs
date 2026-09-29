@@ -1089,93 +1089,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::InstallMultiple { apks } => {
-            if apks.is_empty() {
-                eprintln!("Error: no APK files specified");
-                std::process::exit(1);
-            }
-
-            // Validate all APKs exist
-            let apk_paths: Vec<&Path> = apks.iter().map(|a| Path::new(a)).collect();
-            let mut missing = Vec::new();
-            for (i, p) in apk_paths.iter().enumerate() {
-                if !p.exists() {
-                    missing.push(apks[i].clone());
-                }
-            }
+            let apk_paths: Vec<&Path> = apks.iter().map(|apk| Path::new(apk)).collect();
+            let missing: Vec<&str> = apks
+                .iter()
+                .filter(|apk| !Path::new(apk).exists())
+                .map(String::as_str)
+                .collect();
             if !missing.is_empty() {
-                eprintln!("Error: APK(s) not found: {}", missing.join(", "));
-                std::process::exit(1);
+                return Err(format!("APK(s) not found: {}", missing.join(", ")).into());
             }
 
-            // Connect to adbd
             let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
-                .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
+                .map_err(|error| format!("Cannot connect to adbd at {addr}: {error}"))?;
             let (_info, mut transport) =
                 connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
-
-            // Push each APK via sync protocol
-            let staging = "/data/local/tmp";
-            let mut remote_paths = Vec::new();
-            for apk_path in &apk_paths {
-                let apk_data = std::fs::read(apk_path)
-                    .map_err(|e| format!("Cannot read {}: {e}", apk_path.display()))?;
-                let file_name = apk_path.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("package.apk");
-                let remote_apk = format!("{staging}/{file_name}");
-
-                let (local_id, remote_id) = protocol::open_service(&mut transport, "sync:", 1)?;
-
-                let mut send_buf = Vec::new();
-                build_sync_send_req(&remote_apk, 0o644, &mut send_buf)
-                    .map_err(|e| format!("Build SEND req failed: {e}"))?;
-                println!("[adb-rs] Pushing {file_name} ({} bytes) to {remote_apk} ...", apk_data.len());
-
-                protocol::send_wrte(&mut transport, local_id, remote_id, &send_buf)?;
-                protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
-
-                const MAX_CHUNK: usize = 64 * 1024;
-                for chunk in apk_data.chunks(MAX_CHUNK) {
-                    let mut data_buf = Vec::new();
-                    build_sync_data_chunk(chunk, &mut data_buf)
-                        .map_err(|e| format!("Build DATA chunk failed: {e}"))?;
-                    protocol::send_wrte(&mut transport, local_id, remote_id, &data_buf)?;
-                }
-
-                let mut done_buf = Vec::new();
-                build_sync_done(0xFFFF_FFFF, &mut done_buf)
-                    .map_err(|e| format!("Build DONE failed: {e}"))?;
-                protocol::send_wrte(&mut transport, local_id, remote_id, &done_buf)?;
-                protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
-
-                let clse_hdr = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
-                transport.send_message(&clse_hdr, &[])?;
-                let _ = transport.recv_message();
-
-                remote_paths.push(remote_apk);
-            }
-
-            // Run pm install with all remote paths
-            let paths_str: Vec<&str> = remote_paths.iter().map(|s| s.as_str()).collect();
-            let quoted: Vec<String> = paths_str.iter().map(|p| format!("\"{p}\"")).collect();
-            let install_cmd = format!("pm install -r {}", quoted.join(" "));
-            println!("[adb-rs] Installing {} APKs ...", apks.len());
-            let result = shell::run_shell(&mut transport, &install_cmd, true)?;
-            let output = result.unwrap_or_default();
-            let output_str = String::from_utf8_lossy(&output).trim().to_string();
-
-            if output_str.contains("Success") || output_str.contains("Success\n") {
-                println!("[adb-rs] Install-multiple succeeded: {output_str}");
-            } else if output_str.is_empty() {
-                println!("[adb-rs] Install-multiple completed (no output)");
-            } else {
-                eprintln!("[adb-rs] Install-multiple output: {output_str}");
-            }
-
-            // Clean up temp APKs
-            for rp in &remote_paths {
-                let _ = shell::run_shell(&mut transport, &format!("rm -f \"{rp}\""), false);
-            }
+            let mut printer = client::line_printer::LinePrinter::new();
+            let options = client::adb_install::InstallOptions {
+                reinstall: true,
+                ..Default::default()
+            };
+            client::adb_install::install_multiple(
+                &mut transport,
+                &apk_paths,
+                &options,
+                &mut printer,
+            )?;
+            println!("[adb-rs] Install-multiple succeeded");
         }
 
         Commands::InstallMultiPackage { apks } => {
