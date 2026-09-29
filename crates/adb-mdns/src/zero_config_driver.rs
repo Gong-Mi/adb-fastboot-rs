@@ -337,7 +337,7 @@ mod packet_fixture_tests {
     use simple_dns::rdata::{A, AAAA, PTR, RData, SRV, TXT};
     use simple_dns::{CLASS, Name, Packet, ResourceRecord};
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn dns_packet_fixture_ptr_srv_a_aaaa_txt_reaches_service_create_event() {
@@ -426,5 +426,123 @@ mod packet_fixture_tests {
             }
             other => panic!("expected CreateService, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dns_packet_fixture_txt_srv_update_and_ttl_zero_ptr_emit_update_delete() {
+        let service_type = "_adb-tls-connect._tcp";
+        let service_domain = "_adb-tls-connect._tcp.local";
+        let instance = "adb-SERIAL-9._adb-tls-connect._tcp.local";
+        let host = "device-9.local";
+        let ipv4 = Ipv4Addr::new(192, 168, 50, 9);
+        let start = Instant::now();
+
+        let (_sender, receiver) = crate::zero_config_driver_channel::new().unwrap();
+        let mut driver = ZeroConfigDriver::new(ZeroConfig::new(), receiver).unwrap();
+        driver.zero_config.set_time(start);
+
+        let mut initial_txt = TXT::new();
+        initial_txt.add_string("serial=SERIAL-9").unwrap();
+        initial_txt.add_string("model=before").unwrap();
+        let mut create_packet = Packet::new_reply(1);
+        create_packet.answers = vec![
+            ResourceRecord::new(
+                Name::new_unchecked(service_domain),
+                CLASS::IN,
+                120,
+                RData::PTR(PTR(Name::new_unchecked(instance))),
+            ),
+            ResourceRecord::new(
+                Name::new_unchecked(instance),
+                CLASS::IN,
+                120,
+                RData::SRV(SRV {
+                    priority: 0,
+                    weight: 0,
+                    port: 5555,
+                    target: Name::new_unchecked(host),
+                }),
+            ),
+            ResourceRecord::new(
+                Name::new_unchecked(host),
+                CLASS::IN,
+                120,
+                RData::A(A::from(ipv4)),
+            ),
+            ResourceRecord::new(
+                Name::new_unchecked(instance),
+                CLASS::IN,
+                120,
+                RData::TXT(initial_txt),
+            ),
+        ];
+        let create_wire = create_packet.build_bytes_vec().unwrap();
+        driver.process_packet(Packet::parse(&create_wire).unwrap());
+        let (created, _) = driver.zero_config.tick();
+        assert!(matches!(created.as_slice(), [ZeroConfigCommand::CreateService { .. }]));
+
+        let mut updated_txt = TXT::new();
+        updated_txt.add_string("serial=SERIAL-9").unwrap();
+        updated_txt.add_string("model=after").unwrap();
+        let mut update_packet = Packet::new_reply(2);
+        update_packet.answers = vec![
+            ResourceRecord::new(
+                Name::new_unchecked(instance),
+                CLASS::IN,
+                120,
+                RData::SRV(SRV {
+                    priority: 0,
+                    weight: 0,
+                    port: 5566,
+                    target: Name::new_unchecked(host),
+                }),
+            ),
+            ResourceRecord::new(
+                Name::new_unchecked(instance),
+                CLASS::IN,
+                120,
+                RData::TXT(updated_txt),
+            ),
+        ];
+        let update_wire = update_packet.build_bytes_vec().unwrap();
+        driver.zero_config.set_time(start + Duration::from_millis(1));
+        driver.process_packet(Packet::parse(&update_wire).unwrap());
+        let (updated, _) = driver.zero_config.tick();
+        assert_eq!(updated.len(), 1, "expected one UpdateService event: {updated:?}");
+        match &updated[0] {
+            ZeroConfigCommand::UpdateService {
+                instance_name,
+                service_type: actual_type,
+                port,
+                txt,
+                ..
+            } => {
+                assert_eq!(instance_name, "adb-SERIAL-9");
+                assert_eq!(actual_type, service_type);
+                assert_eq!(*port, 5566);
+                assert_eq!(txt.get("model").map(String::as_str), Some("after"));
+            }
+            other => panic!("expected UpdateService, got {other:?}"),
+        }
+
+        let mut delete_packet = Packet::new_reply(3);
+        delete_packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked(service_domain),
+            CLASS::IN,
+            0,
+            RData::PTR(PTR(Name::new_unchecked(instance))),
+        ));
+        let delete_wire = delete_packet.build_bytes_vec().unwrap();
+        driver.zero_config.set_time(start + Duration::from_millis(2));
+        driver.process_packet(Packet::parse(&delete_wire).unwrap());
+        let (deleted, _) = driver.zero_config.tick();
+        assert_eq!(
+            deleted,
+            vec![ZeroConfigCommand::DeleteService {
+                instance_name: "adb-SERIAL-9".to_string(),
+                service_type: service_type.to_string(),
+            }],
+            "TTL-zero PTR should remove the service from the next snapshot"
+        );
     }
 }

@@ -11,7 +11,7 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 | fdevent 事件循环 | 16 | fdevent.rs 存在（timeout 测试过），API 名不同 | 命名差分+部分(ambient/run_on_looper) |
 | sockets asocket 状态机 | 15 | smart_socket.rs Local/Remote/Smart enum 已实现核心 | 命名差分（enum 替代 vtable） |
 | transport 注册表 | 12 | server/transport.rs+models.rs TransportRegistry 已实现 | 命名差分 |
-| mdns 后端 | 8 | `crates/adb-mdns` callback 由 runner 启动；Create/Update/Delete 已进 TransportRegistry；Packet fixture 跑通 PTR→SRV→A/AAAA→TXT→CreateService | 代码接线+离线状态/packet 测试完成；无设备/组播依赖 |
+| mdns 后端 | 8 | `crates/adb-mdns` callback 由 runner 启动；Create/Update/Delete 已进 TransportRegistry；报文 fixture 覆盖 PTR→SRV→A/AAAA→TXT→Create、TXT/SRV Update 和 TTL-zero PTR→Delete | 代码接线+离线状态/packet 测试完成；无设备/组播依赖 |
 | incremental/fastdeploy | 48 | incremental.rs 仅 4 fns 骨架 | 功能真空(大块)→protobuf 依赖 |
 | adb_install 安装分支 | 21 | Rust `adb_install.rs` 具备 push / 单 APK / split session / uninstall helpers；CLI 的 install-multiple 已路由到 helper | 0 个同名函数；功能缺口：未协商 `cmd`/`abb_exec`/APEX 能力，缺 AOSP streamed/push/incremental 选择；multi-package 未建 parent/child session |
 | usb hotplug | 18 | transport_usb.rs+usb_android.rs usbfs 直连+watcher 实现 | 命名差分 |
@@ -24,7 +24,7 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 | errno wire 映射 | 4 | `adb-protocol/sysdeps/errno.rs` + 4 tests | 已实现 |
 | trace init | 4 | adb_trace.rs 有部分 | 部分实现 |
 | emulator 扫描器 | 12 | transport_emulator.rs 9 fns(探测层) | 部分实现 |
-| mdns C bridge(adbmdns) | 4 | AOSP `adbmdns_start` 安全 Rust callback API: pointers → owned service info, deterministic address ordering; runner callback maps DNS-SD events into registry | 1 adapter-copy test + PTR/SRV/A/AAAA/TXT packet→CreateService fixture；Update/Delete 由 state tests 覆盖 |
+| mdns C bridge(adbmdns) | 4 | AOSP `adbmdns_start` 安全 Rust callback API: pointers → owned service info, deterministic address ordering; runner callback maps DNS-SD events into registry | adapter-copy + wire packet fixtures for Create, TXT/SRV Update and TTL-zero PTR Delete; state reducer also covers unknown/multi-record Delete |
 
 ## 汇总: 命名差分 6 域 / 部分实现 8 域 / 自动化切片已实现 2 域 / 功能真空 1 域
 
@@ -38,8 +38,8 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 - `adb mdns check/services` wire dispatch: 5 fake-server tests cover version response, empty/nonempty record table, classic vs TLS service type, generic TCP/USB filtering, and unsupported-subcommand FAIL.
 - mDNS lifecycle state machine: 7 deterministic tests cover Create idempotence, Update address/TXT, Delete/unknown Delete, multiple service types sharing a serial, serial change, pairing-service exclusion, and USB same-serial preservation. Adapter test verifies copied callback strings/TXT, IPv4/IPv6 and deterministic address ordering.
 - The tests caught three real defects: same-serial TCP upsert kept a stale SocketAddr; mdns services inferred records from generic TCP devices and hard-coded TLS type; update/delete lifecycle had no authoritative per-record state. Registry now stores actual `AdbMdnsService` records and applies AOSP Create/Update/Delete callbacks; host service enumerates that cache, not device entries.
-- CI `.github/workflows/ci.yml` exact head `3c93db9`: 4 jobs all successful (`test`, `test --all-features`, `test --no-default-features`, `clippy`); this run includes the DNS packet fixture, console protocol tests, and split-install fake-peer tests.
-- Local exact worktree: `cargo check --workspace --all-features` exit 0; workspace all-targets tests across 11 binaries: default 544 passed/0 failed, all-features 548/0, no-default-features 513/0. ADB CLI binary is 244 passed/0 failed and `adb-mdns` is 39/0. Install-multiple fake-peer tests cover create→write×N→commit, write failure→abandon, shell quoting, APEX rejection, session-ID parsing, and stream IDs. Local doctests are excluded because the custom toolchain lacks rustdoc; CI stable runs them.
+- CI `.github/workflows/ci.yml` exact head `3c93db9`: 4 jobs all successful (`test`, `test --all-features`, `test --no-default-features`, `clippy`); it includes the Create packet fixture, console protocol tests, and split-install fake-peer tests, but predates the new Update/Delete packet fixture.
+- Local exact worktree: `cargo check --workspace --all-features` exit 0; workspace all-targets tests across 11 binaries: default 545 passed/0 failed, all-features 549/0, no-default-features 514/0. ADB CLI binary is 244/0 and `adb-mdns` is 40/0; mDNS wire fixtures cover Create, TXT/SRV Update, and TTL-zero PTR Delete. Install-multiple fake-peer tests cover create→write×N→commit, write failure→abandon, shell quoting, APEX rejection, session-ID parsing, and stream IDs. Local doctests are excluded because the custom toolchain lacks rustdoc; CI stable runs them.
 
 ## ADB install AOSP差异（源码静态审计；尚未做设备端验收）
 
@@ -50,10 +50,9 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 
 ## Remaining build/test tasks
 
-1. Add a packet fixture for a TXT/SRV Update and TTL-zero/Delete, then assert those raw DNS responses propagate through ZeroConfigDriver into UpdateService/DeleteService (current packet fixture covers PTR→SRV→A/AAAA→TXT→CreateService).
-2. Add capability-gated install mode selection (`--streaming`/`--no-streaming`/incremental, `cmd`/`abb_exec` feature handling) and fake-peer coverage for multi-package parent/child sessions; split install-multiple session lifecycle is now covered.
-3. Add forward listener format/remove-all tests; sysdeps `adb_launch_process` tests via child process fixture; emulator scanner state tests with fake console ports.
-4. Incremental/fastdeploy: map protobuf messages/build dependencies first, then fake-peer/file fixtures; it remains the sole large function-domain vacuum.
+1. Add capability-gated install mode selection (`--streaming`/`--no-streaming`/incremental, `cmd`/`abb_exec` feature handling) and fake-peer coverage for multi-package parent/child sessions; split install-multiple session lifecycle is covered.
+2. Add forward listener format/remove-all tests; sysdeps `adb_launch_process` tests via child process fixture; emulator scanner state tests with fake console ports.
+3. Incremental/fastdeploy: map protobuf messages/build dependencies first, then fake-peer/file fixtures; it remains the sole large function-domain vacuum.
 
 ## 附录: 逐文件 × 逐函数明细
 
