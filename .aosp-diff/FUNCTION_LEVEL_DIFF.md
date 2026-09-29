@@ -30,7 +30,7 @@ Android.bp 权威分母: 67 host 侧 .cpp / 456 函数定义。名字级差分 4
 ## 汇总: 命名差分 6 域 / 部分实现 7 域 / 功能真空 4 域
 
 - 命名差分: fdevent 事件循环, sockets asocket 状态机, transport 注册表, usb hotplug, adb_client server 协议, pairing_connection C API
-- 部分实现: adb_install 安装分支, console 模拟器控制台, sysdeps 网络, listeners forward, auth inotify+TLS 证书链, trace init, emulator 扫描器
+- 部分实现: adb_install 安装分支, sysdeps 网络(keepalive/peek/GetOSVersion 已补), listeners forward(remove_all/format 缺), auth inotify+TLS 证书链, emulator 扫描器
 - 功能真空: mdns 后端, incremental/fastdeploy, errno wire 映射, mdns C bridge(adbmdns)
 
 ## 施工结论
@@ -41,7 +41,7 @@ Android.bp 权威分母: 67 host 侧 .cpp / 456 函数定义。名字级差分 4
    install streamed/multi-package 分支、console 网络层、auth inotify、sysdeps 小函数。
 3. 「创建依赖库」落地: (a) ✅ crates/adb-mdns @ ce2a9df — AOSP 26Q2 已用纯 Rust zeroconf 栈取代 openscreen, 原样搬入 (37 tests passed, adbmdns_start FFI 验证); 待接 client/transport_mdns.rs;
    (b) incremental 管线 crate（需 vendored protobuf 生成代码，或 prost 轻依赖）。
-4. 建议顺序: 先真空里对可用性影响最大且可独立验收的 console 网络层(小)、sysdeps 小函数(小)、
+4. 进度: console 网络层 ✅ sysdeps ✅ errno ✅ mdns 后端 crate ✅ host:mdns:* 服务+CLI ✅ (f18033e);
    再 mDNS 后端(中)，最后 incremental(大,依赖 protobuf)。install 分支与 auth inotify 居中。
 ## 附录: 逐文件 × 逐函数明细
 
