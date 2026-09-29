@@ -98,6 +98,8 @@ pub struct Cli {
 pub enum MdnsCommands {
     /// Check mDNS availability
     Check,
+    /// List all discovered services
+    Services,
 }
 
 #[derive(Subcommand)]
@@ -1392,8 +1394,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Mdns(MdnsCommands::Check) => {
-            // Return nothing to indicate mDNS is not available via CLI
-            println!("");
+            // AOSP commandline.cpp:1965-1968: adb_query_command("host:mdns:check").
+            match host_command(cli.serial.as_deref(), "host:mdns:check") {
+                Ok(resp) => println!("{}", resp.trim()),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Mdns(MdnsCommands::Services) => {
+            // AOSP commandline.cpp:1969-1972.
+            println!("List of discovered mdns services");
+            match host_command(cli.serial.as_deref(), "host:mdns:services") {
+                Ok(resp) => print!("{}", resp),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Emu { args } => {

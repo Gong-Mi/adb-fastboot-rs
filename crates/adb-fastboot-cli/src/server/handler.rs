@@ -431,6 +431,39 @@ pub(crate) fn dispatch_host_service(
             ok_str(client, &features)
         }
 
+        // -- host:mdns:check / host:mdns:services ----------------------------
+        // AOSP adb.cpp:1259-1281 handle_mdns_request: report the discovery
+        // backend version, or the discovered-services table
+        // ("instance\t service\t ip:port" lines).
+        c if c.starts_with("host:mdns:") => {
+            let sub = &c["host:mdns:".len()..];
+            match sub {
+                "check" => {
+                    ok_str(client, "mdns daemon version [adb-rs discovery 0.0.0]")
+                }
+                "services" => {
+                    let mut out = String::new();
+                    let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                    for dev in &reg.devices {
+                        if let Some(serial) = Some(&dev.serial) {
+                            let addr = match &dev.origin {
+                                crate::server::models::DeviceOrigin::Tcp { addr } => {
+                                    format!("{}:{}", addr.ip(), addr.port())
+                                }
+                                _ => continue,
+                            };
+                            out.push_str(&format!(
+                                "{}\t{}\t{}\n",
+                                serial, "_adb-tls-connect._tcp.", addr
+                            ));
+                        }
+                    }
+                    ok_str(client, &out)
+                }
+                _ => fail(client, &format!("unsupported mdns service: {sub}")),
+            }
+        }
+
         // -- host:jdwp -------------------------------------------------------
         "host:jdwp" => {
             ok_str(client, "")

@@ -27,6 +27,12 @@ pub fn host_command(
         && !request.starts_with("host:forward")
         && !request.starts_with("host:reverse")
         && !request.starts_with("host:devices")
+        // Server-level informational services — no transport binding
+        // (AOSP handle_host_request answers these before transport
+        // selection; adb.cpp:1264-1281 handle_mdns_request).
+        && !request.starts_with("host:mdns:")
+        && !request.starts_with("host:host-features")
+        && !request.starts_with("host:version")
     {
         server.switch_transport(serial)?;
     }
