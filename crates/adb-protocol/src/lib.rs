@@ -41,7 +41,9 @@ pub use pairing::{
     PairingPacketType, MAX_PAIRING_PAYLOAD, PAIRING_HEADER_SIZE, PAIRING_VERSION,
 };
 #[cfg(not(feature = "pairing-vendored"))]
-pub use pairing::PairingCipher;
+pub use pairing_auth::PairingCipher;
+#[cfg(feature = "pairing-vendored")]
+pub use pairing::PairingAuth as PairingCipherVendored;
 #[cfg(feature = "pairing-vendored")]
 pub use pairing::PairingAuth;
 pub use shell_v2::{ShellV2Error, ShellV2Packet};
