@@ -105,7 +105,11 @@ const USBDEVFS_CLEAR_HALT: u32 = _ior(T, 21, 4);
 // ---- ioctl wrappers ------------------------------------------------------
 
 unsafe fn usbdevfs_ioctl<T>(fd: RawFd, request: u32, arg: *mut T) -> io::Result<i32> {
-    let rc = libc::ioctl(fd, request as libc::c_int, arg);
+    #[cfg(target_os = "android")]
+    let req: libc::c_int = request as libc::c_int;
+    #[cfg(not(target_os = "android"))]
+    let req: libc::c_ulong = request as libc::c_ulong;
+    let rc = libc::ioctl(fd, req, arg);
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -115,7 +119,11 @@ unsafe fn usbdevfs_ioctl<T>(fd: RawFd, request: u32, arg: *mut T) -> io::Result<
 
 unsafe fn usbdevfs_ioctl_val(fd: RawFd, request: u32, val: u32) -> io::Result<i32> {
     let v = val as libc::c_int;
-    let rc = libc::ioctl(fd, request as libc::c_int, &v as *const libc::c_int);
+    #[cfg(target_os = "android")]
+    let req: libc::c_int = request as libc::c_int;
+    #[cfg(not(target_os = "android"))]
+    let req: libc::c_ulong = request as libc::c_ulong;
+    let rc = libc::ioctl(fd, req, &v as *const libc::c_int);
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
