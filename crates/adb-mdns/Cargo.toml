@@ -1,0 +1,21 @@
+[package]
+name = "adb-mdns"
+version = "0.1.0"
+edition = "2024"
+description = "ADB mDNS discovery backend — vendored from AOSP packages/modules/adb client/adbmdns (26Q2-release, Rust zeroconf stack that replaced openscreen)"
+license = "Apache-2.0"
+
+[lib]
+name = "zeroconf"
+path = "src/lib.rs"
+
+[dependencies]
+socket2 = { version = "0.4.0", features = ["all"] }
+log = { version = "0.4.27", features = ["std"] }
+simple-dns = "0.11.0"
+zerocopy = { version = "0.8.26", features = ["derive"] }
+libc = "0.2.174"
+anyhow = "1.0.99"
+nix = { version = "0.29.0", features = ["socket", "uio", "net"] }
+if-addrs = "0.14.0"
+mio = { version = "1.1.0", features = ["net", "os-poll"] }
