@@ -13,7 +13,7 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 | transport 注册表 | 12 | server/transport.rs+models.rs TransportRegistry 已实现 | 命名差分 |
 | mdns 后端 | 8 | `crates/adb-mdns` callback 由 runner 启动；Create/Update/Delete 已进 TransportRegistry；报文 fixture 覆盖 PTR→SRV→A/AAAA→TXT→Create、TXT/SRV Update 和 TTL-zero PTR→Delete | 代码接线+离线状态/packet 测试完成；无设备/组播依赖 |
 | incremental/fastdeploy | 48 | incremental.rs 仅 4 fns 骨架 | 功能真空(大块)→protobuf 依赖 |
-| adb_install 安装分支 | 21 | Rust `adb_install.rs` 具备 push / 单 APK / split session / uninstall helpers；CLI 的 install-multiple 已路由到 helper | 0 个同名函数；功能缺口：未协商 `cmd`/`abb_exec`/APEX 能力，缺 AOSP streamed/push/incremental 选择；multi-package 未建 parent/child session |
+| adb_install 安装分支 | 21 | CLI `install` 解析设备 CNXN feature banner；`--streaming`/`--no-streaming` 可控，默认按 AOSP `cmd` feature 选 streamed exec 或 legacy sync push；`install-multiple` 使用 split session helper | 0 个同名函数；功能缺口：incremental/fastdeploy、abb_exec、APEX、多包 parent/child；install-multiple 仍先 sync staging 而非 AOSP direct streaming |
 | usb hotplug | 18 | transport_usb.rs+usb_android.rs usbfs 直连+watcher 实现 | 命名差分 |
 | adb_client server 协议 | 20 | AdbServerTransport+server_cmds/host_command 核心 | 命名差分 |
 | console 模拟器控制台 | 5 | console.cpp 网络层 + 六个离线测试：token 文件/空 token/serial 选择/命令字节/双 OK marker/fake TCP peer | 自动化切片完成；不要求 emulator/device |
@@ -38,21 +38,21 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 - `adb mdns check/services` wire dispatch: 5 fake-server tests cover version response, empty/nonempty record table, classic vs TLS service type, generic TCP/USB filtering, and unsupported-subcommand FAIL.
 - mDNS lifecycle state machine: 7 deterministic tests cover Create idempotence, Update address/TXT, Delete/unknown Delete, multiple service types sharing a serial, serial change, pairing-service exclusion, and USB same-serial preservation. Adapter test verifies copied callback strings/TXT, IPv4/IPv6 and deterministic address ordering.
 - The tests caught three real defects: same-serial TCP upsert kept a stale SocketAddr; mdns services inferred records from generic TCP devices and hard-coded TLS type; update/delete lifecycle had no authoritative per-record state. Registry now stores actual `AdbMdnsService` records and applies AOSP Create/Update/Delete callbacks; host service enumerates that cache, not device entries.
-- CI `.github/workflows/ci.yml` exact head `de5735f`: 4 jobs all successful (`test`, `test --all-features`, `test --no-default-features`, `clippy`); this includes the Create/Update/TTL-zero Delete packet fixtures, console protocol tests, and split-install fake-peer tests.
-- Local exact worktree: `cargo check --workspace --all-features` exit 0; workspace all-targets tests across 11 binaries: default 545 passed/0 failed, all-features 549/0, no-default-features 514/0. ADB CLI binary is 244/0 and `adb-mdns` is 40/0; mDNS wire fixtures cover Create, TXT/SRV Update, and TTL-zero PTR Delete. Install-multiple fake-peer tests cover create→write×N→commit, write failure→abandon, shell quoting, APEX rejection, session-ID parsing, and stream IDs. Local doctests are excluded because the custom toolchain lacks rustdoc; CI stable runs them.
+- CI `.github/workflows/ci.yml` last verified exact code head `de5735f`: 4 jobs successful (`test`, `test --all-features`, `test --no-default-features`, `clippy`); it predates the current single-install feature-selection/streaming change.
+- Local exact worktree: `cargo check --workspace --all-features` exit 0; workspace all-targets tests across 11 binaries: default 550 passed/0 failed, all-features 554/0, no-default-features 519/0. ADB CLI binary is 249/0 and `adb-mdns` is 40/0. Tests cover CNXN feature mode selection, `--streaming` gate, raw streamed bytes/remote result, legacy sync+exec push/cleanup, install-multiple transaction and mDNS Create/Update/Delete packets. Local doctests are excluded because the custom toolchain lacks rustdoc; CI stable runs them.
 
 ## ADB install AOSP差异（源码静态审计；尚未做设备端验收）
 
-- AOSP `client/adb_install.cpp:354-526` 先解析 `--streaming/--no-streaming/--incremental`，根据 `cmd`、`abb_exec`、APEX 支持选路径，并对默认 incremental 设 fallback；Rust `main_adb.rs:188-201,1011-1309` 暴露的安装子命令没有这些选项/能力协商，单 APK 固定走 sync push + `pm install -r`。
-- AOSP `adb_install.cpp:531-717` 的 install-multiple 会统计总大小，创建一个 split session，逐 APK 以 `install-write -S ... <session> <name> -` 直接从 host 流入，成功 commit、失败 abandon。Rust CLI 已改为调用 `adb_install::install_multiple`：sync 推送到 staging 后执行 `install-create -S`、`install-write`（shell stdin 重定向读取 staged file）、commit/失败 abandon，并清理临时文件；fake peer 覆盖成功序列、write 失败 abandon、session id 解析及 APEX 拒绝。与 AOSP 的直接 streamed payload 路径仍不同，且 mode/feature negotiation 尚缺。
+- AOSP `client/adb_install.cpp:354-526` 解析 `--streaming/--no-streaming/--incremental`，通过设备 banner 的 `cmd`、`abb_exec`、APEX feature 选模式。Rust CLI `main_adb.rs` 现已发 `host_cnxn_payload()`、解析设备 `features=` 并支持 `--streaming/--no-streaming`；默认 `cmd` feature→`exec:cmd package install -S <size>` 原始 A_WRTE 流，缺 `cmd`→sync push + `exec:pm install`。Fake peer 校验 stream service 字符串、原始 APK 字节、非 1 remote ID 和结果/失败；incremental、abb_exec、APEX 仍未实现，APEX 明确拒绝。
+- AOSP `adb_install.cpp:531-717` 的 install-multiple 会统计总大小，创建一个 split session，逐 APK 以 `install-write -S ... <session> <name> -` 直接从 host 流入，成功 commit、失败 abandon。Rust CLI 调用 `adb_install::install_multiple`：先 sync 推送到 staging，再执行 `install-create -S`、`install-write`（shell stdin 重定向读取 staged file）、commit/失败 abandon，并清理临时文件；fake peer 覆盖事务顺序和失败回滚。相较 AOSP，文件数据仍经过 staging，不是直接 streamed payload。
 - AOSP `adb_install.cpp:718-980` 的 multi-package 使用 `install-create --multi-package` parent、为每个包创建 child session、install-write、install-add-session，再 commit/abandon parent。Rust CLI `main_adb.rs:1181-1309` 仍只创建普通 session，把 APK 全写入同一 session；session 创建失败时还逐个独立安装，丢失原子性。尚无 fake-peer coverage。
-- 下一切片应测试/实现 streamed vs push 的 capability selection（`cmd`/`abb_exec`/APEX 分支），之后覆盖 multi-package parent/child state machine。当前 split session 自动化在 Rust helper 层通过 fake ADB peer，不依赖真机。
+- 下一切片先补 AOSP multi-package 的 parent→child create/write/add-session→parent commit/abandon fake-peer 状态机；再评估 incremental/fastdeploy 与 `abb_exec`/APEX 支持差距。当前单 APK stream/push 已有 feature gate 和 fake-peer 验证，不依赖真机。
 
 ## Remaining build/test tasks
 
-1. Add capability-gated install mode selection (`--streaming`/`--no-streaming`/incremental, `cmd`/`abb_exec` feature handling) and fake-peer coverage for multi-package parent/child sessions; split install-multiple session lifecycle is covered.
-2. Add forward listener format/remove-all tests; sysdeps `adb_launch_process` tests via child process fixture; emulator scanner state tests with fake console ports.
-3. Incremental/fastdeploy: map protobuf messages/build dependencies first, then fake-peer/file fixtures; it remains the sole large function-domain vacuum.
+1. Add fake-peer tests and implementation for multi-package parent/child session creation, writes, `install-add-session`, commit and abandon.
+2. Incremental/fastdeploy and APEX/`abb_exec` remain unsupported; map their capability/data paths and dependencies before exposing options.
+3. Add forward listener format/remove-all tests; sysdeps `adb_launch_process` tests via child process fixture; emulator scanner state tests with fake console ports.
 
 ## 附录: 逐文件 × 逐函数明细
 

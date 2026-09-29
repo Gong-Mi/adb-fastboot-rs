@@ -184,8 +184,14 @@ pub enum Commands {
         remote: Option<String>,
         local: Option<String>,
     },
-    /// Push a single APK to device and install it
+    /// Install one APK; streamed mode is chosen from the device feature banner by default
     Install {
+        /// Require streamed install; fail if the device lacks the cmd feature
+        #[arg(long, conflicts_with = "no_streaming")]
+        streaming: bool,
+        /// Force legacy sync-push install even when streamed install is supported
+        #[arg(long, conflicts_with = "streaming")]
+        no_streaming: bool,
         apk: String,
     },
     /// Push multiple APKs to device and install them
@@ -1008,84 +1014,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Install { apk } => {
+        Commands::Install {
+            apk,
+            streaming,
+            no_streaming,
+        } => {
             let apk_path = Path::new(apk);
             if !apk_path.exists() {
-                eprintln!("Error: APK not found: {apk}");
-                std::process::exit(1);
+                return Err(format!("APK not found: {apk}").into());
+            }
+            if !apk_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("apk"))
+            {
+                return Err("This install command currently supports .apk files only; APEX install is not implemented".into());
             }
 
-            // Read APK file
-            let apk_data = std::fs::read(apk_path)
-                .map_err(|e| format!("Cannot read {apk}: {e}"))?;
-            let file_name = apk_path.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("package.apk");
-            let remote_apk = format!("/data/local/tmp/{file_name}");
-
-            // Connect to adbd
-            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
-                .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-            let (_info, mut transport) =
-                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
-
-            // Open sync: service
-            let (local_id, remote_id) = protocol::open_service(&mut transport, "sync:", 1)?;
-
-            // Build SEND request
-            let mut send_buf = Vec::new();
-            build_sync_send_req(&remote_apk, 0o644, &mut send_buf)
-                .map_err(|e| format!("Build SEND req failed: {e}"))?;
-            println!("[adb-rs] Pushing {file_name} ({} bytes) to {remote_apk} ...", apk_data.len());
-
-            // Send SEND request
-            protocol::send_wrte(&mut transport, local_id, remote_id, &send_buf)?;
-
-            // Expect SYNC_OKAY
-            protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
-
-            // Send DATA chunks (max 64KB each)
-            const MAX_CHUNK: usize = 64 * 1024;
-            for chunk in apk_data.chunks(MAX_CHUNK) {
-                let mut data_buf = Vec::new();
-                build_sync_data_chunk(chunk, &mut data_buf)
-                    .map_err(|e| format!("Build DATA chunk failed: {e}"))?;
-                protocol::send_wrte(&mut transport, local_id, remote_id, &data_buf)?;
-            }
-
-            // Send DONE
-            let mut done_buf = Vec::new();
-            build_sync_done(0xFFFF_FFFF, &mut done_buf) // use max mtime
-                .map_err(|e| format!("Build DONE failed: {e}"))?;
-            protocol::send_wrte(&mut transport, local_id, remote_id, &done_buf)?;
-
-            // Expect SYNC_OKAY or SYNC_FAIL
-            protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
-
-            // Close sync connection
-            let clse_hdr = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
-            transport.send_message(&clse_hdr, &[])?;
-            // Wait for CLSE ack
-            let _ = transport.recv_message();
-
-            println!("[adb-rs] Push complete. Installing {remote_apk} ...");
-
-            // Run pm install via shell
-            let install_cmd = format!("pm install -r \"{remote_apk}\"");
-            let result = shell::run_shell(&mut transport, &install_cmd, true)?;
-            let output = result.unwrap_or_default();
-            let output_str = String::from_utf8_lossy(&output).trim().to_string();
-
-            if output_str.contains("Success") || output_str.contains("Success\n") {
-                println!("[adb-rs] Install succeeded: {output_str}");
-            } else if output_str.is_empty() {
-                println!("[adb-rs] Install completed (no output)");
+            let request = if *streaming {
+                client::adb_install::InstallModeRequest::Streaming
+            } else if *no_streaming {
+                client::adb_install::InstallModeRequest::NoStreaming
             } else {
-                eprintln!("[adb-rs] Install output: {output_str}");
-            }
+                client::adb_install::InstallModeRequest::Auto
+            };
+            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+                .map_err(|error| format!("Cannot connect to adbd at {addr}: {error}"))?;
+            let cnxn_payload = host_cnxn_payload();
+            let (device_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+                transport,
+                &cnxn_payload,
+                default_auth(),
+            )?;
+            let mode = client::adb_install::select_install_mode(&device_info.banner, request)?;
+            let options = client::adb_install::InstallOptions {
+                reinstall: true,
+                ..Default::default()
+            };
 
-            // Clean up temp APK
-            let _ = shell::run_shell(&mut transport, &format!("rm -f \"{remote_apk}\""), false);
+            match mode {
+                client::adb_install::InstallMode::Streamed => {
+                    let output = client::adb_install::install_apk_streamed(
+                        &mut transport,
+                        apk_path,
+                        &options,
+                    )?;
+                    println!("[adb-rs] Streamed install succeeded: {}", output.trim());
+                }
+                client::adb_install::InstallMode::Push => {
+                    let mut printer = client::line_printer::LinePrinter::new();
+                    client::adb_install::install_apk(
+                        &mut transport,
+                        apk_path,
+                        &options,
+                        &mut printer,
+                    )?;
+                    println!("[adb-rs] Push install succeeded");
+                }
+            }
         }
 
         Commands::InstallMultiple { apks } => {
