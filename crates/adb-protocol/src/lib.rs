@@ -25,6 +25,8 @@ pub mod usb_android;
 pub use usb_android::{DeviceCandidate, UsbAndroidError, UsbfsAdbDevice};
 
 pub use adb_utils::{escape_arg, exec_service_string};
+#[cfg(unix)]
+pub use sysdeps::errno::{errno_from_wire, errno_to_wire};
 pub use auth::*;
 pub use compress::*;
 pub use constants::*;

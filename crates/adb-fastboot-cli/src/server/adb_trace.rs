@@ -163,16 +163,22 @@ mod tests {
         assert!(adb_trace_is_enabled(AdbTrace::MdnsStack));
     }
 
+    /// ADB_TRACE is process-global; tests that touch it must serialize.
+    static TRACE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_setup_from_env_empty() {
-        TRACE_MASK.store(0, Ordering::Relaxed);
+        let _guard = TRACE_ENV_MUTEX.lock().unwrap();
         // No ADB_TRACE set → mask stays 0
+        unsafe { std::env::remove_var("ADB_TRACE"); }
+        TRACE_MASK.store(0, Ordering::Relaxed);
         setup_trace_from_env();
         assert_eq!(trace_mask(), 0);
     }
 
     #[test]
     fn test_setup_from_env_parses_tags() {
+        let _guard = TRACE_ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("ADB_TRACE", "usb,transport,shell"); }
         TRACE_MASK.store(0, Ordering::Relaxed);
         setup_trace_from_env();
@@ -185,6 +191,7 @@ mod tests {
 
     #[test]
     fn test_setup_from_env_all() {
+        let _guard = TRACE_ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("ADB_TRACE", "all"); }
         TRACE_MASK.store(0, Ordering::Relaxed);
         setup_trace_from_env();

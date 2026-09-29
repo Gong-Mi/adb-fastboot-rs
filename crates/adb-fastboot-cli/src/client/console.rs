@@ -313,6 +313,161 @@ fn handle_reboot(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Emulator console network layer — AOSP client/console.cpp
+// ---------------------------------------------------------------------------
+
+/// AOSP `adb_construct_auth_command()` (console.cpp:32-63): read
+/// `$HOME/.emulator_console_auth_token`; return `auth <token>\n`, or an
+/// empty string when the file is missing/blank (no auth required).
+pub fn adb_construct_auth_command() -> String {
+    const AUTH_TOKEN_FILENAME: &str = ".emulator_console_auth_token";
+
+    let Some(home) = std::env::var_os("HOME") else {
+        return String::new();
+    };
+    let token_path = std::path::Path::new(&home).join(AUTH_TOKEN_FILENAME);
+
+    let Ok(token) = std::fs::read_to_string(&token_path) else {
+        // Missing or unreadable: the emulator doesn't require auth.
+        return String::new();
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        return String::new();
+    }
+    format!("auth {token}\n")
+}
+
+/// AOSP `adb_get_emulator_console_port()` (console.cpp:67-102):
+/// - explicit `emulator-N` serial → N;
+/// - no serial → query `host:devices`, count emulators; one → its port,
+///   zero or many → error (caller prints AOSP's exact messages).
+///
+/// Returns `Ok(port)`, `Err(EmulatorPortError::None)` or `Many`.
+pub enum EmulatorPortError {
+    None,
+    MoreThanOne,
+    Query(String),
+}
+
+pub fn adb_get_emulator_console_port(
+    serial: Option<&str>,
+) -> Result<u16, EmulatorPortError> {
+    if let Some(serial) = serial {
+        // "emulator-N" → N (sscanf %d semantics: prefix match).
+        if let Some(port_str) = serial.strip_prefix("emulator-") {
+            let digits: String = port_str.chars().take_while(char::is_ascii_digit).collect();
+            if !digits.is_empty() {
+                return digits.parse::<u16>().map_err(|_| EmulatorPortError::None);
+            }
+        }
+        return Err(EmulatorPortError::None);
+    }
+
+    // No serial: search the device list for emulators.
+    let devices = super::host_command::host_command(None, "host:devices")
+        .map_err(|e| EmulatorPortError::Query(e.to_string()))?;
+
+    let mut port: Option<u16> = None;
+    let mut emulator_count = 0usize;
+    for line in devices.lines() {
+        if let Some(rest) = line.strip_prefix("emulator-") {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if !digits.is_empty() {
+                emulator_count += 1;
+                if emulator_count > 1 {
+                    return Err(EmulatorPortError::MoreThanOne);
+                }
+                port = digits.parse::<u16>().ok();
+            }
+        }
+    }
+
+    if emulator_count == 0 {
+        return Err(EmulatorPortError::None);
+    }
+    Ok(port.unwrap_or_default())
+}
+
+/// AOSP `connect_to_console()` (console.cpp:104-118): loopback TCP connect
+/// to the emulator console port.
+fn connect_to_console(port: u16) -> std::io::Result<std::net::TcpStream> {
+    std::net::TcpStream::connect(("127.0.0.1", port))
+}
+
+/// AOSP `adb_send_emulator_command()` (console.cpp:120-191): connect,
+/// send `auth <token>` + the command + `quit`, drain the console output,
+/// then skip the first two `OK\r\n` markers (the connection banner and the
+/// auth acknowledgement) and print the rest.
+pub fn adb_send_emulator_command(
+    args: &[String],
+    serial: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+
+    let port = adb_get_emulator_console_port(serial).map_err(|e| match e {
+        EmulatorPortError::None => {
+            if serial.is_some() {
+                "error: no emulator connected".to_string()
+            } else {
+                "error: no emulator detected".to_string()
+            }
+        }
+        EmulatorPortError::MoreThanOne =>
+            "error: more than one emulator detected; use -s".to_string(),
+        EmulatorPortError::Query(e) => format!("error: no emulator connected: {e}"),
+    })?;
+
+    let mut stream = connect_to_console(port).map_err(|e| {
+        format!("error: could not connect to TCP port {port}: {e}")
+    })?;
+
+    // auth command (empty when no token is configured), then the user
+    // command joined with spaces, then "quit".
+    let mut commands = adb_construct_auth_command();
+    for (i, arg) in args.iter().enumerate() {
+        commands.push_str(arg);
+        commands.push(if i == args.len() - 1 { '\n' } else { ' ' });
+    }
+    commands.push_str("quit\n");
+
+    stream.write_all(commands.as_bytes()).map_err(|e| {
+        format!("error: cannot write to emulator: {e}")
+    })?;
+
+    // Drain the console output until orderly shutdown (AOSP reads until
+    // zero bytes so the emulator sees a graceful close, not RST).
+    let mut emulator_output = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => emulator_output.extend_from_slice(&buf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                break;
+            }
+            Err(e) => return Err(format!("error: reading emulator output: {e}").into()),
+        }
+    }
+
+    // Skip the first two "OK\r\n" markers (banner + auth ack), print the rest.
+    let output = String::from_utf8_lossy(&emulator_output).to_string();
+    const DELIMS: &str = "OK\r\n";
+    let mut found = 0usize;
+    for _ in 0..2 {
+        match output[found..].find(DELIMS) {
+            Some(pos) => found += pos + DELIMS.len(),
+            None => break,
+        }
+    }
+    print!("{}", &output[found..]);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

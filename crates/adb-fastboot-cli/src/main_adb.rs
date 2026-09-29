@@ -15,7 +15,7 @@ use adb_protocol::{
 mod server;
 mod client;
 
-use client::{adb_wifi, detach, file_sync, protocol, shell, exec_out};
+use client::{adb_wifi, console, detach, file_sync, protocol, shell, exec_out};
 use client::server_cmds::{ensure_server_running, kill_server};
 use client::host_command::host_command;
 use client::transport::resolve_target_addr;
@@ -1397,9 +1397,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Emu { args } => {
-            let cmd = args.join(" ");
-            let resp = host_command(cli.serial.as_deref(), &format!("host:emu:{}", cmd))?;
-            println!("{}", resp.trim());
+            // AOSP console.cpp adb_send_emulator_command: connect directly
+            // to the emulator's console port on loopback (NOT a host service
+            // — "host:emu:" does not exist in the ADB protocol).
+            if args.is_empty() {
+                eprintln!("error: no emulator command specified");
+                std::process::exit(1);
+            }
+            console::adb_send_emulator_command(args, cli.serial.as_deref())?;
         }
 
         Commands::Version => {
