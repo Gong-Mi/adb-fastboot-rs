@@ -52,7 +52,7 @@ build dependency.
   3. nix feature "net" added for if_indextoname/InterfaceFlags.
 - Dependencies (crates.io, no C): socket2, log, simple-dns, zerocopy,
   libc, anyhow, nix, if-addrs, mio — matches AOSP Cargo.toml.
-- Verification: cargo check 0 errors; 38 unit tests passed; `adbmdns_start`
+- Verification: cargo check 0 errors; 39 unit tests passed; `adbmdns_start`
   FFI symbol present in rlib (llvm-nm). A safe Rust adapter
   `zeroconf::start_discovery(Fn(AdbMdnsUpdate, DiscoveredService))` now copies
   callback pointers into owned strings/IP/TXT records and enters the same AOSP

@@ -330,3 +330,101 @@ impl ZeroConfigDriver {
         }
     }
 }
+
+#[cfg(test)]
+mod packet_fixture_tests {
+    use super::*;
+    use simple_dns::rdata::{A, AAAA, PTR, RData, SRV, TXT};
+    use simple_dns::{CLASS, Name, Packet, ResourceRecord};
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::time::Instant;
+
+    #[test]
+    fn dns_packet_fixture_ptr_srv_a_aaaa_txt_reaches_service_create_event() {
+        let service_type = "_adb-tls-connect._tcp";
+        let service_domain = "_adb-tls-connect._tcp.local";
+        let instance = "adb-SERIAL-9._adb-tls-connect._tcp.local";
+        let host = "device-9.local";
+        let ipv4 = Ipv4Addr::new(192, 168, 50, 9);
+        let ipv6 = Ipv6Addr::LOCALHOST;
+        let port = 5555;
+
+        let mut txt = TXT::new();
+        txt.add_string("serial=SERIAL-9").unwrap();
+        txt.add_string("model=fixture-model").unwrap();
+
+        // Deterministic mDNS response packet with the full DNS-SD record
+        // chain. Serialize and parse it so this test covers actual wire
+        // decoding before passing sections through ZeroConfigDriver.
+        let mut packet = Packet::new_reply(0);
+        packet.answers = vec![
+            ResourceRecord::new(
+                Name::new_unchecked(service_domain),
+                CLASS::IN,
+                120,
+                RData::PTR(PTR(Name::new_unchecked(instance))),
+            ),
+            ResourceRecord::new(
+                Name::new_unchecked(instance),
+                CLASS::IN,
+                120,
+                RData::SRV(SRV {
+                    priority: 0,
+                    weight: 0,
+                    port,
+                    target: Name::new_unchecked(host),
+                }),
+            ),
+            ResourceRecord::new(
+                Name::new_unchecked(host),
+                CLASS::IN,
+                120,
+                RData::A(A::from(ipv4)),
+            ),
+            ResourceRecord::new(
+                Name::new_unchecked(host),
+                CLASS::IN,
+                120,
+                RData::AAAA(AAAA::from(ipv6)),
+            ),
+            ResourceRecord::new(
+                Name::new_unchecked(instance),
+                CLASS::IN,
+                120,
+                RData::TXT(txt),
+            ),
+        ];
+        let raw = packet.build_bytes_vec().unwrap();
+        let parsed = Packet::parse(&raw).unwrap();
+        assert_eq!(parsed.answers.len(), 5);
+
+        let (_sender, receiver) = crate::zero_config_driver_channel::new().unwrap();
+        let mut driver = ZeroConfigDriver::new(ZeroConfig::new(), receiver).unwrap();
+        driver.zero_config.set_time(Instant::now());
+        driver.process_packet(parsed);
+        let (commands, _) = driver.zero_config.tick();
+
+        assert_eq!(commands.len(), 1, "expected one CreateService event: {commands:?}");
+        match &commands[0] {
+            ZeroConfigCommand::CreateService {
+                instance_name,
+                service_type: actual_type,
+                hostname,
+                ipv4s,
+                ipv6s,
+                port: actual_port,
+                txt: attributes,
+            } => {
+                assert_eq!(instance_name, "adb-SERIAL-9");
+                assert_eq!(actual_type, service_type);
+                assert_eq!(hostname, host);
+                assert!(ipv4s.contains(&ipv4));
+                assert!(ipv6s.contains(&ipv6));
+                assert_eq!(*actual_port, port);
+                assert_eq!(attributes.get("serial").map(String::as_str), Some("SERIAL-9"));
+                assert_eq!(attributes.get("model").map(String::as_str), Some("fixture-model"));
+            }
+            other => panic!("expected CreateService, got {other:?}"),
+        }
+    }
+}

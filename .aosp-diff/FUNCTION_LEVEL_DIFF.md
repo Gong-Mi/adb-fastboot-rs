@@ -11,7 +11,7 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 | fdevent 事件循环 | 16 | fdevent.rs 存在（timeout 测试过），API 名不同 | 命名差分+部分(ambient/run_on_looper) |
 | sockets asocket 状态机 | 15 | smart_socket.rs Local/Remote/Smart enum 已实现核心 | 命名差分（enum 替代 vtable） |
 | transport 注册表 | 12 | server/transport.rs+models.rs TransportRegistry 已实现 | 命名差分 |
-| mdns 后端 | 8 | `crates/adb-mdns` safe callback 已由 runner 启动（ADB_MDNS=0 可关）；Create/Update/Delete 已进 TransportRegistry，7 个纯状态测试覆盖 | 代码接线+离线状态测试完成；mDNS 报文 fixture 测试待补 |
+| mdns 后端 | 8 | `crates/adb-mdns` callback 由 runner 启动；Create/Update/Delete 已进 TransportRegistry；Packet fixture 跑通 PTR→SRV→A/AAAA→TXT→CreateService | 代码接线+离线状态/packet 测试完成；无设备/组播依赖 |
 | incremental/fastdeploy | 48 | incremental.rs 仅 4 fns 骨架 | 功能真空(大块)→protobuf 依赖 |
 | adb_install 安装分支 | 21 | adb_install.rs 7 fns(pm install shell 路径) | 部分实现(streamed/multi/abb_exec/apex 缺) |
 | usb hotplug | 18 | transport_usb.rs+usb_android.rs usbfs 直连+watcher 实现 | 命名差分 |
@@ -24,12 +24,12 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 | errno wire 映射 | 4 | `adb-protocol/sysdeps/errno.rs` + 4 tests | 已实现 |
 | trace init | 4 | adb_trace.rs 有部分 | 部分实现 |
 | emulator 扫描器 | 12 | transport_emulator.rs 9 fns(探测层) | 部分实现 |
-| mdns C bridge(adbmdns) | 4 | AOSP `adbmdns_start` 安全 Rust callback API: pointers → owned service info, deterministic address ordering; runner callback converts DNS-SD types/TXT/address into registry events | 自动化桥接与 1 个 adapter 测试已补；实际 UDP packet/event 配对待 fixture 测 |
+| mdns C bridge(adbmdns) | 4 | AOSP `adbmdns_start` 安全 Rust callback API: pointers → owned service info, deterministic address ordering; runner callback maps DNS-SD events into registry | 1 adapter-copy test + PTR/SRV/A/AAAA/TXT packet→CreateService fixture；Update/Delete 由 state tests 覆盖 |
 
 ## 汇总: 命名差分 6 域 / 部分实现 8 域 / 自动化切片已实现 2 域 / 功能真空 1 域
 
 - 命名差分: fdevent 事件循环, sockets asocket 状态机, transport 注册表, usb hotplug, adb_client server 协议, pairing_connection C API
-- 部分实现: mDNS 后端 packet fixtures, adb_install 安装分支, sysdeps (adb_launch_process 等), listeners forward, auth inotify+TLS 证书链, trace init, emulator 扫描器, mDNS callback/state-machine end-to-end parser linkage
+- 部分实现: mDNS packet Update/TXT-change/TTL-delete fixtures, adb_install 安装分支, sysdeps (adb_launch_process 等), listeners forward, auth inotify+TLS 证书链, trace init, emulator 扫描器
 - 自动化切片已实现: console fake-protocol path/tests; errno wire mapping
 - 功能真空: incremental/fastdeploy
 
@@ -38,12 +38,12 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 - `adb mdns check/services` wire dispatch: 5 fake-server tests cover version response, empty/nonempty record table, classic vs TLS service type, generic TCP/USB filtering, and unsupported-subcommand FAIL.
 - mDNS lifecycle state machine: 7 deterministic tests cover Create idempotence, Update address/TXT, Delete/unknown Delete, multiple service types sharing a serial, serial change, pairing-service exclusion, and USB same-serial preservation. Adapter test verifies copied callback strings/TXT, IPv4/IPv6 and deterministic address ordering.
 - The tests caught three real defects: same-serial TCP upsert kept a stale SocketAddr; mdns services inferred records from generic TCP devices and hard-coded TLS type; update/delete lifecycle had no authoritative per-record state. Registry now stores actual `AdbMdnsService` records and applies AOSP Create/Update/Delete callbacks; host service enumerates that cache, not device entries.
-- CI `.github/workflows/ci.yml` exact head `436e92a`: 4 jobs green (default, `--all-features`, `--no-default-features`, advisory clippy). The feature matrix caught and fixed host-target `ioctl` request type, Android-only `persist_adb_pubkey` import, libc `__errno` portability, and Termux-only BoringSSL build flags.
-- Local exact-tree Android target before this newest console-test slice: workspace `cargo check --all-features` 0 errors; adb-rs bin 234/0; adb-mdns library 38/0; workspace `--all-targets` all-features and no-default-features both passed (doctests intentionally excluded locally because custom toolchain has no rustdoc; GitHub stable CI runs them). The new fake-console tests are 5 focused cases and are pending full-suite rerun/CI below.
+- CI last green `.github/workflows/ci.yml` exact head `436e92a`: 4 jobs green (default, `--all-features`, `--no-default-features`, advisory clippy). The feature matrix caught and fixed host-target `ioctl` request type, Android-only `persist_adb_pubkey` import, libc `__errno` portability, and Termux-only BoringSSL build flags. Console/packet-fixture changes committed after that CI head still need a fresh run.
+- Local exact-tree Android target (after the latest console and packet fixture changes): `cargo check --workspace --all-features` exit 0; workspace all-targets tests: all-features 544 passed/0 failed, no-default-features 509 passed/0 failed (11 test binaries each); ADB CLI binary 240/0, AOSP mDNS crate 39/0. Local doctests are excluded because this custom toolchain lacks rustdoc; GitHub stable CI runs them.
 
 ## Remaining build/test tasks
 
-1. Add deterministic DNS response packet fixtures that drive PTR → SRV → A/AAAA → TXT parsing and then Create/Update/Delete into the state machine (no multicast socket or device required).
+1. Add a packet fixture for a TXT/SRV Update and TTL-zero/Delete, then assert those raw DNS responses propagate through ZeroConfigDriver into UpdateService/DeleteService (current packet fixture covers PTR→SRV→A/AAAA→TXT→CreateService).
 2. Add tests for ADB install streamed/multi-package mode selection using fake peer; keep unsupported abb_exec/APEX branches explicit.
 3. Add forward listener format/remove-all tests; sysdeps `adb_launch_process` tests via child process fixture; emulator scanner state tests with fake console ports.
 4. Incremental/fastdeploy: map protobuf messages/build dependencies first, then fake-peer/file fixtures; it remains the sole large function-domain vacuum.
