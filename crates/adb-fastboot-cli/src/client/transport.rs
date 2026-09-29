@@ -8,6 +8,7 @@ use adb_protocol::{
     MAX_PAYLOAD_V2,
 };
 
+#[cfg(target_os = "android")]
 use crate::client::auth::persist_adb_pubkey;
 
 const ADBD_PORT: u16 = 5555;

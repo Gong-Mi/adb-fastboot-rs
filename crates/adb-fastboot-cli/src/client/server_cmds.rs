@@ -8,8 +8,13 @@ use std::time::Duration;
 
 use adb_protocol::AdbServerTransport;
 
-// Temporary local copy; will be imported from host_command after step 5 merge.
 const ADB_SERVER_PORT: u16 = 5037;
+
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+
 
 /// Ensure ADB server daemon is running on 127.0.0.1:5037.
 /// If not running, autostarts it by spawning `adb-rs serve` in the background.
@@ -43,7 +48,7 @@ pub fn ensure_server_running_at(port: u16) -> Result<(), Box<dyn std::error::Err
     let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
     let rc = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
     if rc != 0 {
-        return Err(format!("pipe() failed: errno={}", unsafe { *libc::__errno() }).into());
+        return Err(format!("pipe() failed: errno={}", last_errno()).into());
     }
     let pipe_read = pipe_fds[0];
     let pipe_write = pipe_fds[1];
@@ -52,7 +57,7 @@ pub fn ensure_server_running_at(port: u16) -> Result<(), Box<dyn std::error::Err
     if pid < 0 {
         let _ = unsafe { libc::close(pipe_read) };
         let _ = unsafe { libc::close(pipe_write) };
-        return Err(format!("fork() failed: errno={}", unsafe { *libc::__errno() }).into());
+        return Err(format!("fork() failed: errno={}", last_errno()).into());
     }
 
     if pid == 0 {
@@ -137,7 +142,7 @@ pub fn ensure_server_running_at(port: u16) -> Result<(), Box<dyn std::error::Err
             // EOF without OK — server exited
             break;
         } else {
-            let err = unsafe { *libc::__errno() };
+            let err = last_errno();
             if err == libc::EINTR {
                 continue;
             }
