@@ -244,6 +244,10 @@ impl TransportRegistry {
     pub(crate) fn upsert_tcp_device(&mut self, addr: SocketAddr, serial: String) {
         if let Some(existing) = self.devices.iter_mut().find(|d| d.serial == serial) {
             existing.state = DeviceState::Device;
+            // Update the origin address: an mDNS device may reconnect on a
+            // different port; keeping the stale address would send later
+            // connects/forwards to the dead endpoint.
+            existing.origin = DeviceOrigin::Tcp { addr };
         } else {
             self.devices.push(DeviceEntry {
                 transport_id: {

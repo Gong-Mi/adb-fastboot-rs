@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "--all-features"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install system deps (pkg-config probes for usb/tls native deps)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            libusb-1.0-0-dev libudev-dev googletest
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}-${{ matrix.features }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check (default ${{ matrix.features }})
+        run: cargo check --workspace ${{ matrix.features }}
+
+      - name: Test (default ${{ matrix.features }})
+        run: cargo test --workspace ${{ matrix.features }}
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libusb-1.0-0-dev libudev-dev
+      # Advisory only: does not gate merges yet (pre-existing warnings).
+      - name: Clippy (advisory)
+        run: cargo clippy --workspace --all-features 2>&1 | tail -40

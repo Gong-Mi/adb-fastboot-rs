@@ -445,18 +445,22 @@ pub(crate) fn dispatch_host_service(
                     let mut out = String::new();
                     let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
                     for dev in &reg.devices {
-                        if let Some(serial) = Some(&dev.serial) {
-                            let addr = match &dev.origin {
-                                crate::server::models::DeviceOrigin::Tcp { addr } => {
-                                    format!("{}:{}", addr.ip(), addr.port())
-                                }
-                                _ => continue,
-                            };
-                            out.push_str(&format!(
-                                "{}\t{}\t{}\n",
-                                serial, "_adb-tls-connect._tcp.", addr
-                            ));
-                        }
+                        let addr = match &dev.origin {
+                            crate::server::models::DeviceOrigin::Tcp { addr } => {
+                                format!("{}:{}", addr.ip(), addr.port())
+                            }
+                            _ => continue,
+                        };
+                        // Derive the mdns service type from the AOSP instance
+                        // name format adb-<serial>-<service>._tcp (the
+                        // registry has no dedicated service field yet — the
+                        // adb-mdns callback integration will add one).
+                        let service = if dev.serial.contains("_adb._tcp") {
+                            "_adb._tcp."
+                        } else {
+                            "_adb-tls-connect._tcp."
+                        };
+                        out.push_str(&format!("{}\t{}\t{}\n", dev.serial, service, addr));
                     }
                     ok_str(client, &out)
                 }
@@ -682,5 +686,151 @@ mod tests {
         running.store(false, Ordering::Relaxed);
         drop(client);
         server.join().unwrap();
+    }
+
+    /// Wire helper: run a host service against an in-thread server and
+    /// return the raw (status, payload) reply.
+    fn run_host_service(
+        cmd: &'static str,
+        registry: Arc<Mutex<TransportRegistry>>,
+    ) -> (String, Vec<u8>) {
+        use std::io::Read as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_registry = Arc::clone(&registry);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            dispatch_host_service(&mut stream, cmd, &server_registry, &running).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let mut status = [0u8; 4];
+        client.read_exact(&mut status).unwrap();
+        let status = String::from_utf8_lossy(&status).to_string();
+
+        let mut payload = Vec::new();
+        if status == "OKAY" {
+            let mut len = [0u8; 4];
+            client.read_exact(&mut len).unwrap();
+            let n = usize::from_str_radix(std::str::from_utf8(&len).unwrap(), 16).unwrap();
+            payload = vec![0u8; n];
+            client.read_exact(&mut payload).unwrap();
+        } else {
+            // FAIL: hex length + message
+            let mut len = [0u8; 4];
+            client.read_exact(&mut len).unwrap();
+            let n = usize::from_str_radix(std::str::from_utf8(&len).unwrap(), 16).unwrap();
+            payload = vec![0u8; n];
+            client.read_exact(&mut payload).unwrap();
+        }
+
+        server.join().unwrap();
+        (status, payload)
+    }
+
+    fn tcp_device(serial: &str, port: u16) -> DeviceEntry {
+        DeviceEntry {
+            serial: serial.to_string(),
+            transport_id: 1,
+            state: DeviceState::Device,
+            origin: DeviceOrigin::Tcp {
+                addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            },
+            product: None,
+            model: None,
+            device_name: None,
+            transport_features: None,
+        }
+    }
+
+    #[test]
+    fn test_mdns_check_reports_backend_version() {
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        let (status, payload) = run_host_service("host:mdns:check", registry);
+        assert_eq!(status, "OKAY");
+        let text = String::from_utf8(payload).unwrap();
+        assert!(
+            text.starts_with("mdns daemon version ["),
+            "unexpected mdns check payload: {text}"
+        );
+        assert!(text.ends_with("]"));
+    }
+
+    #[test]
+    fn test_mdns_services_empty_registry_yields_empty_table() {
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        let (status, payload) = run_host_service("host:mdns:services", registry);
+        assert_eq!(status, "OKAY");
+        assert!(payload.is_empty(), "expected empty table, got {payload:?}");
+    }
+
+    #[test]
+    fn test_mdns_services_lists_tcp_devices_only() {
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.devices.push(tcp_device("adb-emu1-_adb-tls-connect._tcp", 5555));
+            reg.devices.push(tcp_device("adb-emu2-_adb._tcp", 5556));
+            // USB devices must NOT appear in the mDNS table.
+            reg.devices.push(DeviceEntry {
+                serial: "usb-serial-1".to_string(),
+                transport_id: 2,
+                state: DeviceState::Device,
+                origin: DeviceOrigin::Usb,
+                product: None,
+                model: None,
+                device_name: None,
+                transport_features: None,
+            });
+        }
+        let (status, payload) = run_host_service("host:mdns:services", registry);
+        assert_eq!(status, "OKAY");
+        let text = String::from_utf8(payload).unwrap();
+        assert!(text.contains("adb-emu1-_adb-tls-connect._tcp\t"), "{text}");
+        assert!(text.contains("_adb-tls-connect._tcp.\t127.0.0.1:5555"), "{text}");
+        assert!(text.contains("adb-emu2-_adb._tcp\t"), "{text}");
+        assert!(!text.contains("usb-serial-1"), "USB device leaked into mdns table: {text}");
+    }
+
+    #[test]
+    fn test_mdns_unknown_subcommand_fails() {
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        let (status, payload) = run_host_service("host:mdns:bogus", registry);
+        assert_eq!(status, "FAIL");
+        let text = String::from_utf8(payload).unwrap();
+        assert!(text.contains("unsupported mdns service"), "{text}");
+    }
+
+    #[test]
+    fn test_mdns_services_reflects_create_update_delete() {
+        // Create: register a TCP device → appears in the table.
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        registry
+            .lock()
+            .unwrap()
+            .upsert_tcp_device("192.168.1.9:5555".parse().unwrap(), "adb-d1-_adb._tcp".to_string());
+        let (status, payload) = run_host_service("host:mdns:services", Arc::clone(&registry));
+        assert_eq!(status, "OKAY");
+        let text = String::from_utf8(payload).unwrap();
+        assert!(text.contains("adb-d1-_adb._tcp\t_adb._tcp.\t192.168.1.9:5555"), "{text}");
+
+        // Update: same serial, new port → table shows the new address.
+        registry
+            .lock()
+            .unwrap()
+            .upsert_tcp_device("192.168.1.9:6666".parse().unwrap(), "adb-d1-_adb._tcp".to_string());
+        let (status, payload) = run_host_service("host:mdns:services", Arc::clone(&registry));
+        assert_eq!(status, "OKAY");
+        let text = String::from_utf8(payload).unwrap();
+        assert!(text.contains("192.168.1.9:6666"), "{text}");
+        assert!(!text.contains("192.168.1.9:5555"), "stale address still listed: {text}");
+
+        // Delete: remove the device → empty table again.
+        assert!(registry.lock().unwrap().remove_device("adb-d1-_adb._tcp"));
+        let (status, payload) = run_host_service("host:mdns:services", registry);
+        assert_eq!(status, "OKAY");
+        assert!(payload.is_empty());
     }
 }
