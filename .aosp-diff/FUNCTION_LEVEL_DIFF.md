@@ -16,7 +16,7 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 | adb_install 安装分支 | 21 | adb_install.rs 7 fns(pm install shell 路径) | 部分实现(streamed/multi/abb_exec/apex 缺) |
 | usb hotplug | 18 | transport_usb.rs+usb_android.rs usbfs 直连+watcher 实现 | 命名差分 |
 | adb_client server 协议 | 20 | AdbServerTransport+server_cmds/host_command 核心 | 命名差分 |
-| console 模拟器控制台 | 5 | console 网络层已按 console.cpp 实现；尚缺 fake-console 协议测试 | 部分实现(测试待补) |
+| console 模拟器控制台 | 5 | console.cpp 网络层 + 六个离线测试：token 文件/空 token/serial 选择/命令字节/双 OK marker/fake TCP peer | 自动化切片完成；不要求 emulator/device |
 | pairing_connection C API | 8 | pairing_connection.rs/pairing_server.rs 原生 API | 命名差分 |
 | sysdeps 网络 | 7 | keepalive/peek/GetOSVersion 已补；adb_launch_process 等边项待补 | 部分实现 |
 | listeners forward | 10 | forward.rs 有 server forward；remove_all/format 缺 | 部分实现 |
@@ -26,11 +26,11 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 | emulator 扫描器 | 12 | transport_emulator.rs 9 fns(探测层) | 部分实现 |
 | mdns C bridge(adbmdns) | 4 | AOSP `adbmdns_start` 安全 Rust callback API: pointers → owned service info, deterministic address ordering; runner callback converts DNS-SD types/TXT/address into registry events | 自动化桥接与 1 个 adapter 测试已补；实际 UDP packet/event 配对待 fixture 测 |
 
-## 汇总: 命名差分 6 域 / 部分实现 9 域 / 已实现 1 域 / 功能真空 1 域
+## 汇总: 命名差分 6 域 / 部分实现 8 域 / 自动化切片已实现 2 域 / 功能真空 1 域
 
 - 命名差分: fdevent 事件循环, sockets asocket 状态机, transport 注册表, usb hotplug, adb_client server 协议, pairing_connection C API
-- 部分实现: mDNS 后端接线, adb_install 安装分支, console fake-protocol tests, sysdeps (adb_launch_process 等), listeners forward, auth inotify+TLS 证书链, trace init, emulator 扫描器, mDNS callback/state-machine bridge
-- 已实现: errno wire 映射
+- 部分实现: mDNS 后端 packet fixtures, adb_install 安装分支, sysdeps (adb_launch_process 等), listeners forward, auth inotify+TLS 证书链, trace init, emulator 扫描器, mDNS callback/state-machine end-to-end parser linkage
+- 自动化切片已实现: console fake-protocol path/tests; errno wire mapping
 - 功能真空: incremental/fastdeploy
 
 ## 当前自动化状态（2026-09-29）
@@ -39,15 +39,14 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 - mDNS lifecycle state machine: 7 deterministic tests cover Create idempotence, Update address/TXT, Delete/unknown Delete, multiple service types sharing a serial, serial change, pairing-service exclusion, and USB same-serial preservation. Adapter test verifies copied callback strings/TXT, IPv4/IPv6 and deterministic address ordering.
 - The tests caught three real defects: same-serial TCP upsert kept a stale SocketAddr; mdns services inferred records from generic TCP devices and hard-coded TLS type; update/delete lifecycle had no authoritative per-record state. Registry now stores actual `AdbMdnsService` records and applies AOSP Create/Update/Delete callbacks; host service enumerates that cache, not device entries.
 - CI `.github/workflows/ci.yml` exact head `436e92a`: 4 jobs green (default, `--all-features`, `--no-default-features`, advisory clippy). The feature matrix caught and fixed host-target `ioctl` request type, Android-only `persist_adb_pubkey` import, libc `__errno` portability, and Termux-only BoringSSL build flags.
-- Local exact-tree Android target: workspace `cargo check --all-features` 0 errors; adb-rs bin 234/0; adb-mdns library 38/0; workspace `--all-targets` all-features and no-default-features both passed (doctests intentionally excluded locally because custom toolchain has no rustdoc; GitHub stable CI runs them).
+- Local exact-tree Android target before this newest console-test slice: workspace `cargo check --all-features` 0 errors; adb-rs bin 234/0; adb-mdns library 38/0; workspace `--all-targets` all-features and no-default-features both passed (doctests intentionally excluded locally because custom toolchain has no rustdoc; GitHub stable CI runs them). The new fake-console tests are 5 focused cases and are pending full-suite rerun/CI below.
 
 ## Remaining build/test tasks
 
 1. Add deterministic DNS response packet fixtures that drive PTR → SRV → A/AAAA → TXT parsing and then Create/Update/Delete into the state machine (no multicast socket or device required).
-2. Add fake-console protocol tests for auth/no-auth, emulator selection (0/1/>1), two greeting OK markers, orderly close/reset handling, and command bytes.
-3. Add tests for ADB install streamed/multi-package mode selection using fake peer; keep unsupported abb_exec/APEX branches explicit.
-4. Add forward listener format/remove-all tests; sysdeps `adb_launch_process` tests via child process fixture; emulator scanner state tests with fake console ports.
-5. Incremental/fastdeploy: map protobuf messages/build dependencies first, then fake-peer/file fixtures; it remains the sole large function-domain vacuum.
+2. Add tests for ADB install streamed/multi-package mode selection using fake peer; keep unsupported abb_exec/APEX branches explicit.
+3. Add forward listener format/remove-all tests; sysdeps `adb_launch_process` tests via child process fixture; emulator scanner state tests with fake console ports.
+4. Incremental/fastdeploy: map protobuf messages/build dependencies first, then fake-peer/file fixtures; it remains the sole large function-domain vacuum.
 
 ## 附录: 逐文件 × 逐函数明细
 

@@ -327,16 +327,21 @@ pub fn adb_construct_auth_command() -> String {
         return String::new();
     };
     let token_path = std::path::Path::new(&home).join(AUTH_TOKEN_FILENAME);
+    auth_command_from_path(&token_path)
+}
 
-    let Ok(token) = std::fs::read_to_string(&token_path) else {
-        // Missing or unreadable: the emulator doesn't require auth.
-        return String::new();
-    };
-    let token = token.trim();
+fn auth_command_from_path(token_path: &std::path::Path) -> String {
+    let token = std::fs::read_to_string(token_path).ok();
+    console_auth_command(token.as_deref())
+}
+
+fn console_auth_command(token: Option<&str>) -> String {
+    let token = token.unwrap_or_default().trim();
     if token.is_empty() {
-        return String::new();
+        String::new()
+    } else {
+        format!("auth {token}\n")
     }
-    format!("auth {token}\n")
 }
 
 /// AOSP `adb_get_emulator_console_port()` (console.cpp:67-102):
@@ -344,50 +349,51 @@ pub fn adb_construct_auth_command() -> String {
 /// - no serial → query `host:devices`, count emulators; one → its port,
 ///   zero or many → error (caller prints AOSP's exact messages).
 ///
-/// Returns `Ok(port)`, `Err(EmulatorPortError::None)` or `Many`.
+#[derive(Debug, PartialEq, Eq)]
 pub enum EmulatorPortError {
     None,
     MoreThanOne,
     Query(String),
 }
 
+fn parse_emulator_serial(serial: &str) -> Option<u16> {
+    let rest = serial.strip_prefix("emulator-")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u16>().ok()
+}
+
+fn find_unique_emulator_port(devices: &str) -> Result<u16, EmulatorPortError> {
+    let mut port = None;
+    for line in devices.lines() {
+        let Some(rest) = line.strip_prefix("emulator-") else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        let found = digits.parse::<u16>().map_err(|_| EmulatorPortError::None)?;
+        if port.replace(found).is_some() {
+            return Err(EmulatorPortError::MoreThanOne);
+        }
+    }
+    port.ok_or(EmulatorPortError::None)
+}
+
 pub fn adb_get_emulator_console_port(
     serial: Option<&str>,
 ) -> Result<u16, EmulatorPortError> {
     if let Some(serial) = serial {
-        // "emulator-N" → N (sscanf %d semantics: prefix match).
-        if let Some(port_str) = serial.strip_prefix("emulator-") {
-            let digits: String = port_str.chars().take_while(char::is_ascii_digit).collect();
-            if !digits.is_empty() {
-                return digits.parse::<u16>().map_err(|_| EmulatorPortError::None);
-            }
-        }
-        return Err(EmulatorPortError::None);
+        return parse_emulator_serial(serial).ok_or(EmulatorPortError::None);
     }
 
     // No serial: search the device list for emulators.
     let devices = super::host_command::host_command(None, "host:devices")
         .map_err(|e| EmulatorPortError::Query(e.to_string()))?;
-
-    let mut port: Option<u16> = None;
-    let mut emulator_count = 0usize;
-    for line in devices.lines() {
-        if let Some(rest) = line.strip_prefix("emulator-") {
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            if !digits.is_empty() {
-                emulator_count += 1;
-                if emulator_count > 1 {
-                    return Err(EmulatorPortError::MoreThanOne);
-                }
-                port = digits.parse::<u16>().ok();
-            }
-        }
-    }
-
-    if emulator_count == 0 {
-        return Err(EmulatorPortError::None);
-    }
-    Ok(port.unwrap_or_default())
+    find_unique_emulator_port(&devices)
 }
 
 /// AOSP `connect_to_console()` (console.cpp:104-118): loopback TCP connect
@@ -396,16 +402,63 @@ fn connect_to_console(port: u16) -> std::io::Result<std::net::TcpStream> {
     std::net::TcpStream::connect(("127.0.0.1", port))
 }
 
+fn console_command_bytes(auth_command: &str, args: &[String]) -> Vec<u8> {
+    let mut commands = auth_command.to_owned();
+    for (i, arg) in args.iter().enumerate() {
+        commands.push_str(arg);
+        commands.push(if i == args.len() - 1 { '\n' } else { ' ' });
+    }
+    commands.push_str("quit\n");
+    commands.into_bytes()
+}
+
+fn strip_console_greeting(raw: &[u8]) -> String {
+    let output = String::from_utf8_lossy(raw);
+    const DELIMS: &str = "OK\r\n";
+    let mut found = 0usize;
+    for _ in 0..2 {
+        match output[found..].find(DELIMS) {
+            Some(pos) => found += pos + DELIMS.len(),
+            None => break,
+        }
+    }
+    output[found..].to_owned()
+}
+
+fn exchange_console<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    commands: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    stream.write_all(commands)?;
+
+    // Drain output to orderly EOF; returning without draining can make the
+    // emulator's next recv see ECONNABORTED instead of the sent command.
+    let mut output = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => output.extend_from_slice(&buf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(output)
+}
+
 /// AOSP `adb_send_emulator_command()` (console.cpp:120-191): connect,
 /// send `auth <token>` + the command + `quit`, drain the console output,
-/// then skip the first two `OK\r\n` markers (the connection banner and the
-/// auth acknowledgement) and print the rest.
+/// then skip the first two `OK\r\n` markers and print the rest.
 pub fn adb_send_emulator_command(
     args: &[String],
     serial: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::{Read, Write};
-
     let port = adb_get_emulator_console_port(serial).map_err(|e| match e {
         EmulatorPortError::None => {
             if serial.is_some() {
@@ -422,49 +475,10 @@ pub fn adb_send_emulator_command(
     let mut stream = connect_to_console(port).map_err(|e| {
         format!("error: could not connect to TCP port {port}: {e}")
     })?;
-
-    // auth command (empty when no token is configured), then the user
-    // command joined with spaces, then "quit".
-    let mut commands = adb_construct_auth_command();
-    for (i, arg) in args.iter().enumerate() {
-        commands.push_str(arg);
-        commands.push(if i == args.len() - 1 { '\n' } else { ' ' });
-    }
-    commands.push_str("quit\n");
-
-    stream.write_all(commands.as_bytes()).map_err(|e| {
-        format!("error: cannot write to emulator: {e}")
-    })?;
-
-    // Drain the console output until orderly shutdown (AOSP reads until
-    // zero bytes so the emulator sees a graceful close, not RST).
-    let mut emulator_output = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => emulator_output.extend_from_slice(&buf[..n]),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::UnexpectedEof
-                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
-            {
-                break;
-            }
-            Err(e) => return Err(format!("error: reading emulator output: {e}").into()),
-        }
-    }
-
-    // Skip the first two "OK\r\n" markers (banner + auth ack), print the rest.
-    let output = String::from_utf8_lossy(&emulator_output).to_string();
-    const DELIMS: &str = "OK\r\n";
-    let mut found = 0usize;
-    for _ in 0..2 {
-        match output[found..].find(DELIMS) {
-            Some(pos) => found += pos + DELIMS.len(),
-            None => break,
-        }
-    }
-    print!("{}", &output[found..]);
+    let commands = console_command_bytes(&adb_construct_auth_command(), args);
+    let raw_output = exchange_console(&mut stream, &commands)
+        .map_err(|e| format!("error: emulator console I/O failed: {e}"))?;
+    print!("{}", strip_console_greeting(&raw_output));
     Ok(())
 }
 
@@ -544,5 +558,96 @@ mod tests {
             ConsoleCommand::Unknown(_) => {}
             _ => panic!("expected Unknown"),
         }
+    }
+
+    #[test]
+    fn test_console_auth_command_missing_and_blank_token() {
+        assert_eq!(console_auth_command(None), "");
+        assert_eq!(console_auth_command(Some("  \n\t  ")), "");
+        assert_eq!(console_auth_command(Some("  secret-token\n")), "auth secret-token\n");
+    }
+
+    #[test]
+    fn test_auth_token_file_missing_blank_and_nonempty() {
+        let home = std::env::temp_dir().join(format!("adb-console-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let token_path = home.join(".emulator_console_auth_token");
+
+        assert_eq!(auth_command_from_path(&token_path), "");
+        std::fs::write(&token_path, "  \n\t ").unwrap();
+        assert_eq!(auth_command_from_path(&token_path), "");
+        std::fs::write(&token_path, "  fake-token \n").unwrap();
+        assert_eq!(auth_command_from_path(&token_path), "auth fake-token\n");
+
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn test_emulator_serial_and_unique_device_selection() {
+        assert_eq!(parse_emulator_serial("emulator-5554"), Some(5554));
+        assert_eq!(parse_emulator_serial("emulator-5554-extra"), Some(5554));
+        assert_eq!(parse_emulator_serial("127.0.0.1:5555"), None);
+        assert_eq!(find_unique_emulator_port("device-1\tdevice\nemulator-5554\tdevice\n"), Ok(5554));
+        assert_eq!(find_unique_emulator_port("device-1\tdevice\n"), Err(EmulatorPortError::None));
+        assert_eq!(
+            find_unique_emulator_port("emulator-5554\tdevice\nemulator-5556\tdevice\n"),
+            Err(EmulatorPortError::MoreThanOne)
+        );
+    }
+
+    #[test]
+    fn test_console_command_bytes_aosp_order_and_newlines() {
+        let args = vec!["avd".to_owned(), "status".to_owned()];
+        assert_eq!(
+            console_command_bytes("auth token\n", &args),
+            b"auth token\navd status\nquit\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_console_greeting_skips_exactly_two_ok_markers() {
+        let output = b"Android Console: auth\r\nOK\r\nAndroid Console: help\r\nOK\r\nOK\r\nresult\r\n";
+        assert_eq!(strip_console_greeting(output), "OK\r\nresult\r\n");
+        assert_eq!(strip_console_greeting(b"banner without marker"), "banner without marker");
+    }
+
+    #[test]
+    fn test_fake_console_server_auth_command_drain_and_response() {
+        use std::io::{BufRead, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fake = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut received = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                let n = reader.read_until(b'\n', &mut line).unwrap();
+                if n == 0 {
+                    break;
+                }
+                let quit = line == b"quit\n";
+                received.extend_from_slice(&line);
+                if quit {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"Android Console: auth\r\nOK\r\nAndroid Console: help\r\nOK\r\nOK\r\nresult\r\n")
+                .unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            received
+        });
+
+        let mut stream = connect_to_console(port).unwrap();
+        let args = vec!["avd".to_owned(), "status".to_owned()];
+        let commands = console_command_bytes("auth fake-token\n", &args);
+        let raw = exchange_console(&mut stream, &commands).unwrap();
+        assert_eq!(strip_console_greeting(&raw), "OK\r\nresult\r\n");
+        assert_eq!(fake.join().unwrap(), b"auth fake-token\navd status\nquit\n");
     }
 }
