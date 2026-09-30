@@ -10,7 +10,7 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use adb_protocol::{
     AdbMessageHeader, Transport,
@@ -111,6 +111,13 @@ pub fn select_install_mode(
 struct StagedApk {
     remote_path: String,
     file_name: String,
+    size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MultiPackageApk {
+    local_path: PathBuf,
+    split_name: String,
     size: u64,
 }
 
@@ -239,25 +246,20 @@ fn run_exec_command(
     read_exec_output(transport, local_id, remote_id, Vec::new())
 }
 
-/// Stream a single APK to `cmd package install` using the size-delimited exec service.
-/// The APK bytes are raw A_WRTE payloads; `-S` tells package manager when input is complete.
-pub fn install_apk_streamed(
+fn stream_file_to_exec(
     transport: &mut dyn Transport,
-    local_apk: &Path,
-    options: &InstallOptions,
+    command: &str,
+    local_file: &Path,
+    expected_file_size: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let extension = local_apk.extension().and_then(|value| value.to_str()).unwrap_or_default();
-    if !extension.eq_ignore_ascii_case("apk") {
-        return Err("streamed install currently supports .apk files only".into());
+    let file_size = fs::metadata(local_file)?.len();
+    if file_size != expected_file_size {
+        return Err(format!(
+            "Input file changed before streaming: expected {expected_file_size} bytes, found {file_size}"
+        )
+        .into());
     }
-    let file_size = fs::metadata(local_apk)?.len();
-    let mut file = fs::File::open(local_apk)?;
-    let flags = options.to_pm_flags().join(" ");
-    let command = if flags.is_empty() {
-        format!("cmd package install -S {file_size}")
-    } else {
-        format!("cmd package install {flags} -S {file_size}")
-    };
+    let mut file = fs::File::open(local_file)?;
     let destination = format!("exec:{command}");
     let (local_id, remote_id) = open_service(transport, &destination, 1)?;
 
@@ -273,10 +275,30 @@ pub fn install_apk_streamed(
         bytes_sent += length as u64;
     }
     if bytes_sent != file_size {
-        return Err(format!("APK changed while streaming: expected {file_size} bytes, sent {bytes_sent}").into());
+        return Err(format!("Input file changed while streaming: expected {file_size} bytes, sent {bytes_sent}").into());
     }
+    read_exec_output(transport, local_id, remote_id, pending_output)
+}
 
-    let output = read_exec_output(transport, local_id, remote_id, pending_output)?;
+/// Stream a single APK to `cmd package install` using the size-delimited exec service.
+/// The APK bytes are raw A_WRTE payloads; `-S` tells package manager when input is complete.
+pub fn install_apk_streamed(
+    transport: &mut dyn Transport,
+    local_apk: &Path,
+    options: &InstallOptions,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let extension = local_apk.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    if !extension.eq_ignore_ascii_case("apk") {
+        return Err("streamed install currently supports .apk files only".into());
+    }
+    let file_size = fs::metadata(local_apk)?.len();
+    let flags = options.to_pm_flags().join(" ");
+    let command = if flags.is_empty() {
+        format!("cmd package install -S {file_size}")
+    } else {
+        format!("cmd package install {flags} -S {file_size}")
+    };
+    let output = stream_file_to_exec(transport, &command, local_apk, file_size)?;
     if output.lines().any(|line| line.starts_with("Success")) {
         Ok(output)
     } else {
@@ -295,57 +317,57 @@ pub fn push_apk(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let file_name = local_apk
         .file_name()
-        .and_then(|n| n.to_str())
+        .and_then(|name| name.to_str())
         .ok_or("Invalid APK filename")?;
     let remote_path = format!("{remote_staging_dir}/{file_name}");
+    push_apk_to_path(transport, local_apk, &remote_path, printer)?;
+    Ok(remote_path)
+}
 
+fn push_apk_to_path(
+    transport: &mut dyn Transport,
+    local_apk: &Path,
+    remote_path: &str,
+    printer: &mut LinePrinter,
+) -> Result<(), Box<dyn std::error::Error>> {
     let file_size = fs::metadata(local_apk)?.len();
     let mut file = fs::File::open(local_apk)?;
-
     let (local_id, remote_id) = open_service(transport, "sync:", 1)?;
 
-    // Build SEND request: remote_path,mode
     let mut send_buf = Vec::new();
-    // mode 0644 (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
-    build_sync_send_req(&remote_path, 0x81a4, &mut send_buf)?;
+    build_sync_send_req(remote_path, 0x81a4, &mut send_buf)?;
     send_wrte(transport, local_id, remote_id, &send_buf)?;
-
-    // Read the sync OKAY after SEND request
     recv_sync_response(transport, local_id, remote_id)?;
 
-    // Stream file data in chunks
     let mut chunk_buf = vec![0u8; SYNC_DATA_MAX];
-    let mut bytes_sent: u64 = 0;
-
+    let mut bytes_sent = 0u64;
     printer.set_max(file_size);
-
     loop {
-        let n = file.read(&mut chunk_buf)?;
-        if n == 0 {
+        let length = file.read(&mut chunk_buf)?;
+        if length == 0 {
             break;
         }
         let mut data_buf = Vec::new();
-        build_sync_data_chunk(&chunk_buf[..n], &mut data_buf)?;
+        build_sync_data_chunk(&chunk_buf[..length], &mut data_buf)?;
         send_wrte(transport, local_id, remote_id, &data_buf)?;
-        bytes_sent += n as u64;
+        bytes_sent += length as u64;
         printer.update(bytes_sent);
     }
+    if bytes_sent != file_size {
+        return Err(format!("APK changed while pushing: expected {file_size} bytes, sent {bytes_sent}").into());
+    }
 
-    // Send DONE
     let mut done_buf = Vec::new();
     build_sync_done(0, &mut done_buf)?;
     send_wrte(transport, local_id, remote_id, &done_buf)?;
-
-    // Read final sync response
     recv_sync_response(transport, local_id, remote_id)?;
 
-    // Close the sync stream before opening the next one.
     let close = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
     transport.send_message(&close, &[])?;
     loop {
         let (header, payload) = transport.recv_message()?;
         match header.command {
-            // We initiated this close, so the peer CLSE completes the handshake; do not echo it.
+            // We initiated this close; the peer CLSE completes the handshake.
             A_CLSE => break,
             A_WRTE => {
                 let ack = AdbMessageHeader::new(A_OKAY, local_id, header.arg0, &[]);
@@ -358,11 +380,9 @@ pub fn push_apk(
             other => return Err(format!("Unexpected sync close command: {other:#x}").into()),
         }
     }
-
     printer.finish();
-    Ok(remote_path)
+    Ok(())
 }
-
 /// Install an APK after pushing it to the device.
 pub fn install_apk(
     transport: &mut dyn Transport,
@@ -497,6 +517,144 @@ fn install_staged_multiple(
     result
 }
 
+fn split_package_argument(argument: &str) -> Vec<&str> {
+    #[cfg(windows)]
+    {
+        argument.split(';').collect()
+    }
+    #[cfg(not(windows))]
+    {
+        argument.split(':').collect()
+    }
+}
+
+/// Atomically install one APK (or a colon-separated split set) per package argument.
+pub fn install_multi_package(
+    transport: &mut dyn Transport,
+    package_arguments: &[String],
+    device_banner: &str,
+    options: &InstallOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if package_arguments.is_empty() {
+        return Err("No packages provided".into());
+    }
+    select_install_mode(device_banner, InstallModeRequest::Streaming)?;
+
+    let mut packages: Vec<Vec<MultiPackageApk>> = Vec::with_capacity(package_arguments.len());
+    for (package_index, argument) in package_arguments.iter().enumerate() {
+        let splits = split_package_argument(argument);
+        if splits.is_empty() || splits.iter().any(|split| split.is_empty()) {
+            return Err(format!("Invalid empty split path in package argument: {argument}").into());
+        }
+        let mut basenames = std::collections::HashSet::with_capacity(splits.len());
+        let mut package = Vec::with_capacity(splits.len());
+        for split in splits {
+            let local_path = Path::new(split);
+            if !local_path.is_file() {
+                return Err(format!("APK not found or not a regular file: {split}").into());
+            }
+            let file_name = local_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("Invalid APK filename")?;
+            let extension = local_path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+            if extension.eq_ignore_ascii_case("apex") {
+                return Err("APEX multi-package install requires unsupported staged/Apex flags".into());
+            }
+            if !extension.eq_ignore_ascii_case("apk") {
+                return Err(format!("Expected an .apk input, got {split}").into());
+            }
+            if !basenames.insert(file_name.to_string()) {
+                return Err(format!("Duplicate split basename in package {argument}: {file_name}").into());
+            }
+            let size = fs::metadata(local_path)?.len();
+            package.push(MultiPackageApk {
+                local_path: local_path.to_path_buf(),
+                split_name: format!("{}_{}", package_index + 1, file_name),
+                size,
+            });
+        }
+        packages.push(package);
+    }
+
+    install_multi_package_sessions(transport, &packages, options)
+}
+
+fn install_multi_package_sessions(
+    transport: &mut dyn Transport,
+    packages: &[Vec<MultiPackageApk>],
+    options: &InstallOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let flags = options.to_pm_flags().join(" ");
+    let parent_command = if flags.is_empty() {
+        "cmd package install-create --multi-package".to_string()
+    } else {
+        format!("cmd package install-create --multi-package {flags}")
+    };
+    let parent_output = run_exec_command(transport, &parent_command)?;
+    let parent_id = parse_install_session_id(&parent_output).ok_or_else(|| {
+        format!("Failed to create multi-package parent session: {}", parent_output.trim())
+    })?;
+    let mut child_ids = Vec::with_capacity(packages.len());
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        for package in packages {
+            let child_command = if flags.is_empty() {
+                "cmd package install-create".to_string()
+            } else {
+                format!("cmd package install-create {flags}")
+            };
+            let child_output = run_exec_command(transport, &child_command)?;
+            let child_id = parse_install_session_id(&child_output)
+                .ok_or_else(|| format!("Failed to create child session: {}", child_output.trim()))?;
+            child_ids.push(child_id.clone());
+
+            for apk in package {
+                let write_command = format!(
+                    "cmd package install-write -S {} {} {} -",
+                    apk.size,
+                    child_id,
+                    shell_quote(&apk.split_name),
+                );
+                let output = stream_file_to_exec(transport, &write_command, &apk.local_path, apk.size)?;
+                if !output.lines().any(|line| line.starts_with("Success")) {
+                    return Err(format!(
+                        "install-write failed for child session {child_id}, split {}: {}",
+                        apk.split_name,
+                        output.trim()
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let add_sessions = format!(
+            "cmd package install-add-session {} {}",
+            parent_id,
+            child_ids.join(" ")
+        );
+        let add_output = run_exec_command(transport, &add_sessions)?;
+        if !add_output.lines().any(|line| line.starts_with("Success")) {
+            return Err(format!("install-add-session failed: {}", add_output.trim()).into());
+        }
+
+        let commit = format!("cmd package install-commit {parent_id}");
+        let commit_output = run_exec_command(transport, &commit)?;
+        if !commit_output.lines().any(|line| line.starts_with("Success")) {
+            return Err(format!("parent install-commit failed: {}", commit_output.trim()).into());
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = run_exec_command(transport, &format!("cmd package install-abandon {parent_id}"));
+        for child_id in &child_ids {
+            let _ = run_exec_command(transport, &format!("cmd package install-abandon {child_id}"));
+        }
+    }
+    result
+}
+
 /// Uninstall a package from the device via `pm uninstall`.
 pub fn uninstall_package(
     transport: &mut dyn Transport,
@@ -588,6 +746,10 @@ mod tests {
         incoming: VecDeque<(AdbMessageHeader, Vec<u8>)>,
         opened_services: Vec<String>,
         fail_install_write: bool,
+        fail_install_add: bool,
+        next_session_id: u32,
+        active_stream: Option<(String, usize, Vec<u8>)>,
+        streamed_splits: Vec<(String, Vec<u8>)>,
         close_pending: bool,
         host_close_response_pending: bool,
     }
@@ -598,6 +760,10 @@ mod tests {
                 incoming: VecDeque::new(),
                 opened_services: Vec::new(),
                 fail_install_write,
+                fail_install_add: false,
+                next_session_id: 42,
+                active_stream: None,
+                streamed_splits: Vec::new(),
                 close_pending: false,
                 host_close_response_pending: false,
             }
@@ -616,13 +782,17 @@ mod tests {
             self.enqueue(A_WRTE, remote_id, local_id, &payload);
         }
 
-        fn shell_output(&self, command: &str) -> &'static [u8] {
-            if command.contains("pm install-create") {
-                b"Success: created install session [42]\n"
-            } else if command.contains("pm install-write") && self.fail_install_write {
-                b"Failure: injected write error\n"
+        fn shell_output(&mut self, command: &str) -> Vec<u8> {
+            if command.contains("install-create") {
+                let id = self.next_session_id;
+                self.next_session_id += 1;
+                format!("Success: created install session [{id}]\n").into_bytes()
+            } else if command.contains("install-write") && self.fail_install_write {
+                b"Failure: injected write error\n".to_vec()
+            } else if command.contains("install-add-session") && self.fail_install_add {
+                b"Failure: injected link error\n".to_vec()
             } else {
-                b"Success\n"
+                b"Success\n".to_vec()
             }
         }
     }
@@ -659,10 +829,17 @@ mod tests {
                         .strip_prefix("shell,v2,raw:")
                         .or_else(|| destination.strip_prefix("exec:"));
                     if let Some(command) = command {
-                        let output = self.shell_output(command);
-                        self.enqueue(A_WRTE, REMOTE_ID, header.arg0, output);
-                        self.close_pending = true;
-                        self.enqueue(A_CLSE, REMOTE_ID, header.arg0, &[]);
+                        if command.starts_with("cmd package install-write ") {
+                            let words: Vec<&str> = command.split_whitespace().collect();
+                            let size_index = words.iter().position(|word| *word == "-S").unwrap() + 1;
+                            let expected_size = words[size_index].parse::<usize>().unwrap();
+                            self.active_stream = Some((command.to_string(), expected_size, Vec::new()));
+                        } else {
+                            let output = self.shell_output(command);
+                            self.enqueue(A_WRTE, REMOTE_ID, header.arg0, &output);
+                            self.close_pending = true;
+                            self.enqueue(A_CLSE, REMOTE_ID, header.arg0, &[]);
+                        }
                     }
                 }
                 A_WRTE => {
@@ -672,9 +849,28 @@ mod tests {
                             header.arg1
                         )));
                     }
+                    let stream_complete = if let Some((_, expected_size, streamed)) = self.active_stream.as_mut() {
+                        streamed.extend_from_slice(payload);
+                        Some(streamed.len() == *expected_size)
+                    } else {
+                        None
+                    };
                     self.enqueue(A_OKAY, REMOTE_ID, header.arg0, &[]);
-                    if payload.starts_with(b"SEND") || payload.starts_with(b"DONE") {
-                        self.enqueue_sync_okay(REMOTE_ID, header.arg0);
+                    match stream_complete {
+                        Some(true) => {
+                            let (command, _, bytes) = self.active_stream.take().unwrap();
+                            self.streamed_splits.push((command.clone(), bytes));
+                            let output = self.shell_output(&command);
+                            self.enqueue(A_WRTE, REMOTE_ID, header.arg0, &output);
+                            self.close_pending = true;
+                            self.enqueue(A_CLSE, REMOTE_ID, header.arg0, &[]);
+                        }
+                        Some(false) => {}
+                        None => {
+                            if payload.starts_with(b"SEND") || payload.starts_with(b"DONE") {
+                                self.enqueue_sync_okay(REMOTE_ID, header.arg0);
+                            }
+                        }
                     }
                 }
                 A_CLSE => {
@@ -729,6 +925,14 @@ mod tests {
         peer.opened_services
             .iter()
             .filter_map(|service| service.strip_prefix("shell,v2,raw:"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn exec_commands(peer: &FakeTransport) -> Vec<String> {
+        peer.opened_services
+            .iter()
+            .filter_map(|service| service.strip_prefix("exec:"))
             .map(str::to_string)
             .collect()
     }
@@ -991,6 +1195,123 @@ mod tests {
         assert!(peer.opened_services.iter().any(|service| {
             service == "exec:rm '/data/local/tmp/base.apk' </dev/null"
         }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multi_package_parent_child_writes_link_then_commit_parent() {
+        let (root, paths) = fixture_apks();
+        let extra = root.join("feature.apk");
+        fs::write(&extra, b"feature").unwrap();
+        let package_args = vec![
+            format!("{}:{}", paths[0].display(), extra.display()),
+            paths[1].display().to_string(),
+        ];
+        let mut peer = FakeTransport::new(false);
+        let banner = "device::ro.product.name=test;features=shell_v2,cmd";
+
+        install_multi_package(
+            &mut peer,
+            &package_args,
+            banner,
+            &InstallOptions::default(),
+        )
+        .unwrap();
+
+        let commands = exec_commands(&peer);
+        let transaction: Vec<&str> = commands
+            .iter()
+            .map(String::as_str)
+            .filter(|command| command.starts_with("cmd package install-"))
+            .collect();
+        assert_eq!(
+            transaction,
+            [
+                "cmd package install-create --multi-package",
+                "cmd package install-create",
+                "cmd package install-write -S 4 43 '1_base.apk' -",
+                "cmd package install-write -S 7 43 '1_feature.apk' -",
+                "cmd package install-create",
+                "cmd package install-write -S 6 44 '2_split'\\''cfg.apk' -",
+                "cmd package install-add-session 42 43 44",
+                "cmd package install-commit 42",
+            ]
+        );
+        assert_eq!(
+            peer.streamed_splits.iter().map(|(_, bytes)| bytes.as_slice()).collect::<Vec<_>>(),
+            [b"base".as_slice(), b"feature".as_slice(), b"split!".as_slice()]
+        );
+        assert!(!peer.opened_services.iter().any(|service| service == "sync:"));
+        assert!(!commands.iter().any(|command| command == "cmd package install-abandon 42"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multi_package_write_failure_abandons_parent_and_created_child_without_fallback() {
+        let (root, paths) = fixture_apks();
+        let package_args: Vec<String> = paths.iter().map(|path| path.display().to_string()).collect();
+        let mut peer = FakeTransport::new(true);
+        let banner = "device::features=cmd,shell_v2";
+
+        let result = install_multi_package(
+            &mut peer,
+            &package_args,
+            banner,
+            &InstallOptions::default(),
+        );
+
+        assert!(result.is_err());
+        let commands = exec_commands(&peer);
+        assert!(commands.iter().any(|command| command == "cmd package install-abandon 42"));
+        assert!(commands.iter().any(|command| command == "cmd package install-abandon 43"));
+        assert!(!commands.iter().any(|command| command.contains("install-add-session")));
+        assert!(!commands.iter().any(|command| command.contains("install-commit")));
+        assert!(!commands.iter().any(|command| command.starts_with("pm install -r")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multi_package_add_session_failure_abandons_parent_and_every_child() {
+        let (root, paths) = fixture_apks();
+        let package_args: Vec<String> = paths.iter().map(|path| path.display().to_string()).collect();
+        let mut peer = FakeTransport::new(false);
+        peer.fail_install_add = true;
+        let banner = "device::features=cmd,shell_v2";
+
+        let result = install_multi_package(
+            &mut peer,
+            &package_args,
+            banner,
+            &InstallOptions::default(),
+        );
+
+        assert!(result.is_err());
+        let commands = exec_commands(&peer);
+        assert!(commands.iter().any(|command| command == "cmd package install-add-session 42 43 44"));
+        assert!(commands.iter().any(|command| command == "cmd package install-abandon 42"));
+        assert!(commands.iter().any(|command| command == "cmd package install-abandon 43"));
+        assert!(commands.iter().any(|command| command == "cmd package install-abandon 44"));
+        assert!(!commands.iter().any(|command| command.contains("install-commit")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multi_package_requires_cmd_before_opening_any_service() {
+        let (root, paths) = fixture_apks();
+        let package_args = vec![paths[0].display().to_string()];
+        let mut peer = FakeTransport::new(false);
+
+        let error = install_multi_package(
+            &mut peer,
+            &package_args,
+            "device::features=shell_v2",
+            &InstallOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("does not support cmd"));
+        assert!(peer.opened_services.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

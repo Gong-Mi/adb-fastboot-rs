@@ -1105,134 +1105,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::InstallMultiPackage { apks } => {
             if apks.is_empty() {
-                eprintln!("Error: no APK files specified");
-                std::process::exit(1);
+                return Err("No APK files specified".into());
             }
 
-            // Validate all APKs exist
-            let apk_paths: Vec<&Path> = apks.iter().map(|a| Path::new(a)).collect();
-            let mut missing = Vec::new();
-            for (i, p) in apk_paths.iter().enumerate() {
-                if !p.exists() {
-                    missing.push(apks[i].clone());
-                }
-            }
-            if !missing.is_empty() {
-                eprintln!("Error: APK(s) not found: {}", missing.join(", "));
-                std::process::exit(1);
-            }
-
-            // Connect to adbd
             let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
-                .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
-            let (_info, mut transport) =
-                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
-
-            // Push each APK via sync protocol
-            let staging = "/data/local/tmp";
-            let mut remote_paths = Vec::new();
-            for apk_path in &apk_paths {
-                let apk_data = std::fs::read(apk_path)
-                    .map_err(|e| format!("Cannot read {}: {e}", apk_path.display()))?;
-                let file_name = apk_path.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("package.apk");
-                let remote_apk = format!("{staging}/{file_name}");
-
-                let (local_id, remote_id) = protocol::open_service(&mut transport, "sync:", 1)?;
-
-                let mut send_buf = Vec::new();
-                build_sync_send_req(&remote_apk, 0o644, &mut send_buf)
-                    .map_err(|e| format!("Build SEND req failed: {e}"))?;
-                println!("[adb-rs] Pushing {file_name} ({} bytes) ...", apk_data.len());
-
-                protocol::send_wrte(&mut transport, local_id, remote_id, &send_buf)?;
-                protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
-
-                const MAX_CHUNK: usize = 64 * 1024;
-                for chunk in apk_data.chunks(MAX_CHUNK) {
-                    let mut data_buf = Vec::new();
-                    build_sync_data_chunk(chunk, &mut data_buf)
-                        .map_err(|e| format!("Build DATA chunk failed: {e}"))?;
-                    protocol::send_wrte(&mut transport, local_id, remote_id, &data_buf)?;
-                }
-
-                let mut done_buf = Vec::new();
-                build_sync_done(0xFFFF_FFFF, &mut done_buf)
-                    .map_err(|e| format!("Build DONE failed: {e}"))?;
-                protocol::send_wrte(&mut transport, local_id, remote_id, &done_buf)?;
-                protocol::recv_sync_response(&mut transport, local_id, remote_id)?;
-
-                let clse_hdr = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
-                transport.send_message(&clse_hdr, &[])?;
-                let _ = transport.recv_message();
-
-                remote_paths.push(remote_apk);
-            }
-
-            // Use pm install-create / install-write / install-commit
-            println!("[adb-rs] Running pm install-create ...");
-            let create_result = shell::run_shell(&mut transport, "pm install-create", true)?;
-            let create_output = create_result.unwrap_or_default();
-            let create_str = String::from_utf8_lossy(&create_output).trim().to_string();
-            println!("[adb-rs] install-create output: {create_str}");
-
-            // Extract session ID from output (format: "Success: created install session [1234567890]")
-            let session_id = create_str
-                .split('[')
-                .nth(1)
-                .and_then(|s| s.split(']').next())
-                .unwrap_or("")
-                .to_string();
-
-            if session_id.is_empty() {
-                eprintln!("[adb-rs] Failed to create install session. Output: {create_str}");
-                // Still try to install individually
-                for rp in &remote_paths {
-                    let cmd = format!("pm install -r \"{rp}\"");
-                    let _ = shell::run_shell(&mut transport, &cmd, false);
-                }
-            } else {
-                // Write each APK to the session
-                for rp in &remote_paths {
-                    let name = Path::new(rp)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("split.apk");
-                    let size = match std::fs::metadata(rp) {
-                        Ok(m) => m.len(),
-                        Err(_) => 0,
-                    };
-                    let _write_cmd = format!("pm install-write -S {size} {session_id} \"{name}\" < \"{rp}\"");
-                    println!("[adb-rs] Writing {name} ({} bytes) to session {session_id} ...", size);
-                    // Use shell exec (cat file | pm install-write ...)
-                    let write_cmd_shell = format!("cat \"{rp}\" | pm install-write -S {size} {session_id} \"{name}\"");
-                    let write_result = shell::run_shell(&mut transport, &write_cmd_shell, true)?;
-                    let write_output = write_result.unwrap_or_default();
-                    let write_str = String::from_utf8_lossy(&write_output).trim().to_string();
-                    println!("[adb-rs] install-write output: {write_str}");
-                }
-
-                // Commit the session
-                let commit_cmd = format!("pm install-commit {session_id}");
-                println!("[adb-rs] Committing session {session_id} ...");
-                let commit_result = shell::run_shell(&mut transport, &commit_cmd, true)?;
-                let commit_output = commit_result.unwrap_or_default();
-                let commit_str = String::from_utf8_lossy(&commit_output).trim().to_string();
-
-                if commit_str.contains("Success") {
-                    println!("[adb-rs] Install-multi-package succeeded: {commit_str}");
-                } else if commit_str.is_empty() {
-                    println!("[adb-rs] Install-multi-package completed (no output)");
-                } else {
-                    eprintln!("[adb-rs] Install-multi-package output: {commit_str}");
-                }
-            }
-
-            // Clean up temp APKs
-            for rp in &remote_paths {
-                let _ = shell::run_shell(&mut transport, &format!("rm -f \"{rp}\""), false);
-            }
+                .map_err(|error| format!("Cannot connect to adbd at {addr}: {error}"))?;
+            let cnxn_payload = host_cnxn_payload();
+            let (device_info, mut transport) = connect_and_handshake_with_tls_upgrade(
+                transport,
+                &cnxn_payload,
+                default_auth(),
+            )?;
+            client::adb_install::install_multi_package(
+                &mut transport,
+                &apks,
+                &device_info.banner,
+                &client::adb_install::InstallOptions::default(),
+            )?;
+            println!("[adb-rs] Atomic multi-package install succeeded");
         }
 
         Commands::Uninstall { package } => {
