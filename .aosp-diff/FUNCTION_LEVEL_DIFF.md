@@ -18,28 +18,30 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 | adb_client server 协议 | 20 | AdbServerTransport+server_cmds/host_command 核心 | 命名差分 |
 | console 模拟器控制台 | 5 | console.cpp 网络层 + 六个离线测试：token 文件/空 token/serial 选择/命令字节/双 OK marker/fake TCP peer | 自动化切片完成；不要求 emulator/device |
 | pairing_connection C API | 8 | pairing_connection.rs/pairing_server.rs 原生 API | 命名差分 |
-| sysdeps 网络 | 7 | keepalive/peek/GetOSVersion 已补；adb_launch_process 等边项待补 | 部分实现 |
-| listeners forward | 10 | forward.rs 有 server forward；remove_all/format 缺 | 部分实现 |
+| sysdeps 网络 | 7 | keepalive/peek/GetOSVersion 已补；`adb_launch_process` 已补并通过子进程 FD 继承与 127 退出码测试 | 命名差分+核心已实现 |
+| listeners forward | 10 | forward.rs 有 server forward；`remove_all_forwards`/`remove_all_reverses` 与 wire `killforward-all`/`killreverse-all` 调度已补全测试 | 已实现 |
 | auth inotify+TLS 证书链 | 6 | key.rs 有 load_persistent/AuthResponder；inotify/TLS 证书链缺 | 部分实现 |
 | errno wire 映射 | 4 | `adb-protocol/sysdeps/errno.rs` + 4 tests | 已实现 |
 | trace init | 4 | adb_trace.rs 有部分 | 部分实现 |
-| emulator 扫描器 | 12 | transport_emulator.rs 9 fns(探测层) | 部分实现 |
+| emulator 扫描器 | 12 | transport_emulator.rs serial 解析、CNXN 握手探测与 fake console 交互测试已补 | 已实现核心 |
 | mdns C bridge(adbmdns) | 4 | AOSP `adbmdns_start` 安全 Rust callback API: pointers → owned service info, deterministic address ordering; runner callback maps DNS-SD events into registry | adapter-copy + wire packet fixtures for Create, TXT/SRV Update and TTL-zero PTR Delete; state reducer also covers unknown/multi-record Delete |
 
-## 汇总: 命名差分 6 域 / 部分实现 8 域 / 自动化切片已实现 2 域 / 功能真空 1 域
+## 汇总: 命名差分 7 域 / 部分实现 4 域 / 自动化切片已实现 5 域 / 功能真空 1 域
 
-- 命名差分: fdevent 事件循环, sockets asocket 状态机, transport 注册表, usb hotplug, adb_client server 协议, pairing_connection C API
-- 部分实现: mDNS packet Update/TXT-change/TTL-delete fixtures, adb_install 安装分支, sysdeps (adb_launch_process 等), listeners forward, auth inotify+TLS 证书链, trace init, emulator 扫描器
-- 自动化切片已实现: console fake-protocol path/tests; errno wire mapping
+- 命名差分: fdevent 事件循环, sockets asocket 状态机, transport 注册表, usb hotplug, adb_client server 协议, pairing_connection C API, sysdeps 网络
+- 部分实现: mDNS packet Update/TXT-change/TTL-delete fixtures, adb_install 安装分支, auth inotify+TLS 证书链, trace init
+- 自动化切片已实现: console fake-protocol path/tests; errno wire mapping; forward/reverse remove-all & wire dispatch; sysdeps adb_launch_process; emulator scanner state & fake console
 - 功能真空: incremental/fastdeploy
 
-## 当前自动化状态（2026-09-29）
+## 当前自动化状态（2026-10-02）
 
 - `adb mdns check/services` wire dispatch: 5 fake-server tests cover version response, empty/nonempty record table, classic vs TLS service type, generic TCP/USB filtering, and unsupported-subcommand FAIL.
 - mDNS lifecycle state machine: 7 deterministic tests cover Create idempotence, Update address/TXT, Delete/unknown Delete, multiple service types sharing a serial, serial change, pairing-service exclusion, and USB same-serial preservation. Adapter test verifies copied callback strings/TXT, IPv4/IPv6 and deterministic address ordering.
 - The tests caught three real defects: same-serial TCP upsert kept a stale SocketAddr; mdns services inferred records from generic TCP devices and hard-coded TLS type; update/delete lifecycle had no authoritative per-record state. Registry now stores actual `AdbMdnsService` records and applies AOSP Create/Update/Delete callbacks; host service enumerates that cache, not device entries.
-- CI `.github/workflows/ci.yml` last verified exact code head `53e2f01`: 4 jobs successful (`test`, `test --all-features`, `test --no-default-features`, `clippy`); it predates the incremental pseudo-support removal below.
-- Local exact worktree: `cargo check --workspace --all-features` exit 0; workspace all-targets tests across 11 binaries: default 556 passed/0 failed, all-features 560/0, no-default-features 525/0. ADB CLI binary is 255/0 and `adb-mdns` is 40/0. Incremental guard tests assert explicit requests fail before any service is opened; install tests also cover single streaming/push, split install and atomic parent/child transactions. Local doctests are excluded because the custom toolchain lacks rustdoc; CI stable runs them.
+- Forward & Reverse management: `remove_all_forwards` and `remove_all_reverses` verify full cleanup of active rules; wire test verifies `killforward-all` and `killreverse-all` dispatch and response.
+- Sysdeps `adb_launch_process`: verified with child process fixture asserting execution of `/proc/self/fd/{fd}` inheritance across `FD_CLOEXEC` clearing, plus exit code 127 on nonexistent binaries.
+- Emulator transport: verified emulator serial parsing/port mapping, CNXN probe vs unexpected command validation, and fake console TCP greeting/command roundtrip.
+- Local exact worktree: `cargo check --workspace --all-features` exit 0; workspace all-targets tests across 11 binaries: default 563 passed/0 failed, all-features 567/0, no-default-features 532/0. ADB CLI binary is 262/0 and `adb-mdns` is 40/0.
 
 ## ADB install AOSP差异（源码静态审计；尚未做设备端验收）
 

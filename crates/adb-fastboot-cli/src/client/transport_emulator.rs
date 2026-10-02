@@ -214,3 +214,114 @@ pub fn connect_to_any_emulator(
     }
     Err("No running emulator found".into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    #[test]
+    fn test_emulator_serial_parsing_and_detection() {
+        assert!(is_emulator_serial("emulator-5554"));
+        assert!(is_emulator_serial("emulator-5584"));
+        assert!(!is_emulator_serial("127.0.0.1:5555"));
+        assert!(!is_emulator_serial("device-1234"));
+
+        assert_eq!(serial_to_port("emulator-5554").unwrap(), 5555);
+        assert_eq!(serial_to_port("emulator-5584").unwrap(), 5585);
+        assert_eq!(get_emulator_adb_port("emulator-5554").unwrap(), 5555);
+
+        assert!(serial_to_port("not-an-emulator").is_err());
+        assert!(serial_to_port("emulator-invalid").is_err());
+    }
+
+    #[test]
+    fn test_probe_emulator_valid_and_invalid_handshake() {
+        // Case 1: valid CNXN response
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+
+            let handle = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut req_hdr = [0u8; 24];
+                let _ = sock.read_exact(&mut req_hdr);
+                let mut req_body = [0u8; 6];
+                let _ = sock.read_exact(&mut req_body);
+
+                // Send back valid A_CNXN header
+                let resp = AdbMessageHeader::new(
+                    adb_protocol::constants::A_CNXN,
+                    adb_protocol::constants::ADB_VERSION,
+                    MAX_PAYLOAD_V2,
+                    b"device::\0",
+                );
+                let mut resp_buf = [0u8; 24];
+                resp.encode(&mut resp_buf);
+                sock.write_all(&resp_buf).unwrap();
+            });
+
+            let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            assert!(probe_emulator(client).is_ok());
+            handle.join().unwrap();
+        }
+
+        // Case 2: unexpected command response
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+
+            let handle = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut req_hdr = [0u8; 24];
+                let _ = sock.read_exact(&mut req_hdr);
+
+                // Send back A_AUTH instead of A_CNXN
+                let resp = AdbMessageHeader::new(
+                    adb_protocol::constants::A_AUTH,
+                    1,
+                    0,
+                    &[],
+                );
+                let mut resp_buf = [0u8; 24];
+                resp.encode(&mut resp_buf);
+                sock.write_all(&resp_buf).unwrap();
+            });
+
+            let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let err = probe_emulator(client).unwrap_err().to_string();
+            assert!(err.contains("Unexpected command"));
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_send_console_command_fake_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Send greeting
+            sock.write_all(b"Android Console: Authentication required\r\nOK\r\n").unwrap();
+            sock.flush().unwrap();
+
+            // Read command
+            let mut buf = [0u8; 128];
+            let n = sock.read(&mut buf).unwrap();
+            let cmd = String::from_utf8_lossy(&buf[..n]);
+            assert!(cmd.contains("avd name"));
+
+            // Respond
+            sock.write_all(b"test_avd_34\r\nOK\r\n").unwrap();
+            sock.flush().unwrap();
+        });
+
+        let serial = format!("emulator-{port}");
+        let response = send_console_command(&serial, "avd name").unwrap();
+        assert!(response.contains("test_avd_34"));
+        assert!(response.contains("OK"));
+        handle.join().unwrap();
+    }
+}

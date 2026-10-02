@@ -149,6 +149,60 @@ pub fn get_os_version() -> String {
     )
 }
 
+/// AOSP `disable_close_on_exec()` (sysdeps_unix.cpp:65-71).
+fn disable_close_on_exec(fd: RawFd) {
+    let old_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if old_flags >= 0 {
+        let new_flags = old_flags & !libc::FD_CLOEXEC;
+        if new_flags != old_flags {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, new_flags);
+            }
+        }
+    }
+}
+
+/// AOSP `adb_launch_process()` (sysdeps_unix.cpp:73-97): fork child,
+/// clear FD_CLOEXEC on specified fds to inherit, and execv.
+pub fn adb_launch_process(
+    executable: &str,
+    args: &[&str],
+    fds_to_inherit: &[RawFd],
+) -> std::io::Result<libc::pid_t> {
+    use std::ffi::CString;
+
+    let c_exec = CString::new(executable)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut c_args = Vec::with_capacity(args.len() + 1);
+    c_args.push(c_exec.clone());
+    for arg in args {
+        c_args.push(
+            CString::new(*arg)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
+        );
+    }
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if pid != 0 {
+        return Ok(pid);
+    }
+
+    for &fd in fds_to_inherit {
+        disable_close_on_exec(fd);
+    }
+
+    let mut raw_ptrs: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
+    raw_ptrs.push(std::ptr::null());
+
+    unsafe {
+        libc::execv(c_exec.as_ptr(), raw_ptrs.as_ptr());
+        libc::_exit(127);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +248,47 @@ mod tests {
         // Just verify it doesn't crash
         adb_close(r);
         if new_fd >= 0 { adb_close(new_fd); }
+    }
+
+    #[test]
+    fn test_adb_launch_process_nonexistent_executable_exits_127() {
+        let pid = adb_launch_process("/nonexistent_adb_test_bin_xyz", &[], &[]).unwrap();
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 127);
+    }
+
+    #[test]
+    fn test_adb_launch_process_inherits_fds_and_executes() {
+        let sh = if std::path::Path::new("/system/bin/sh").exists() {
+            "/system/bin/sh"
+        } else if std::path::Path::new("/bin/sh").exists() {
+            "/bin/sh"
+        } else {
+            "/data/data/com.termux/files/usr/bin/sh"
+        };
+
+        let (r, w) = adb_pipe().unwrap();
+        // Explicitly set FD_CLOEXEC to verify disable_close_on_exec clears it.
+        let flags = unsafe { libc::fcntl(w, libc::F_GETFD) };
+        assert!(flags >= 0);
+        unsafe { libc::fcntl(w, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+
+        let cmd = format!("echo inherited > /proc/self/fd/{w}");
+        let pid = adb_launch_process(sh, &["-c", &cmd], &[w]).unwrap();
+        adb_close(w);
+
+        let mut buf = [0u8; 16];
+        let n = adb_read(r, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"inherited\n");
+        adb_close(r);
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 }

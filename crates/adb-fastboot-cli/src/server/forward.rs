@@ -595,4 +595,80 @@ mod tests {
         assert!(reg.remove_reverse("tcp:8080"));
         assert!(reg.list_reverses().is_empty());
     }
+
+    #[test]
+    fn test_remove_all_forwards_and_reverses() {
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        {
+            let mut reg = registry.lock().unwrap();
+            let p1 = reg.add_forward(&registry, "tcp:0", "tcp:9001", false).unwrap();
+            let p2 = reg.add_forward(&registry, "tcp:0", "tcp:9002", false).unwrap();
+            let list = reg.list_forwards();
+            assert!(list.contains(&format!("tcp:{p1} tcp:9001")));
+            assert!(list.contains(&format!("tcp:{p2} tcp:9002")));
+            assert_eq!(list.lines().count(), 2);
+
+            reg.remove_all_forwards();
+            assert!(reg.list_forwards().is_empty());
+
+            reg.add_reverse("tcp:7001", "tcp:8001", false).unwrap();
+            reg.add_reverse("tcp:7002", "tcp:8002", false).unwrap();
+            let r_list = reg.list_reverses();
+            assert!(r_list.contains("tcp:7001 tcp:8001"));
+            assert!(r_list.contains("tcp:7002 tcp:8002"));
+            assert_eq!(r_list.lines().count(), 2);
+
+            reg.remove_all_reverses();
+            assert!(reg.list_reverses().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_handle_forward_and_reverse_wire_dispatch() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        {
+            let mut reg = registry.lock().unwrap();
+            let p = reg.add_forward(&registry, "tcp:0", "tcp:9099", false).unwrap();
+            reg.add_reverse("tcp:6000", "tcp:7000", false).unwrap();
+            assert!(reg.list_forwards().contains(&p));
+        }
+
+        // Test forward killforward-all
+        {
+            let mut client_side = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let (mut server_side, _) = listener.accept().unwrap();
+
+            handle_forward(&mut server_side, "killforward-all", &registry).unwrap();
+            drop(server_side);
+
+            let mut resp = Vec::new();
+            client_side.read_to_end(&mut resp).unwrap();
+            assert_eq!(&resp, b"OKAY0000");
+
+            let reg = registry.lock().unwrap();
+            assert!(reg.list_forwards().is_empty());
+        }
+
+        // Test reverse killreverse-all
+        {
+            let mut client_side = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let (mut server_side, _) = listener.accept().unwrap();
+
+            handle_reverse(&mut server_side, "killreverse-all", &registry).unwrap();
+            drop(server_side);
+
+            let mut resp = Vec::new();
+            client_side.read_to_end(&mut resp).unwrap();
+            assert_eq!(&resp, b"OKAY0000");
+
+            let reg = registry.lock().unwrap();
+            assert!(reg.list_reverses().is_empty());
+        }
+    }
 }
