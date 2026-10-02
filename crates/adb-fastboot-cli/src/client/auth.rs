@@ -1,6 +1,8 @@
 //! ADB authentication (RSA key loading/saving).
 //! Maps to AOSP `vendor/adb/client/auth.cpp`.
 
+use std::collections::HashMap;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -185,6 +187,117 @@ pub fn get_vendor_keys() -> Vec<PathBuf> {
     adb_protocol::auth::get_vendor_keys()
 }
 
+/// Inotify monitor for ADB key directories (AOSP: `g_monitored_paths`).
+#[derive(Debug, Default)]
+pub struct AdbAuthInotify {
+    pub fd: Option<RawFd>,
+    pub monitored_paths: HashMap<i32, PathBuf>,
+}
+
+impl AdbAuthInotify {
+    /// AOSP `adb_auth_inotify_init()` (client/auth.cpp:392-416):
+    /// create an inotify fd with IN_CLOEXEC | IN_NONBLOCK and watch paths for IN_CREATE | IN_MOVED_TO.
+    pub fn init<P: AsRef<Path>>(paths: &[P]) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let infd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+            if infd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let mut monitored = HashMap::new();
+            for p in paths {
+                let path = p.as_ref();
+                if let Ok(c_path) = std::ffi::CString::new(path.to_str().unwrap_or_default()) {
+                    let wd = unsafe {
+                        libc::inotify_add_watch(
+                            infd,
+                            c_path.as_ptr(),
+                            libc::IN_CREATE | libc::IN_MOVED_TO,
+                        )
+                    };
+                    if wd >= 0 {
+                        monitored.insert(wd, path.to_path_buf());
+                    }
+                }
+            }
+            Ok(Self {
+                fd: Some(infd),
+                monitored_paths: monitored,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = paths;
+            Ok(Self::default())
+        }
+    }
+
+    /// AOSP `adb_auth_inotify_update()` (client/auth.cpp:341-390):
+    /// read available inotify events and return any newly detected key file paths.
+    pub fn update(&self) -> Vec<PathBuf> {
+        let mut new_keys = Vec::new();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(fd) = self.fd {
+            let mut buf = [0u8; 4096];
+            loop {
+                let rc = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if rc <= 0 {
+                    break;
+                }
+                let mut offset = 0;
+                while offset + std::mem::size_of::<libc::inotify_event>() <= rc as usize {
+                    let event_ptr = unsafe {
+                        &*(buf.as_ptr().add(offset) as *const libc::inotify_event)
+                    };
+                    let name_len = event_ptr.len as usize;
+                    if let Some(dir) = self.monitored_paths.get(&event_ptr.wd) {
+                        if (event_ptr.mask & (libc::IN_CREATE | libc::IN_MOVED_TO)) != 0
+                            && (event_ptr.mask & libc::IN_ISDIR) == 0
+                        {
+                            if name_len > 0 {
+                                let name_bytes = &buf[offset + std::mem::size_of::<libc::inotify_event>()..offset + std::mem::size_of::<libc::inotify_event>() + name_len];
+                                let name_str = std::ffi::CStr::from_bytes_until_nul(name_bytes)
+                                    .map(|c| c.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                if !name_str.is_empty() && !name_str.ends_with(".pub") {
+                                    new_keys.push(dir.join(name_str));
+                                }
+                            }
+                        }
+                    }
+                    offset += std::mem::size_of::<libc::inotify_event>() + name_len;
+                }
+            }
+        }
+        new_keys
+    }
+}
+
+impl Drop for AdbAuthInotify {
+    fn drop(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            unsafe { libc::close(fd); }
+        }
+    }
+}
+
+/// AOSP `adb_auth_init()` (client/auth.cpp:418-440): load user key,
+/// load vendor keys, and start directory inotify monitoring.
+pub fn adb_auth_init() -> Result<(Vec<AdbAuth>, AdbAuthInotify), Box<dyn std::error::Error>> {
+    let keys = adb_protocol::auth::load_all_keys()?;
+    let mut watch_dirs = Vec::new();
+    if let Ok(dir) = adb_protocol::auth::adb_get_android_dir_path() {
+        watch_dirs.push(dir);
+    }
+    for vendor in get_vendor_keys() {
+        if vendor.is_dir() {
+            watch_dirs.push(vendor);
+        }
+    }
+    let inotify = AdbAuthInotify::init(&watch_dirs)?;
+    Ok((keys, inotify))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +342,42 @@ mod tests {
         assert!(path.is_ok());
         let p = path.unwrap();
         assert!(p.ends_with(".android/adbkey"));
+    }
+
+    #[test]
+    fn test_adb_auth_inotify_detects_new_key_file() {
+        let dir = std::env::temp_dir().join(format!("adb-inotify-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let inotify = AdbAuthInotify::init(&[&dir]).unwrap();
+        assert!(inotify.fd.is_some());
+
+        // Create a new key file
+        let key_file = dir.join("custom_key");
+        std::fs::write(&key_file, b"test-key-content").unwrap();
+
+        // Create a .pub file (should be ignored by update)
+        let pub_file = dir.join("custom_key.pub");
+        std::fs::write(&pub_file, b"test-pub-content").unwrap();
+
+        // Wait briefly for inotify event to be ready
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let detected = inotify.update();
+        assert!(detected.contains(&key_file));
+        assert!(!detected.contains(&pub_file));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_adb_auth_init_loads_keys() {
+        let res = adb_auth_init();
+        assert!(res.is_ok());
+        let (keys, inotify) = res.unwrap();
+        assert!(!keys.is_empty());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(inotify.fd.is_some());
     }
 }
