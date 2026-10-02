@@ -12,8 +12,25 @@ use crate::server::handler::handle_client;
 use crate::server::models::{TransportRegistry, ADB_SERVER_PORT, SERVER_VERSION};
 use crate::server::watcher::usb_device_watcher;
 
+pub fn parse_socket_spec(spec: &str) -> (String, u16) {
+    let s = spec.strip_prefix("tcp:").unwrap_or(spec);
+    if let Some((host, port_str)) = s.rsplit_once(':') {
+        let port = port_str.parse().unwrap_or(ADB_SERVER_PORT);
+        let host = if host.is_empty() || host == "localhost" {
+            "127.0.0.1".to_string()
+        } else {
+            host.to_string()
+        };
+        (host, port)
+    } else if let Ok(port) = s.parse::<u16>() {
+        ("127.0.0.1".to_string(), port)
+    } else {
+        ("127.0.0.1".to_string(), ADB_SERVER_PORT)
+    }
+}
+
 pub fn run_server() -> ! {
-    run_server_fork(None, ADB_SERVER_PORT);
+    run_server_fork(None, &format!("tcp:127.0.0.1:{ADB_SERVER_PORT}"));
     #[allow(unreachable_code)]
     {
         std::process::exit(0);
@@ -26,11 +43,19 @@ pub fn run_server() -> ! {
 /// After USB scan completes, the server writes "OK\n" to this fd to
 /// signal the parent that it's ready, then closes it.
 /// Only after that are client connections accepted.
-pub fn run_server_fork(ack_reply_fd: Option<i32>, port: u16) -> ! {
-    let listener = match TcpListener::bind(format!("127.0.0.1:{port}")) {
+pub fn run_server_fork(ack_reply_fd: Option<i32>, socket_spec: &str) -> ! {
+    let (host, port) = parse_socket_spec(socket_spec);
+    let bind_addr = if host.starts_with('[') && host.ends_with(']') {
+        format!("{host}:{port}")
+    } else if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let listener = match TcpListener::bind(&bind_addr) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[adb-server] Cannot bind to 127.0.0.1:{ADB_SERVER_PORT}: {e}");
+            eprintln!("[adb-server] Cannot bind to {bind_addr}: {e}");
             std::process::exit(1);
         }
     };
@@ -39,14 +64,7 @@ pub fn run_server_fork(ack_reply_fd: Option<i32>, port: u16) -> ! {
 }
 
 pub fn run_server_on_port(port: u16) {
-    let listener = match TcpListener::bind(format!("127.0.0.1:{port}")) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[adb-server] Cannot bind to 127.0.0.1:{port}: {e}");
-            std::process::exit(1);
-        }
-    };
-    run_server_with_listener(listener, None);
+    run_server_fork(None, &format!("tcp:127.0.0.1:{port}"));
 }
 
 pub fn run_server_with_listener(listener: TcpListener, ack_reply_fd: Option<i32>) {

@@ -25,12 +25,35 @@ pub const ADB_SERVER_PORT: u16 = 5037;
 
 /// Parse `tcp:host:port` or `tcp:port` from the `-L` argument. Returns port only.
 fn parse_server_addr(addr: &str) -> Option<u16> {
-    let rest = addr.strip_prefix("tcp:")?;
+    let rest = addr.strip_prefix("tcp:").unwrap_or(addr);
     if let Some((_host, port_str)) = rest.rsplit_once(':') {
         port_str.parse().ok()
     } else {
         rest.parse().ok()
     }
+}
+
+/// Resolve the ADB server port from CLI `-P`, CLI `-L`, env vars, or default 5037.
+fn resolve_server_port(port_flag: Option<u16>, listen_flag: Option<&str>) -> u16 {
+    if let Some(p) = port_flag {
+        return p;
+    }
+    if let Some(l) = listen_flag {
+        if let Some(p) = parse_server_addr(l) {
+            return p;
+        }
+    }
+    if let Ok(spec) = std::env::var("ADB_SERVER_SOCKET") {
+        if let Some(p) = parse_server_addr(&spec) {
+            return p;
+        }
+    }
+    if let Ok(port_str) = std::env::var("ANDROID_ADB_SERVER_PORT") {
+        if let Ok(p) = port_str.parse::<u16>() {
+            return p;
+        }
+    }
+    ADB_SERVER_PORT
 }
 
 /// Map `adb reconnect [device|offline]` to the AOSP host-service request.
@@ -222,6 +245,18 @@ pub enum Commands {
         /// Full spec string, e.g. "device", "usb-device", "local-recovery"
         spec: Vec<String>,
     },
+    /// Wait for device state 'device'
+    #[command(name = "wait-for-device")]
+    WaitForDevice,
+    /// Wait for device state 'recovery'
+    #[command(name = "wait-for-recovery")]
+    WaitForRecovery,
+    /// Wait for device state 'bootloader'
+    #[command(name = "wait-for-bootloader")]
+    WaitForBootloader,
+    /// Wait for device state 'disconnect'
+    #[command(name = "wait-for-disconnect")]
+    WaitForDisconnect,
     /// Uninstall a package from device
     Uninstall {
         package: String,
@@ -232,7 +267,8 @@ pub enum Commands {
     Unroot,
     /// Restart adbd listening on TCP on the specified port
     Tcpip {
-        port: u16,
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
     },
     /// Restart adbd listening on USB
     Usb,
@@ -269,6 +305,12 @@ pub enum Commands {
     GetDevpath,
     /// Start the ADB server (listens on 127.0.0.1:5037)
     Serve,
+    /// Start the ADB server daemon (AOSP compatibility)
+    #[command(name = "server")]
+    Server {
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// Start the ADB server daemon
     #[command(name = "start-server")]
     StartServer,
@@ -412,7 +454,7 @@ pub fn open_adb_transport(
     //    For now, skip server for non-devices commands to avoid
     //    CNXN-over-server incompatibility.
     //{
-    //    let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+    //    let server_addr = server_addr.to_string();
     //    if let Ok(mut t) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
     //        if t.switch_transport(serial).is_ok() {
     //            return Ok(Box::new(t));
@@ -745,12 +787,17 @@ fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let addr = resolve_target_addr(cli.serial.as_deref(), ADBD_PORT);
+    let server_port = resolve_server_port(cli.port, cli.transport.as_deref());
+    let server_addr = format!("127.0.0.1:{server_port}");
+    let host_cmd = |req: &str| -> Result<String, Box<dyn std::error::Error>> {
+        client::host_command::host_command_at(server_port, cli.serial.as_deref(), req)
+    };
 
     match &cli.command {
         Commands::Devices { long } => {
             if *long {
                 println!("List of devices attached (adb-rs pure rust transport)");
-                match host_command(cli.serial.as_deref(), "host:devices-l") {
+                match host_cmd("host:devices-l") {
                     Ok(resp) => {
                         if !resp.is_empty() {
                             print!("{resp}");
@@ -764,7 +811,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &host_cnxn_payload(),
                                 default_auth(),
                             ) {
-                                println!("{}\\tdevice ({})", direct_addr, device_info.banner.trim());
+                                println!("{}\tdevice ({})", direct_addr, device_info.banner.trim());
                                 return Ok(());
                             }
                         }
@@ -774,7 +821,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else {
                 println!("List of devices attached (adb-rs pure rust transport)");
-                match host_command(cli.serial.as_deref(), "host:devices") {
+                match host_cmd("host:devices") {
                     Ok(resp) => {
                         if !resp.is_empty() {
                             print!("{resp}");
@@ -803,8 +850,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             //   (NOT raw A_OPEN — the server creates A_OPEN internally).
             //   Server responds OKAY, then enters raw ADB forwarding mode.
             //   Client then reads WRTE/CLSE from the device via server.
-            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
-            if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+            let server_addr = &server_addr;
+            if let Ok(mut server) = AdbServerTransport::connect_timeout(server_addr, Duration::from_millis(300)) {
                 if server.switch_transport(cli.serial.as_deref()).is_ok() {
                     // Send shell service via host service protocol
                     server.send_host_request(&shell_service)?;
@@ -860,8 +907,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // Priority 1: ADB server (port 5037) — same pattern as shell.
-            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
-            if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
+            let server_addr = &server_addr;
+            if let Ok(mut server) = AdbServerTransport::connect_timeout(server_addr, Duration::from_millis(300)) {
                 if server.switch_transport(cli.serial.as_deref()).is_ok() {
                     // Send exec service via host service protocol
                     server.send_host_request(&exec_service)?;
@@ -975,7 +1022,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             };
 
-            match host_command(cli.serial.as_deref(), &request) {
+            match host_cmd(&request) {
                 Ok(resp) => {
                     if !resp.is_empty() {
                         println!("{resp}");
@@ -1006,7 +1053,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             };
 
-            match host_command(cli.serial.as_deref(), &request) {
+            match host_cmd(&request) {
                 Ok(resp) => {
                     if !resp.is_empty() {
                         println!("{resp}");
@@ -1200,7 +1247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Jdwp => {
-            match host_command(cli.serial.as_deref(), "host:jdwp") {
+            match host_cmd("host:jdwp") {
                 Ok(resp) => {
                     let trimmed = resp.trim();
                     if trimmed.is_empty() {
@@ -1221,7 +1268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Mdns(MdnsCommands::Check) => {
             // AOSP commandline.cpp:1965-1968: adb_query_command("host:mdns:check").
-            match host_command(cli.serial.as_deref(), "host:mdns:check") {
+            match host_cmd("host:mdns:check") {
                 Ok(resp) => println!("{}", resp.trim()),
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -1232,7 +1279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Mdns(MdnsCommands::Services) => {
             // AOSP commandline.cpp:1969-1972.
             println!("List of discovered mdns services");
-            match host_command(cli.serial.as_deref(), "host:mdns:services") {
+            match host_cmd("host:mdns:services") {
                 Ok(resp) => print!("{}", resp),
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -1258,76 +1305,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::GetState => {
-            match host_command(cli.serial.as_deref(), "host:get-state") {
+            match host_cmd("host:get-state") {
                 Ok(resp) => println!("{}", resp.trim()),
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             }
         }
 
         Commands::GetSerialno => {
-            match host_command(cli.serial.as_deref(), "host:get-serialno") {
+            match host_cmd("host:get-serialno") {
                 Ok(resp) => println!("{}", resp.trim()),
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             }
         }
 
         Commands::GetDevpath => {
-            match host_command(cli.serial.as_deref(), "host:get-devpath") {
+            match host_cmd("host:get-devpath") {
                 Ok(resp) => println!("{}", resp.trim()),
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             }
         }
 
         Commands::Serve => {
-            println!("[adb-rs] Starting ADB server on 127.0.0.1:5037 ...");
+            println!("[adb-rs] Starting ADB server on {server_addr} ...");
             server::run_server();
         }
 
-        Commands::StartServer => {
-            let addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
-            if std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)).is_ok() {
-                println!("* daemon already running *");
+        Commands::Server { args } => {
+            let nodaemon = args.iter().any(|a| a == "nodaemon");
+            if nodaemon {
+                let default_spec = format!("tcp:127.0.0.1:{server_port}");
+                let spec = cli.transport.as_deref().unwrap_or(&default_spec);
+                server::run_server_fork(None, spec);
             } else {
-                ensure_server_running()?;
+                client::server_cmds::ensure_server_running_spec(cli.transport.as_deref(), server_port)?;
             }
         }
 
+        Commands::StartServer => {
+            client::server_cmds::ensure_server_running_spec(cli.transport.as_deref(), server_port)?;
+        }
+
         Commands::KillServer => {
-            kill_server()?;
+            let _ = client::server_cmds::kill_server_at(server_port);
         }
 
         Commands::ForkServer { mode: _, reply_fd } => {
-            let addr = cli.transport.as_deref().unwrap_or("tcp:127.0.0.1:5037");
-            let port = parse_server_addr(addr).unwrap_or(ADB_SERVER_PORT);
-            server::run_server_fork(Some(*reply_fd), port);
+            let default_spec = format!("tcp:127.0.0.1:{server_port}");
+            let spec = cli.transport.as_deref().unwrap_or(&default_spec);
+            server::run_server_fork(Some(*reply_fd), spec);
         }
 
         Commands::Connect { target } => {
-            // Parse target as host:port
-            let (host, port) = if let Some(idx) = target.rfind(':') {
-                let h = &target[..idx];
-                let p: u16 = target[idx+1..].parse().unwrap_or(5555);
-                (h.to_string(), p)
-            } else {
-                (target.clone(), 5555)
-            };
-            let request = format!("host:connect:{}:{}", host, port);
-
-            match host_command(cli.serial.as_deref(), &request) {
-                Ok(_resp) => {
-                    println!("connected to {}:{}", host, port);
+            let request = format!("host:connect:{target}");
+            match host_cmd(&request) {
+                Ok(resp) => {
+                    let trimmed = resp.trim();
+                    if !trimmed.is_empty() {
+                        println!("{trimmed}");
+                    } else {
+                        println!("connected to {target}");
+                    }
                 }
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             }
@@ -1339,7 +1388,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => "host:disconnect".to_string(),
             };
 
-            match host_command(cli.serial.as_deref(), &request) {
+            match host_cmd(&request) {
                 Ok(resp) => {
                     let trimmed = resp.trim();
                     if !trimmed.is_empty() {
@@ -1389,7 +1438,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Root => {
-            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let server_addr = server_addr.to_string();
             let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
                 Ok(s) => s,
                 Err(_) => {
@@ -1415,7 +1464,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Unroot => {
-            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let server_addr = server_addr.to_string();
             let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
                 Ok(s) => s,
                 Err(_) => {
@@ -1440,8 +1489,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::io::stdout().flush()?;
         }
 
-        Commands::Tcpip { port } => {
-            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+        Commands::Tcpip { args } => {
+            if args.is_empty() {
+                eprintln!("adb: tcpip requires an argument");
+                std::process::exit(1);
+            }
+            let port: u16 = match args[0].parse() {
+                Ok(p) if p > 0 => p,
+                _ => {
+                    eprintln!("adb: tcpip: invalid port: {}", args[0]);
+                    std::process::exit(1);
+                }
+            };
+            let server_addr = server_addr.to_string();
             let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
                 Ok(s) => s,
                 Err(_) => {
@@ -1468,7 +1528,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Usb => {
-            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let server_addr = server_addr.to_string();
             let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
                 Ok(s) => s,
                 Err(_) => {
@@ -1494,7 +1554,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Reconnect { target } => {
-            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let server_addr = server_addr.to_string();
             let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
                 Ok(s) => s,
                 Err(_) => {
@@ -1523,7 +1583,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Attach => {
-            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let server_addr = server_addr.to_string();
             let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
                 Ok(s) => s,
                 Err(_) => {
@@ -1557,7 +1617,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         #[allow(unreachable_patterns)]
         Commands::DisableVerity => {
-            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let server_addr = server_addr.to_string();
             let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
                 Ok(s) => s,
                 Err(_) => {
@@ -1583,7 +1643,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::EnableVerity => {
-            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let server_addr = server_addr.to_string();
             let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
                 Ok(s) => s,
                 Err(_) => {
@@ -1618,7 +1678,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Remount { reboot } => {
-            let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+            let server_addr = server_addr.to_string();
             let mut server = match AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
                 Ok(s) => s,
                 Err(_) => {
@@ -1782,6 +1842,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        Commands::WaitForDevice => {
+            let max_attempts = 60;
+            let mut attempts = 0;
+            loop {
+                let result = host_cmd("host:get-state");
+                if let Ok(resp) = &result {
+                    if resp.trim() == "device" {
+                        return Ok(());
+                    }
+                }
+                attempts += 1;
+                if attempts >= max_attempts {
+                    eprintln!("error: timeout waiting for device");
+                    std::process::exit(1);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+
+        Commands::WaitForRecovery => {
+            let max_attempts = 60;
+            let mut attempts = 0;
+            loop {
+                let result = host_cmd("host:get-state");
+                if let Ok(resp) = &result {
+                    if resp.trim() == "recovery" {
+                        return Ok(());
+                    }
+                }
+                attempts += 1;
+                if attempts >= max_attempts {
+                    eprintln!("error: timeout waiting for recovery");
+                    std::process::exit(1);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+
+        Commands::WaitForBootloader => {
+            let max_attempts = 60;
+            let mut attempts = 0;
+            loop {
+                let result = host_cmd("host:get-state");
+                if let Ok(resp) = &result {
+                    if resp.trim() == "bootloader" {
+                        return Ok(());
+                    }
+                }
+                attempts += 1;
+                if attempts >= max_attempts {
+                    eprintln!("error: timeout waiting for bootloader");
+                    std::process::exit(1);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+
+        Commands::WaitForDisconnect => {
+            let max_attempts = 60;
+            let mut attempts = 0;
+            loop {
+                let result = host_cmd("host:get-state");
+                if result.is_err() {
+                    return Ok(());
+                }
+                attempts += 1;
+                if attempts >= max_attempts {
+                    eprintln!("error: timeout waiting for disconnect");
+                    std::process::exit(1);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+
         Commands::WaitFor { spec } => {
             let spec_str = spec.join(" ");
             let spec_str = spec_str.trim();
@@ -1815,7 +1949,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[adb-rs] Waiting for device state '{spec_str}' ...");
 
             loop {
-                let result = host_command(cli.serial.as_deref(), "host:get-state");
+                let result = host_cmd("host:get-state");
                 let current_state = match &result {
                     Ok(resp) => resp.trim().to_string(),
                     Err(_) if state == "disconnect" => "disconnect".to_string(),

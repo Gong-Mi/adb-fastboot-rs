@@ -401,7 +401,7 @@ pub(crate) fn run_smart_socket_loop(
             None => return Ok(()), // clean disconnect
         };
 
-        let is_host_cmd = cmd.starts_with("host:");
+        let is_host_cmd = cmd.starts_with("host:") || cmd.starts_with("host-");
         let is_transport_cmd = is_host_cmd && (cmd.starts_with("host:transport:")
             || cmd == "host:transport-any"
             || cmd.starts_with("host:tport:")

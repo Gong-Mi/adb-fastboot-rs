@@ -44,6 +44,14 @@ jobs:
       - name: Test (default ${{ matrix.features }})
         run: cargo test --workspace ${{ matrix.features }}
 
+      - name: Run AOSP integration test_adb.py
+        if: matrix.features == ''
+        run: |
+          cargo build --bin adb-rs
+          mkdir -p target/testbin
+          cp target/debug/adb-rs target/testbin/adb
+          PATH="$PWD/target/testbin:$PATH" python3 tests/test_adb.py
+
   clippy:
     runs-on: ubuntu-latest
     steps:

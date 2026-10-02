@@ -207,6 +207,34 @@ pub(crate) fn dispatch_host_service(
             }
         }
 
+        // -- host-serial:<serial>:get-state / get-serialno / get-devpath -----
+        c if c.starts_with("host-serial:")
+            && (c.ends_with(":get-state") || c.ends_with(":get-serialno") || c.ends_with(":get-devpath")) =>
+        {
+            let rest = &c["host-serial:".len()..];
+            if let Some((serial, cmd)) = rest.split_once(':') {
+                let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                if let Some(dev) = reg.find_by_serial(serial) {
+                    match cmd {
+                        "get-state" => ok_str(client, dev.state.as_str()),
+                        "get-serialno" => ok_str(client, &dev.serial),
+                        "get-devpath" => {
+                            let path = match dev.origin {
+                                DeviceOrigin::Usb => "usb".to_string(),
+                                DeviceOrigin::Tcp { addr } => format!("{}:{}", addr.ip(), addr.port()),
+                            };
+                            ok_str(client, &path)
+                        }
+                        _ => fail(client, &format!("unsupported host-serial service: {cmd}")),
+                    }
+                } else {
+                    fail(client, &format!("device '{serial}' not found"))
+                }
+            } else {
+                fail(client, "invalid host-serial format")
+            }
+        }
+
         // -- host:transport:<serial> ----------------------------------------
         c if c.starts_with("host:transport:") => {
             let serial = &c["host:transport:".len()..];
@@ -333,20 +361,22 @@ pub(crate) fn dispatch_host_service(
             let (parsed_host, port) = parse_adb_host_port(target)?;
             let host = &parsed_host;
 
-            let addr_str = if host.contains(':') {
-                format!("[{host}]:{port}")
+            let sock_addrs: Vec<SocketAddr> = if host == "localhost" || host.is_empty() {
+                vec![
+                    SocketAddr::from(([127, 0, 0, 1], port)),
+                    SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
+                ]
             } else {
-                format!("{host}:{port}")
+                let addr_str = if host.contains(':') {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                };
+                addr_str
+                    .to_socket_addrs()
+                    .map_err(|e| format!("resolve failed: {e}"))?
+                    .collect()
             };
-            let sock_addrs: Vec<SocketAddr> = addr_str
-                .to_socket_addrs()
-                .map_err(|e| format!("resolve failed: {e}"))?
-                .collect();
-            let addr = sock_addrs
-                .first()
-                .ok_or_else(|| "no address resolved".to_string())?
-                .to_owned();
-
             let serial = target.to_string(); // keep original hostname for matching
 
             // Check if already connected (using original hostname serial)
@@ -361,26 +391,98 @@ pub(crate) fn dispatch_host_service(
                 }
             }
 
-            let ip_serial = addr.to_string(); // resolved IP for transport registration
-            match crate::server::transport::connect_to_remote(addr, registry) {
-                Ok(t) => {
-                    let _ = t; // keep transport alive
-                    eprintln!("[adb-debug] connect_to_remote OK for {}", &ip_serial);
-                    // Register AND return the original hostname serial
-                    // This makes disconnect by hostname work
-                    {
-                        let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-                        if let Some(dev) = reg.devices.iter_mut().find(|d| d.serial == ip_serial) {
-                            dev.serial = serial.clone();
-                            eprintln!("[adb-debug] updated serial: {} -> {}", &ip_serial, &serial);
+            let mut last_err = None;
+            let mut connected_ip = None;
+            let mut connected_transport = None;
+            for addr in sock_addrs {
+                let ip_serial = addr.to_string();
+                match crate::server::transport::connect_to_remote(addr, registry) {
+                    Ok(t) => {
+                        connected_ip = Some(ip_serial);
+                        connected_transport = Some(t);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
+                }
+            }
+
+            if let (Some(ip_serial), Some(t)) = (connected_ip, connected_transport) {
+                // Register AND return the original hostname serial
+                // This makes disconnect by hostname work
+                {
+                    let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
+                    if let Some(dev) = reg.devices.iter_mut().find(|d| d.serial == ip_serial) {
+                        dev.serial = serial.clone();
+                        eprintln!("[adb-debug] updated serial: {} -> {}", &ip_serial, &serial);
+                    }
+                }
+
+                let reg_for_watch = Arc::clone(registry);
+                let serial_for_watch = serial.clone();
+                std::thread::spawn(move || {
+                    let mut transport = t;
+                    loop {
+                        match transport.recv_message() {
+                            Ok((_hdr, _data)) => {}
+                            Err(_) => {
+                                eprintln!("[adb-server] Device {} connection error, marking offline", &serial_for_watch);
+                                if let Ok(mut reg) = reg_for_watch.lock() {
+                                    if let Some(dev) = reg.devices.iter_mut().find(|d| d.serial == serial_for_watch) {
+                                        dev.state = crate::server::models::DeviceState::Offline;
+                                    }
+                                }
+                                break;
+                            }
                         }
                     }
-                    ok_str(client, &serial)?;
-                }
-                Err(e) => {
-                    eprintln!("[adb-debug] connect_to_remote FAIL: {}", &e);
-                    fail(client, &format!("connection failed: {e}"))?;
-                }
+                });
+
+                ok_str(client, &format!("connected to {serial}"))?;
+            } else {
+                let err_msg = last_err.unwrap_or_else(|| "cannot connect".to_string());
+                fail(client, &format!("cannot connect to {serial}: {err_msg}"))?;
+            }
+            Ok(())
+        }
+
+        // -- host:emulator:<port> -------------------------------------------
+        c if c.starts_with("host:emulator:") => {
+            let port_str = &c["host:emulator:".len()..];
+            if let Ok(port) = port_str.parse::<u16>() {
+                let reg_for_emu = Arc::clone(registry);
+                std::thread::spawn(move || {
+                    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                    let console_port = port.saturating_sub(1);
+                    let serial = format!("emulator-{console_port}");
+                    if let Ok(t) = crate::server::transport::connect_to_remote(addr, &reg_for_emu) {
+                        if let Ok(mut reg) = reg_for_emu.lock() {
+                            let ip_serial = addr.to_string();
+                            if let Some(dev) = reg.devices.iter_mut().find(|d| d.serial == ip_serial) {
+                                dev.serial = serial.clone();
+                            }
+                        }
+                        let reg_for_watch = Arc::clone(&reg_for_emu);
+                        let serial_for_watch = serial.clone();
+                        std::thread::spawn(move || {
+                            let mut transport = t;
+                            loop {
+                                match transport.recv_message() {
+                                    Ok(_) => {}
+                                    Err(_) => {
+                                        if let Ok(mut reg) = reg_for_watch.lock() {
+                                            if let Some(dev) = reg.devices.iter_mut().find(|d| d.serial == serial_for_watch) {
+                                                dev.state = crate::server::models::DeviceState::Offline;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
             }
             Ok(())
         }

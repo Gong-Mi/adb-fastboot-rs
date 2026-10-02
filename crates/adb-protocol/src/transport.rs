@@ -22,6 +22,9 @@ pub enum TransportError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    #[error("{0}")]
+    ServerError(String),
+
     /// Device responded with A_STLS, indicating it requires TLS upgrade.
     /// The caller should wrap the transport in a TlsStream and retry the handshake.
     #[error("TLS handshake required: device requested A_STLS")]
@@ -292,7 +295,7 @@ impl AdbServerTransport {
                     self.stream.read_exact(&mut err_buf)?;
                 }
                 let err_msg = String::from_utf8_lossy(&err_buf).to_string();
-                Err(TransportError::Protocol(format!("ADB server error: {}", err_msg)))
+                Err(TransportError::ServerError(err_msg))
             }
             other => {
                 let s = String::from_utf8_lossy(other);
@@ -318,13 +321,9 @@ impl AdbServerTransport {
 
     /// Execute a host command expecting a data payload (e.g. "host:devices-l", "host:version")
     pub fn execute_host_command(&mut self, request: &str) -> Result<String, TransportError> {
-        eprintln!("[adb-debug] execute_host_command: sending '{}'", request);
         self.send_host_request(request)?;
-        eprintln!("[adb-debug] execute_host_command: sent OK, reading status");
         self.read_status()?;
-        eprintln!("[adb-debug] execute_host_command: status OK, reading payload");
         let payload = self.read_payload()?;
-        eprintln!("[adb-debug] execute_host_command: payload={:?}", &payload);
         Ok(String::from_utf8_lossy(&payload).to_string())
     }
 

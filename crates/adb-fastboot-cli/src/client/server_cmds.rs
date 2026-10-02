@@ -23,11 +23,34 @@ pub fn ensure_server_running() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn ensure_server_running_at(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_server_running_spec(None, port)
+}
+
+pub fn ensure_server_running_spec(
+    spec: Option<&str>,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::net::TcpStream;
 
-    let addr = format!("127.0.0.1:{port}");
-    if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)).is_ok() {
-        return Ok(());
+    let probe_spec = spec.unwrap_or("");
+    let clean_spec = probe_spec.strip_prefix("tcp:").unwrap_or(probe_spec);
+    let target_spec = if !clean_spec.is_empty() {
+        clean_spec
+    } else {
+        ""
+    };
+
+    if !target_spec.is_empty() {
+        if let Ok(sa) = target_spec.parse() {
+            if TcpStream::connect_timeout(&sa, Duration::from_millis(200)).is_ok() {
+                return Ok(());
+            }
+        }
+    } else {
+        let addr = format!("127.0.0.1:{port}");
+        if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)).is_ok() {
+            return Ok(());
+        }
     }
 
     eprintln!("* daemon not running; starting it now at tcp:{port} *");
@@ -70,6 +93,21 @@ pub fn ensure_server_running_at(port: u16) -> Result<(), Box<dyn std::error::Err
             libc::fcntl(pipe_write, libc::F_SETFD, 0);
         }
 
+        // Redirect stdin, stdout, stderr to /dev/null so child daemon does not
+        // inherit parent pipes and block callers (AOSP client/main.cpp:218-228).
+        let dev_null = unsafe {
+            let c_devnull = std::ffi::CString::new("/dev/null").unwrap();
+            libc::open(c_devnull.as_ptr(), libc::O_RDWR)
+        };
+        if dev_null >= 0 {
+            unsafe {
+                libc::dup2(dev_null, libc::STDIN_FILENO);
+                libc::dup2(dev_null, libc::STDOUT_FILENO);
+                libc::dup2(dev_null, libc::STDERR_FILENO);
+                libc::close(dev_null);
+            }
+        }
+
         // argv: adb-rs fork-server server --reply-fd N
         // The "server" positional arg is required by AOSP protocol.
         // Also pass -L tcp:127.0.0.1:{port} so the server binds to the
@@ -77,7 +115,16 @@ pub fn ensure_server_running_at(port: u16) -> Result<(), Box<dyn std::error::Err
         let fork_server = std::ffi::CString::new("fork-server").unwrap();
         let server_mode = std::ffi::CString::new("server").unwrap();
         let listen_flag = std::ffi::CString::new("-L").unwrap();
-        let listen_addr = std::ffi::CString::new(format!("tcp:127.0.0.1:{port}")).unwrap();
+        let listen_str = if let Some(s) = spec {
+            if s.starts_with("tcp:") {
+                s.to_string()
+            } else {
+                format!("tcp:{s}")
+            }
+        } else {
+            format!("tcp:127.0.0.1:{port}")
+        };
+        let listen_addr = std::ffi::CString::new(listen_str).unwrap();
         let reply_fd_arg = std::ffi::CString::new("--reply-fd").unwrap();
         let reply_fd_str = std::ffi::CString::new(pipe_write.to_string()).unwrap();
 
@@ -180,23 +227,41 @@ pub fn kill_server() -> Result<(), Box<dyn std::error::Error>> {
 pub fn kill_server_at(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     use std::net::TcpStream;
 
-    let addr = format!("127.0.0.1:{port}");
-    let mut transport = match AdbServerTransport::connect_timeout(&addr, Duration::from_secs(1)) {
-        Ok(t) => t,
-        Err(_) => {
+    let candidate_addrs = [
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+    ];
+    let mut target_addr = None;
+    let mut transport = None;
+    for addr in &candidate_addrs {
+        if let Ok(t) = AdbServerTransport::connect_timeout(addr, Duration::from_millis(300)) {
+            target_addr = Some(addr.clone());
+            transport = Some(t);
+            break;
+        }
+    }
+
+    let mut transport = match transport {
+        Some(t) => t,
+        None => {
             // Server not running
             return Ok(());
         }
     };
+    let active_addr = target_addr.unwrap();
 
-    transport.send_host_request("host:kill")?;
-    transport.read_status()?;
+    let _ = transport.send_host_request("host:kill");
+    let _ = transport.read_status();
 
     // Wait for process termination
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(3);
     while start.elapsed() < timeout {
-        if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(100)).is_err() {
+        if let Ok(sa) = active_addr.parse() {
+            if TcpStream::connect_timeout(&sa, Duration::from_millis(100)).is_err() {
+                return Ok(());
+            }
+        } else {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
