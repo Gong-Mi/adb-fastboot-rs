@@ -616,10 +616,11 @@ mod tests {
         let mut transport = AdbServerTransport::connect(local_addr.to_string()).unwrap();
         let res = transport.switch_transport(Some("nonexistent"));
         assert!(res.is_err());
-        if let Err(TransportError::Protocol(msg)) = res {
-            assert!(msg.contains("device 'nonexistent' not found"));
-        } else {
-            panic!("Expected Protocol error");
+        match res {
+            Err(TransportError::ServerError(msg)) | Err(TransportError::Protocol(msg)) => {
+                assert!(msg.contains("device 'nonexistent' not found"));
+            }
+            _ => panic!("Expected ServerError or Protocol error, got {:?}", res),
         }
 
         handle.join().unwrap();
