@@ -44,6 +44,8 @@ pub struct InstallOptions {
     pub staging: bool,
     /// Wait for the device after install
     pub wait: bool,
+    /// Explicit streaming preference (Some(true) = --streaming, Some(false) = --no-streaming, None = default auto-detect).
+    pub streaming: Option<bool>,
 }
 
 impl InstallOptions {
@@ -447,6 +449,10 @@ pub fn install_multiple(
         });
     }
 
+    if options.streaming == Some(true) {
+        return install_multiple_streamed(transport, apks, total_size, options);
+    }
+
     // If any push fails, remove all planned paths, including a partially written file.
     for (apk, staged_apk) in apks.iter().zip(&staged) {
         if let Err(error) = push_apk(transport, apk, staging, printer) {
@@ -462,6 +468,64 @@ pub fn install_multiple(
     let install_result = install_staged_multiple(transport, &staged, total_size, options);
     cleanup_staged_apks(transport, &staged);
     install_result
+}
+
+fn install_multiple_streamed(
+    transport: &mut dyn Transport,
+    apks: &[&Path],
+    total_size: u64,
+    options: &InstallOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let flags = options.to_pm_flags().join(" ");
+    let create_command = if flags.is_empty() {
+        format!("cmd package install-create -S {total_size}")
+    } else {
+        format!("cmd package install-create -S {total_size} {flags}")
+    };
+    let create_output = run_exec_command(transport, &create_command)?;
+    let session_id = parse_install_session_id(&create_output)
+        .ok_or_else(|| format!("Failed to create streamed install session: {}", create_output.trim()))?;
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        for apk in apks {
+            let file_name = apk
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("Invalid APK filename")?;
+            let size = fs::metadata(apk)?.len();
+            let write_command = format!(
+                "cmd package install-write -S {} {} {} -",
+                size,
+                session_id,
+                shell_quote(file_name),
+            );
+            let output = stream_file_to_exec(transport, &write_command, apk, size)?;
+            if !output.lines().any(|line| line.starts_with("Success")) {
+                return Err(format!(
+                    "install-write failed for {file_name}: {}",
+                    output.trim()
+                )
+                .into());
+            }
+        }
+
+        let commit_command = format!("cmd package install-commit {session_id}");
+        let commit_output = run_exec_command(transport, &commit_command)?;
+        if !commit_output.lines().any(|line| line.starts_with("Success")) {
+            return Err(format!(
+                "install-commit failed for session {session_id}: {}",
+                commit_output.trim()
+            )
+            .into());
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let abandon_command = format!("cmd package install-abandon {session_id}");
+        let _ = run_exec_command(transport, &abandon_command);
+    }
+    result
 }
 
 fn cleanup_staged_apks(transport: &mut dyn Transport, apks: &[StagedApk]) {
@@ -990,6 +1054,55 @@ mod tests {
         let commands = shell_commands(&peer);
         assert!(commands.iter().any(|command| command == "pm install-abandon 42"));
         assert!(!commands.iter().any(|command| command == "pm install-commit 42"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_multiple_streamed_uses_direct_stream_writes_and_commits() {
+        let (root, paths) = fixture_apks();
+        let references: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        let mut peer = FakeTransport::new(false);
+        let mut printer = LinePrinter::new();
+        let options = InstallOptions {
+            streaming: Some(true),
+            reinstall: true,
+            ..Default::default()
+        };
+
+        install_multiple(&mut peer, &references, &options, &mut printer).unwrap();
+
+        let commands = exec_commands(&peer);
+        assert_eq!(
+            commands,
+            vec![
+                "cmd package install-create -S 10 -r".to_string(),
+                "cmd package install-write -S 4 42 'base.apk' -".to_string(),
+                "cmd package install-write -S 6 42 'split'\\''cfg.apk' -".to_string(),
+                "cmd package install-commit 42".to_string(),
+            ]
+        );
+        // Direct stream: no staging pushes, no rm cleanups!
+        assert!(!peer.opened_services.iter().any(|s| s.contains("sync:")));
+        assert!(!peer.opened_services.iter().any(|s| s.contains("rm ")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_multiple_streamed_abandons_session_on_write_failure() {
+        let (root, paths) = fixture_apks();
+        let references: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        let mut peer = FakeTransport::new(true);
+        let mut printer = LinePrinter::new();
+        let options = InstallOptions {
+            streaming: Some(true),
+            ..Default::default()
+        };
+
+        let result = install_multiple(&mut peer, &references, &options, &mut printer);
+        assert!(result.is_err());
+        let commands = exec_commands(&peer);
+        assert!(commands.iter().any(|cmd| cmd == "cmd package install-abandon 42"));
+        assert!(!commands.iter().any(|cmd| cmd == "cmd package install-commit 42"));
         fs::remove_dir_all(root).unwrap();
     }
 

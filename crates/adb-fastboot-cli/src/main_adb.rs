@@ -1092,10 +1092,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|error| format!("Cannot connect to adbd at {addr}: {error}"))?;
-            let (_info, mut transport) =
-                connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
+            let cnxn_payload = host_cnxn_payload();
+            let (device_info, mut transport) =
+                connect_and_handshake_with_tls_upgrade(transport, &cnxn_payload, default_auth())?;
             let mut printer = client::line_printer::LinePrinter::new();
+            let mode = client::adb_install::select_install_mode(
+                &device_info.banner,
+                client::adb_install::InstallModeRequest::Auto,
+            )?;
             let options = client::adb_install::InstallOptions {
+                streaming: Some(mode == client::adb_install::InstallMode::Streamed),
                 reinstall: true,
                 ..Default::default()
             };
