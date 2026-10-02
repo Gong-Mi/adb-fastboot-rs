@@ -139,3 +139,95 @@ pub fn persist_adb_pubkey(auth: &AdbAuth) -> Result<(), Box<dyn std::error::Erro
     }
     Ok(())
 }
+
+/// AOSP `adb_auth_keygen()` (client/auth.cpp:61-107): generate an
+/// RSA key pair at `file` (0600) and `file.pub`.
+pub fn adb_auth_keygen(file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(file);
+    if path.exists() {
+        return Err(format!("'{file}' already exists").into());
+    }
+    let private_path = if file.ends_with(".pub") {
+        let priv_path = file.strip_suffix(".pub").unwrap_or(file);
+        PathBuf::from(priv_path)
+    } else {
+        path.to_path_buf()
+    };
+    adb_protocol::auth::generate_key(&private_path)?;
+    println!("[adb-rs] Generated ADB key pair:");
+    println!("       Private: {}", private_path.display());
+    let mut pub_path = private_path.clone();
+    pub_path.set_extension("pub");
+    println!("       Public:  {}", pub_path.display());
+    Ok(())
+}
+
+/// AOSP `adb_auth_pubkey()` (client/auth.cpp:331-338): calculate and
+/// return the public key payload from a private key file.
+pub fn adb_auth_pubkey(file: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let path = Path::new(file);
+    let pem = std::fs::read_to_string(path)?;
+    let private_key = adb_protocol::auth::load_private_key_from_pem(&pem)?;
+    let label = adb_protocol::auth::default_key_label();
+    let auth = AdbAuth::new(private_key, &label);
+    let bytes = auth.build_rsakey_payload()?;
+    let pubkey_str = std::str::from_utf8(&bytes)?;
+    Ok(pubkey_str.trim_end_matches('\0').to_string())
+}
+
+/// AOSP `adb_auth_get_userkey_path()` (client/auth.cpp:205-207).
+pub fn adb_auth_get_userkey_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(adb_protocol::auth::adb_auth_get_userkey_path()?)
+}
+
+/// AOSP `get_vendor_keys()` (client/auth.cpp:228-243).
+pub fn get_vendor_keys() -> Vec<PathBuf> {
+    adb_protocol::auth::get_vendor_keys()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_adb_auth_keygen_and_pubkey_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("adb-auth-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("test_adbkey");
+        let key_str = key_path.to_str().unwrap();
+
+        // 1. Generate key pair
+        adb_auth_keygen(key_str).unwrap();
+        assert!(key_path.is_file());
+
+        let pub_path = dir.join("test_adbkey.pub");
+        assert!(pub_path.is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(&key_path).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o600);
+        }
+
+        // 2. Read public key via adb_auth_pubkey
+        let pubkey_from_priv = adb_auth_pubkey(key_str).unwrap();
+        let pubkey_from_file = std::fs::read_to_string(&pub_path).unwrap();
+        assert_eq!(pubkey_from_priv, pubkey_from_file.trim_end_matches('\0'));
+
+        // 3. Attempting to keygen over existing file fails
+        let err = adb_auth_keygen(key_str).unwrap_err().to_string();
+        assert!(err.contains("already exists"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_adb_auth_userkey_path() {
+        let path = adb_auth_get_userkey_path();
+        assert!(path.is_ok());
+        let p = path.unwrap();
+        assert!(p.ends_with(".android/adbkey"));
+    }
+}

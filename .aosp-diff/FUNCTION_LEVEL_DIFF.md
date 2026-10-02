@@ -20,17 +20,17 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 | pairing_connection C API | 8 | pairing_connection.rs/pairing_server.rs 原生 API | 命名差分 |
 | sysdeps 网络 | 7 | keepalive/peek/GetOSVersion 已补；`adb_launch_process` 已补并通过子进程 FD 继承与 127 退出码测试 | 命名差分+核心已实现 |
 | listeners forward | 10 | forward.rs 有 server forward；`remove_all_forwards`/`remove_all_reverses` 与 wire `killforward-all`/`killreverse-all` 调度已补全测试 | 已实现 |
-| auth inotify+TLS 证书链 | 6 | key.rs 有 load_persistent/AuthResponder；inotify/TLS 证书链缺 | 部分实现 |
+| auth inotify+TLS 证书链 | 6 | key.rs 有 load_persistent/AuthResponder；`adb_auth_keygen`/`adb_auth_pubkey`/`adb_auth_get_userkey_path` 已对齐并通过单测与 CLI 子命令解析；inotify/TLS 证书链待补 | 部分实现 |
 | errno wire 映射 | 4 | `adb-protocol/sysdeps/errno.rs` + 4 tests | 已实现 |
-| trace init | 4 | adb_trace.rs 有部分 | 部分实现 |
+| trace init | 4 | adb_trace.rs 已补全 `NUM_TRACES`、`get_trace_setting`、`setup_trace_mask`、`adb_trace_init` 并通过测试 | 已实现 |
 | emulator 扫描器 | 12 | transport_emulator.rs serial 解析、CNXN 握手探测与 fake console 交互测试已补 | 已实现核心 |
 | mdns C bridge(adbmdns) | 4 | AOSP `adbmdns_start` 安全 Rust callback API: pointers → owned service info, deterministic address ordering; runner callback maps DNS-SD events into registry | adapter-copy + wire packet fixtures for Create, TXT/SRV Update and TTL-zero PTR Delete; state reducer also covers unknown/multi-record Delete |
 
-## 汇总: 命名差分 7 域 / 部分实现 4 域 / 自动化切片已实现 5 域 / 功能真空 1 域
+## 汇总: 命名差分 7 域 / 部分实现 3 域 / 自动化切片已实现 6 域 / 功能真空 1 域
 
 - 命名差分: fdevent 事件循环, sockets asocket 状态机, transport 注册表, usb hotplug, adb_client server 协议, pairing_connection C API, sysdeps 网络
-- 部分实现: mDNS packet Update/TXT-change/TTL-delete fixtures, adb_install 安装分支, auth inotify+TLS 证书链, trace init
-- 自动化切片已实现: console fake-protocol path/tests; errno wire mapping; forward/reverse remove-all & wire dispatch; sysdeps adb_launch_process; emulator scanner state & fake console
+- 部分实现: mDNS packet Update/TXT-change/TTL-delete fixtures, adb_install 安装分支, auth inotify+TLS 证书链
+- 自动化切片已实现: console fake-protocol path/tests; errno wire mapping; forward/reverse remove-all & wire dispatch; sysdeps adb_launch_process; emulator scanner state & fake console; trace init & env parsing
 - 功能真空: incremental/fastdeploy
 
 ## 当前自动化状态（2026-10-02）
@@ -41,7 +41,8 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 - Forward & Reverse management: `remove_all_forwards` and `remove_all_reverses` verify full cleanup of active rules; wire test verifies `killforward-all` and `killreverse-all` dispatch and response.
 - Sysdeps `adb_launch_process`: verified with child process fixture asserting execution of `/proc/self/fd/{fd}` inheritance across `FD_CLOEXEC` clearing, plus exit code 127 on nonexistent binaries.
 - Emulator transport: verified emulator serial parsing/port mapping, CNXN probe vs unexpected command validation, and fake console TCP greeting/command roundtrip.
-- Local exact worktree: `cargo check --workspace --all-features` exit 0; workspace all-targets tests across 11 binaries: default 563 passed/0 failed, all-features 567/0, no-default-features 532/0. ADB CLI binary is 262/0 and `adb-mdns` is 40/0.
+- Auth & Trace: `adb_auth_keygen` and `adb_auth_pubkey` roundtrip verification with 0600 mode and `.pub` content equality; `adb pubkey <FILE>` CLI command support; `adb_trace_init` and `get_trace_setting` parsing verified.
+- Local exact worktree: `cargo check --workspace --all-features` exit 0; workspace all-targets tests across 11 binaries: default 567 passed/0 failed, all-features 571/0, no-default-features 536/0. ADB CLI binary is 266/0 and `adb-mdns` is 40/0.
 
 ## ADB install AOSP差异（源码静态审计；尚未做设备端验收）
 

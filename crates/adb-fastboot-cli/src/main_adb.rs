@@ -321,6 +321,11 @@ pub enum Commands {
         /// Output file path for the private key (adbkey)
         file: String,
     },
+    /// Print public key corresponding to private key file
+    Pubkey {
+        /// Input private key file path
+        file: String,
+    },
     /// Remount partitions read-write
     Remount {
         /// Reboot after remount
@@ -1598,32 +1603,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Keygen { file } => {
-            let path = Path::new(file);
-            if path.exists() {
-                eprintln!("Error: '{}' already exists", file);
-                std::process::exit(1);
-            }
-            let private_path = if file.ends_with(".pub") {
-                // User specified the public key file — derive private
-                let priv_path = file.strip_suffix(".pub").unwrap_or(file);
-                PathBuf::from(priv_path)
-            } else {
-                path.to_path_buf()
-            };
-            let public_path = {
-                let mut p = private_path.clone();
-                p.set_extension("pub");
-                p
-            };
+            crate::client::auth::adb_auth_keygen(file)?;
+        }
 
-            let auth = AdbAuth::generate("adb-rs@localhost")?;
-            let pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key())?;
-            write_private_key(&private_path, pem.as_bytes())?;
-            let pub_bytes = auth.build_rsakey_payload()?;
-            write_private_key(&public_path, &pub_bytes)?;
-            println!("[adb-rs] Generated ADB key pair:");
-            println!("       Private: {}", private_path.display());
-            println!("       Public:  {}", public_path.display());
+        Commands::Pubkey { file } => {
+            let pubkey = crate::client::auth::adb_auth_pubkey(file)?;
+            println!("{pubkey}");
         }
 
         Commands::Remount { reboot } => {
@@ -1926,5 +1911,21 @@ mod tests {
         handle.join().unwrap();
 
         assert!(std::net::TcpStream::connect(&addr).is_err());
+    }
+
+    #[test]
+    fn test_cli_keygen_and_pubkey_subcommands() {
+        use clap::Parser;
+        let keygen_args = Cli::try_parse_from(["adb-rs", "keygen", "my_key"]).unwrap();
+        match keygen_args.command {
+            Commands::Keygen { file } => assert_eq!(file, "my_key"),
+            _ => panic!("expected Keygen"),
+        }
+
+        let pubkey_args = Cli::try_parse_from(["adb-rs", "pubkey", "my_key"]).unwrap();
+        match pubkey_args.command {
+            Commands::Pubkey { file } => assert_eq!(file, "my_key"),
+            _ => panic!("expected Pubkey"),
+        }
     }
 }

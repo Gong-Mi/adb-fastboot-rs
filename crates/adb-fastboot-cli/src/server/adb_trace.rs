@@ -32,6 +32,14 @@ pub fn trace_mask() -> u32 {
     TRACE_MASK.load(Ordering::Relaxed)
 }
 
+/// Number of trace tags in `AdbTrace` enum (AOSP: `AdbTrace::NUM_TRACES`).
+pub const NUM_TRACES: usize = 16;
+
+/// AOSP `get_trace_setting()` (adb_trace.cpp:92-102): returns `ADB_TRACE` env var.
+pub fn get_trace_setting() -> String {
+    std::env::var("ADB_TRACE").unwrap_or_default()
+}
+
 /// Enable a specific trace tag (AOSP: `adb_trace_enable()`).
 pub fn adb_trace_enable(tag: AdbTrace) {
     TRACE_MASK.fetch_or(1 << (tag as u32), Ordering::Relaxed);
@@ -49,7 +57,7 @@ pub fn adb_trace_is_enabled(tag: AdbTrace) -> bool {
 
 /// Parse `ADB_TRACE` env var into trace mask (AOSP: `setup_trace_mask()`).
 pub fn setup_trace_from_env() {
-    let setting = std::env::var("ADB_TRACE").unwrap_or_default();
+    let setting = get_trace_setting();
     if setting.is_empty() {
         return;
     }
@@ -81,6 +89,11 @@ pub fn setup_trace_from_env() {
         }
     }
     TRACE_MASK.store(mask, Ordering::Relaxed);
+}
+
+/// AOSP `setup_trace_mask()` (adb_trace.cpp:110-168).
+pub fn setup_trace_mask() {
+    setup_trace_from_env();
 }
 
 /// Redirect stdout/stderr to a timestamped log file (AOSP: `start_device_log()`).
@@ -133,7 +146,16 @@ macro_rules! vlog {
 
 /// Trace log at ADB level.
 #[macro_export]
-macro_rules! vlog_adb { ($($arg:tt)*) => { vlog!($crate::server::adb_trace::AdbTrace::Adb, $($arg)*) } }
+macro_rules! vlog_adb { ($($arg:tt)*) => { $crate::vlog!($crate::server::adb_trace::AdbTrace::Adb, $($arg)*) } }
+
+/// AOSP `adb_trace_init()` (adb_trace.cpp:170-202): initialize logging,
+/// read trace mask from environment, and emit trace banner if ADB trace enabled.
+pub fn adb_trace_init() {
+    setup_trace_mask();
+    if adb_trace_is_enabled(AdbTrace::Adb) {
+        crate::vlog_adb!("Android Debug Bridge (trace initialized)");
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -196,6 +218,22 @@ mod tests {
         TRACE_MASK.store(0, Ordering::Relaxed);
         setup_trace_from_env();
         assert_eq!(trace_mask(), !0u32);
+        unsafe { std::env::remove_var("ADB_TRACE"); }
+    }
+
+    #[test]
+    fn test_get_trace_setting_and_trace_init() {
+        let _guard = TRACE_ENV_MUTEX.lock().unwrap();
+        assert_eq!(NUM_TRACES, 16);
+
+        unsafe { std::env::set_var("ADB_TRACE", "adb,sync"); }
+        assert_eq!(get_trace_setting(), "adb,sync");
+
+        TRACE_MASK.store(0, Ordering::Relaxed);
+        adb_trace_init();
+        assert!(adb_trace_is_enabled(AdbTrace::Adb));
+        assert!(adb_trace_is_enabled(AdbTrace::Sync));
+        assert!(!adb_trace_is_enabled(AdbTrace::Usb));
         unsafe { std::env::remove_var("ADB_TRACE"); }
     }
 }
