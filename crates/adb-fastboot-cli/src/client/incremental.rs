@@ -1,6 +1,7 @@
 //! Incremental ADB installation (adb install --incremental).
 //!
-//! AOSP source: `vendor/adb/client/incremental_adb_install.cpp`
+//! AOSP sources: `client/adb_install.cpp`, `client/incremental.cpp`,
+//! `client/incremental_utils.cpp`, and `client/incremental_server.cpp`.
 //!
 //! Handles:
 //! - Incremental APK installation using the Incremental File System (IncFS)
@@ -8,9 +9,10 @@
 //! - Reduces install time for large APKs by allowing apps to start before
 //!   the full APK is transferred
 //!
-//! Current implementation: wraps the standard install path with IncFS-compatible
-//! flags. Full IncFS chunked streaming requires kernel-level IncFS support and
-//! is a future enhancement.
+//! Current status: AOSP Incremental File System installation is not implemented.
+//! This module refuses explicit incremental requests instead of pretending that
+//! `pm install --incremental` plus a `/proc/fs/incfs` probe implements AOSP's
+//! signature/database/inc-server/`abb_exec` protocol.
 
 use std::path::Path;
 
@@ -19,10 +21,11 @@ use adb_protocol::Transport;
 use super::adb_install::{InstallOptions, install_apk, install_multiple};
 use super::line_printer::LinePrinter;
 
-/// Whether the device supports IncFS (Incremental File System).
-/// Determined by checking for the incfs feature in the device's
-/// sysfs or kernel version.
-pub fn supports_incfs(transport: &mut dyn Transport) -> Result<bool, Box<dyn std::error::Error>> {
+/// Advisory kernel-state probe only: a visible `/proc/fs/incfs` entry does not
+/// establish that AOSP incremental installation is usable. AOSP additionally
+/// requires the `abb_exec` path, v4 signature validation, a database and the
+/// incremental server; this helper must not be used to select an install mode.
+pub fn incfs_mountpoint_visible(transport: &mut dyn Transport) -> Result<bool, Box<dyn std::error::Error>> {
     use super::protocol::open_service;
     use adb_protocol::AdbMessageHeader;
     use adb_protocol::A_CLSE;
@@ -91,68 +94,10 @@ pub fn install_apk_incremental(
     options: &IncrementalOptions,
     printer: &mut LinePrinter,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !options.incremental {
-        // If not incremental, use standard install
-        return install_apk(transport, local_apk, &options.install_opts, printer);
+    if options.incremental {
+        return Err("Incremental ADB install is not implemented: refusing to substitute `pm install --incremental` for AOSP's signature/database/inc-server pipeline".into());
     }
-
-    // Check IncFS support
-    if !supports_incfs(transport)? {
-        eprintln!("Warning: Device does not support IncFS, falling back to regular install");
-        return install_apk(transport, local_apk, &options.install_opts, printer);
-    }
-
-    // For IncFS install, we use the same push + pm install path with
-    // additional --incremental flag passed to pm install.
-    let _opts = InstallOptions {
-        staging: true,
-        ..options.install_opts.clone()
-    };
-
-    // Push and install with incremental hint
-    let staging = "/data/local/tmp";
-    let remote_path =
-        super::adb_install::push_apk(transport, local_apk, staging, printer)?;
-
-    // Try pm install with --incremental first
-    let cmd = format!("pm install --incremental \"{remote_path}\"");
-
-    use super::protocol::open_service;
-    use adb_protocol::AdbMessageHeader;
-    use adb_protocol::{A_CLSE, A_OKAY, A_WRTE};
-
-    let dest = format!("shell,v2,raw:{cmd}");
-    let (local_id, _remote_id) = open_service(transport, &dest, 2)?;
-
-    let mut output = Vec::new();
-    loop {
-        let (hdr, payload) = transport.recv_message()?;
-        match hdr.command {
-            A_OKAY => {}
-            A_WRTE => {
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                output.extend_from_slice(&payload);
-            }
-            A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    let output_str = String::from_utf8_lossy(&output);
-    if output_str.contains("Success") || output_str.contains("success") {
-        Ok(())
-    } else if output_str.contains("not supported") || output_str.contains("Unknown") {
-        // Fallback to regular install
-        eprintln!("Warning: Incremental install not supported, retrying standard install");
-        install_apk(transport, local_apk, &options.install_opts, printer)
-    } else {
-        Err(format!("Incremental install failed: {output_str}").into())
-    }
+    install_apk(transport, local_apk, &options.install_opts, printer)
 }
 
 /// Install multiple APKs incrementally.
@@ -162,13 +107,88 @@ pub fn install_multiple_incremental(
     options: &IncrementalOptions,
     printer: &mut LinePrinter,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !options.incremental || !supports_incfs(transport)? {
-        return install_multiple(transport, apks, &options.install_opts, printer);
+    if options.incremental {
+        return Err("Incremental ADB multi-package install is not implemented: refusing to install packages individually or pass a superficial `--incremental` flag".into());
+    }
+    install_multiple(transport, apks, &options.install_opts, printer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adb_protocol::{AdbMessageHeader, TransportError};
+    use std::io::{Read, Write};
+
+    #[derive(Default)]
+    struct NoWireTransport {
+        sent_messages: usize,
     }
 
-    // For IncFS multi-install, install each APK incrementally
-    for apk in apks {
-        install_apk_incremental(transport, apk, options, printer)?;
+    impl Read for NoWireTransport {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
     }
-    Ok(())
+
+    impl Write for NoWireTransport {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Transport for NoWireTransport {
+        fn send_message(
+            &mut self,
+            _header: &AdbMessageHeader,
+            _payload: &[u8],
+        ) -> Result<(), TransportError> {
+            self.sent_messages += 1;
+            Ok(())
+        }
+
+        fn recv_message(&mut self) -> Result<(AdbMessageHeader, Vec<u8>), TransportError> {
+            Err(TransportError::Protocol("unexpected wire read".to_string()))
+        }
+    }
+
+    #[test]
+    fn explicit_incremental_request_is_rejected_before_opening_a_service() {
+        let mut transport = NoWireTransport::default();
+        let options = IncrementalOptions { incremental: true, ..Default::default() };
+        let mut printer = LinePrinter::new();
+        let error = install_apk_incremental(
+            &mut transport,
+            Path::new("not-read.apk"),
+            &options,
+            &mut printer,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("not implemented"));
+        assert_eq!(transport.sent_messages, 0);
+    }
+
+    #[test]
+    fn explicit_incremental_multi_request_is_rejected_before_opening_a_service() {
+        let mut transport = NoWireTransport::default();
+        let options = IncrementalOptions { incremental: true, ..Default::default() };
+        let mut printer = LinePrinter::new();
+        let paths = [Path::new("one.apk"), Path::new("two.apk")];
+        let error = install_multiple_incremental(
+            &mut transport,
+            &paths,
+            &options,
+            &mut printer,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("not implemented"));
+        assert_eq!(transport.sent_messages, 0);
+    }
 }
