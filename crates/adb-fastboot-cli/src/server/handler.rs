@@ -655,7 +655,7 @@ mod tests {
         let length = usize::from_str_radix(std::str::from_utf8(&length).unwrap(), 16).unwrap();
         let mut payload = vec![0u8; length];
         client.read_exact(&mut payload).unwrap();
-        assert_eq!(std::str::from_utf8(&payload).unwrap(), format!("[::1]:{}", device_addr.port()));
+        assert_eq!(std::str::from_utf8(&payload).unwrap(), format!("connected to [::1]:{}", device_addr.port()));
 
         server.join().unwrap();
         device.join().unwrap();
