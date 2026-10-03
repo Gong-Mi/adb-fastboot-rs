@@ -338,8 +338,8 @@ fn push_apk_to_path(
 
     let mut send_buf = Vec::new();
     build_sync_send_req(remote_path, 0x81a4, &mut send_buf)?;
+    // A_OKAY only acknowledges WRTE(SEND); SYNC_OKAY is the final result.
     send_wrte(transport, local_id, remote_id, &send_buf)?;
-    recv_sync_response(transport, local_id, remote_id)?;
 
     let mut chunk_buf = vec![0u8; SYNC_DATA_MAX];
     let mut bytes_sent = 0u64;
@@ -804,7 +804,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use adb_protocol::{SyncMessageHeader, TransportError, SYNC_OKAY};
+    use adb_protocol::{SyncMessageHeader, TransportError, SYNC_DATA, SYNC_DONE, SYNC_FAIL, SYNC_OKAY, SYNC_SEND};
+
+    #[derive(Clone, Copy)]
+    enum SyncOutcome { Okay, Fail, Disconnect }
 
     struct FakeTransport {
         incoming: VecDeque<(AdbMessageHeader, Vec<u8>)>,
@@ -814,6 +817,10 @@ mod tests {
         next_session_id: u32,
         active_stream: Option<(String, usize, Vec<u8>)>,
         streamed_splits: Vec<(String, Vec<u8>)>,
+        expected_pushes: VecDeque<(String, Vec<u8>)>,
+        active_sync: Option<(String, Vec<u8>, Vec<u8>)>,
+        staged_apks: Vec<(String, Vec<u8>)>,
+        sync_outcome: SyncOutcome,
         close_pending: bool,
         host_close_response_pending: bool,
     }
@@ -828,6 +835,10 @@ mod tests {
                 next_session_id: 42,
                 active_stream: None,
                 streamed_splits: Vec::new(),
+                expected_pushes: VecDeque::new(),
+                active_sync: None,
+                staged_apks: Vec::new(),
+                sync_outcome: SyncOutcome::Okay,
                 close_pending: false,
                 host_close_response_pending: false,
             }
@@ -840,10 +851,54 @@ mod tests {
             ));
         }
 
-        fn enqueue_sync_okay(&mut self, remote_id: u32, local_id: u32) {
-            let mut payload = [0u8; SyncMessageHeader::SIZE];
-            SyncMessageHeader::new(SYNC_OKAY, 0).encode(&mut payload);
-            self.enqueue(A_WRTE, remote_id, local_id, &payload);
+        fn expect_pushes(&mut self, paths: &[PathBuf]) {
+            self.expected_pushes = paths.iter().map(|path| (
+                format!("/data/local/tmp/{}", path.file_name().unwrap().to_str().unwrap()),
+                fs::read(path).unwrap(),
+            )).collect();
+        }
+
+        fn accept_sync(&mut self, payload: &[u8], remote_id: u32, local_id: u32) {
+            let header = SyncMessageHeader::decode(payload).unwrap();
+            let data = &payload[8..];
+            match header.id {
+                SYNC_SEND => {
+                    assert!(self.active_sync.is_none());
+                    assert_eq!(header.length as usize, data.len());
+                    let (path, bytes) = self.expected_pushes.pop_front().expect("unexpected staged SEND");
+                    assert_eq!(data, format!("{path},{}", 0x81a4).as_bytes());
+                    self.active_sync = Some((path, bytes, Vec::new()));
+                    // A_OKAY was queued by send_message; there is no SYNC_OKAY here.
+                }
+                SYNC_DATA => {
+                    assert_eq!(header.length as usize, data.len());
+                    assert!(data.len() <= SYNC_DATA_MAX);
+                    let (_, expected, received) = self.active_sync.as_mut().expect("DATA before SEND");
+                    received.extend_from_slice(data);
+                    assert!(received.len() <= expected.len());
+                    assert_eq!(received.as_slice(), &expected[..received.len()]);
+                }
+                SYNC_DONE => {
+                    assert_eq!(header.length, 0, "staged DONE mtime changed");
+                    assert!(data.is_empty());
+                    let (path, expected, received) = self.active_sync.take().expect("DONE before SEND");
+                    assert_eq!(received, expected, "incomplete staged APK");
+                    self.staged_apks.push((path, received));
+                    let (id, message): (u32, &[u8]) = match self.sync_outcome {
+                        SyncOutcome::Okay => (SYNC_OKAY, b""),
+                        SyncOutcome::Fail => (SYNC_FAIL, b"staging rejected"),
+                        SyncOutcome::Disconnect => {
+                            self.enqueue(A_CLSE, remote_id, local_id, &[]);
+                            self.close_pending = true;
+                            return;
+                        }
+                    };
+                    let mut header = [0u8; 8];
+                    SyncMessageHeader::new(id, message.len() as u32).encode(&mut header);
+                    self.enqueue(A_WRTE, remote_id, local_id, &[header.as_slice(), message].concat());
+                }
+                other => panic!("unexpected staged SYNC request {other:#x}"),
+            }
         }
 
         fn shell_output(&mut self, command: &str) -> Vec<u8> {
@@ -930,11 +985,7 @@ mod tests {
                             self.enqueue(A_CLSE, REMOTE_ID, header.arg0, &[]);
                         }
                         Some(false) => {}
-                        None => {
-                            if payload.starts_with(b"SEND") || payload.starts_with(b"DONE") {
-                                self.enqueue_sync_okay(REMOTE_ID, header.arg0);
-                            }
-                        }
+                        None => self.accept_sync(payload, REMOTE_ID, header.arg0),
                     }
                 }
                 A_CLSE => {
@@ -1006,6 +1057,7 @@ mod tests {
         let (root, paths) = fixture_apks();
         let references: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
         let mut peer = FakeTransport::new(false);
+        peer.expect_pushes(&paths);
         let mut printer = LinePrinter::new();
         let options = InstallOptions {
             reinstall: true,
@@ -1034,6 +1086,8 @@ mod tests {
         assert!(!commands.iter().any(|command| command.contains("pm install-abandon")));
         assert!(!peer.close_pending);
         assert!(!peer.host_close_response_pending);
+        assert_eq!(peer.staged_apks.iter().map(|(_, bytes)| bytes.as_slice()).collect::<Vec<_>>(), [b"base".as_slice(), b"split!".as_slice()]);
+        assert!(peer.expected_pushes.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1042,6 +1096,7 @@ mod tests {
         let (root, paths) = fixture_apks();
         let references: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
         let mut peer = FakeTransport::new(true);
+        peer.expect_pushes(&paths);
         let mut printer = LinePrinter::new();
         let result = install_multiple(
             &mut peer,
@@ -1292,6 +1347,7 @@ mod tests {
     fn install_apk_push_mode_uses_sync_then_exec_pm_and_cleans_up() {
         let (root, paths) = fixture_apks();
         let mut peer = FakeTransport::new(false);
+        peer.expect_pushes(&paths);
         let mut printer = LinePrinter::new();
         install_apk(
             &mut peer,
@@ -1309,6 +1365,37 @@ mod tests {
             service == "exec:rm '/data/local/tmp/base.apk' </dev/null"
         }));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_send_propagates_fail_and_disconnect_before_install_or_commit() {
+        for outcome in [SyncOutcome::Fail, SyncOutcome::Disconnect] {
+            let (root, paths) = fixture_apks();
+            let mut peer = FakeTransport::new(false);
+            peer.expect_pushes(&paths);
+            peer.sync_outcome = outcome;
+            let mut printer = LinePrinter::new();
+            let error = install_apk(&mut peer, &paths[0], &InstallOptions::default(), &mut printer)
+                .unwrap_err().to_string();
+            assert!(error.contains("staging rejected") || error.contains("closed"), "{error}");
+            assert_eq!(peer.opened_services, ["sync:"]);
+            assert_eq!(peer.staged_apks[0].1, b"base");
+
+            let mut peer = FakeTransport::new(false);
+            peer.expect_pushes(&paths);
+            peer.sync_outcome = outcome;
+            let references: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+            assert!(install_multiple(&mut peer, &references, &InstallOptions::default(), &mut printer).is_err());
+            let commands = shell_commands(&peer);
+            // Staging happens before session creation: preserve cleanup of all
+            // planned paths, but never create/write/commit/abandon a session.
+            assert_eq!(commands, [
+                "rm '/data/local/tmp/base.apk' </dev/null",
+                "rm '/data/local/tmp/split'\\''cfg.apk' </dev/null",
+            ]);
+            assert_eq!(peer.staged_apks.len(), 1);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
