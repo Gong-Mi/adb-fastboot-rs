@@ -530,20 +530,26 @@ impl UsbfsFastbootDevice {
 // BulkIo implementation — no ZLP, short read/write allowed per AOSP
 // ---------------------------------------------------------------------------
 
-impl BulkIo for UsbfsFastbootDevice {
-    fn descriptor(&self) -> &UsbDescriptor {
-        &self.descriptor
-    }
-
-    fn bulk_read(
+// One implementation builds the real ioctl request and interprets its result.
+// Tests replace only the syscall, below BulkIo; descriptor/length/timeout and
+// the production backend-to-Read/Write adapter paths remain unchanged.
+impl UsbfsFastbootDevice {
+    fn bulk_read_with<F>(
         &mut self,
         endpoint: UsbEndpointInfo,
         buf: &mut [u8],
-    ) -> Result<usize, UsbTransportError> {
+        mut ioctl: F,
+    ) -> Result<usize, UsbTransportError>
+    where
+        F: FnMut(RawFd, &mut UsbdevfsBulkTransfer) -> io::Result<i32>,
+    {
         if endpoint.direction != UsbEndpointDirection::In {
             return Err(UsbTransportError::InvalidDescriptor {
                 reason: "bulk read endpoint is not IN".into(),
             });
+        }
+        if buf.is_empty() {
+            return Ok(0);
         }
         let timeout_ms = self.timeout.as_millis().min(u32::MAX as u128) as u32;
         let len = buf.len().min(16 * 1024); // AOSP read cap: 16 KiB
@@ -554,22 +560,29 @@ impl BulkIo for UsbfsFastbootDevice {
             _pad: 0,
             data: buf.as_mut_ptr(),
         };
-        let rc = unsafe { usbdevfs_ioctl(self.fd.as_raw_fd(), USBDEVFS_BULK, &mut bulk as *mut _) };
+        let rc = ioctl(self.fd.as_raw_fd(), &mut bulk);
         match rc {
-            Ok(_) => Ok(bulk.len as usize),
+            Ok(count) => checked_bulk_count(count, len),
             Err(e) => Err(map_io_error(e)),
         }
     }
 
-    fn bulk_write(
+    fn bulk_write_with<F>(
         &mut self,
         endpoint: UsbEndpointInfo,
         buf: &[u8],
-    ) -> Result<usize, UsbTransportError> {
+        mut ioctl: F,
+    ) -> Result<usize, UsbTransportError>
+    where
+        F: FnMut(RawFd, &mut UsbdevfsBulkTransfer) -> io::Result<i32>,
+    {
         if endpoint.direction != UsbEndpointDirection::Out {
             return Err(UsbTransportError::InvalidDescriptor {
                 reason: "bulk write endpoint is not OUT".into(),
             });
+        }
+        if buf.is_empty() {
+            return Ok(0);
         }
         // USBDEVFS_BULK needs a mutable pointer even for writes.
         let timeout_ms = self.timeout.as_millis().min(u32::MAX as u128) as u32;
@@ -582,11 +595,50 @@ impl BulkIo for UsbfsFastbootDevice {
             _pad: 0,
             data: buf_copy.as_mut_ptr(),
         };
-        let rc = unsafe { usbdevfs_ioctl(self.fd.as_raw_fd(), USBDEVFS_BULK, &mut bulk as *mut _) };
+        let rc = ioctl(self.fd.as_raw_fd(), &mut bulk);
         match rc {
-            Ok(_) => Ok(bulk.len as usize),
+            Ok(count) => checked_bulk_count(count, chunk_len),
             Err(e) => Err(map_io_error(e)),
         }
+    }
+}
+
+// USBDEVFS_BULK returns the actual byte count. The struct's len is the
+// requested capacity, not an output count (AOSP usb_linux.cpp Read/Write).
+fn checked_bulk_count(count: i32, capacity: usize) -> Result<usize, UsbTransportError> {
+    let received = usize::try_from(count).map_err(|_| UsbTransportError::Backend {
+        operation: "bulk transfer",
+        message: format!("usbfs returned negative byte count {count}"),
+    })?;
+    if received > capacity {
+        return Err(UsbTransportError::InvalidTransfer { received, capacity });
+    }
+    Ok(received)
+}
+
+impl BulkIo for UsbfsFastbootDevice {
+    fn descriptor(&self) -> &UsbDescriptor {
+        &self.descriptor
+    }
+
+    fn bulk_read(
+        &mut self,
+        endpoint: UsbEndpointInfo,
+        buf: &mut [u8],
+    ) -> Result<usize, UsbTransportError> {
+        self.bulk_read_with(endpoint, buf, |fd, bulk| unsafe {
+            usbdevfs_ioctl(fd, USBDEVFS_BULK, bulk as *mut _)
+        })
+    }
+
+    fn bulk_write(
+        &mut self,
+        endpoint: UsbEndpointInfo,
+        buf: &[u8],
+    ) -> Result<usize, UsbTransportError> {
+        self.bulk_write_with(endpoint, buf, |fd, bulk| unsafe {
+            usbdevfs_ioctl(fd, USBDEVFS_BULK, bulk as *mut _)
+        })
     }
 }
 
@@ -683,8 +735,189 @@ fn map_io_error(e: io::Error) -> UsbTransportError {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (compile-only — requires real hardware for usbfs)
+// Tests — syscall injection covers the production request/count boundary;
+// physical USB access and kernel/device behaviour remain separate evidence.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod bulk_syscall_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+
+    fn device() -> UsbfsFastbootDevice {
+        UsbfsFastbootDevice {
+            // Merely hold a valid fd. Every transfer below replaces the syscall,
+            // so these tests never enumerate, claim, or access a USB device.
+            fd: File::open("/dev/null").unwrap(),
+            descriptor: build_descriptor(2, 1, (0x81, 512), (0x02, 512)),
+            serial: Some("injected-only".into()),
+            bus_number: 0,
+            address: 0,
+            timeout: Duration::from_millis(123),
+        }
+    }
+
+    #[test]
+    fn bulk_read_uses_syscall_count_and_preserves_unread_bytes() {
+        let mut device = device();
+        let endpoint = device.descriptor.bulk_in.unwrap();
+        let mut buf = [0xa5; 64];
+        let n = device.bulk_read_with(endpoint, &mut buf, |_, request| {
+            assert_eq!(request.ep, 0x81);
+            assert_eq!(request.len, 64);
+            assert_eq!(request.timeout, 123);
+            unsafe { std::ptr::copy_nonoverlapping(b"abc".as_ptr(), request.data, 3) };
+            // usbfs leaves the requested length intact and returns the actual n.
+            Ok(3)
+        }).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..n], b"abc");
+        assert!(buf[n..].iter().all(|&byte| byte == 0xa5));
+    }
+
+    #[test]
+    fn bulk_write_uses_syscall_count_not_request_length() {
+        let mut device = device();
+        let endpoint = device.descriptor.bulk_out.unwrap();
+        let n = device.bulk_write_with(endpoint, b"abcdef", |_, request| {
+            assert_eq!(request.ep, 0x02);
+            assert_eq!(request.len, 6);
+            assert_eq!(request.timeout, 123);
+            let data = unsafe { std::slice::from_raw_parts(request.data, request.len as usize) };
+            assert_eq!(data, b"abcdef");
+            Ok(2)
+        }).unwrap();
+        assert_eq!(n, 2);
+    }
+
+    struct InjectedBackend {
+        device: UsbfsFastbootDevice,
+        write_results: VecDeque<Result<i32, i32>>,
+        requests: Vec<Vec<u8>>,
+        accepted: Vec<u8>,
+        reads: VecDeque<Vec<u8>>,
+    }
+
+    impl InjectedBackend {
+        fn writes(results: impl IntoIterator<Item = Result<i32, i32>>) -> Self {
+            Self {
+                device: device(), write_results: results.into_iter().collect(),
+                requests: Vec::new(), accepted: Vec::new(), reads: VecDeque::new(),
+            }
+        }
+    }
+
+    impl BulkIo for InjectedBackend {
+        fn descriptor(&self) -> &UsbDescriptor { &self.device.descriptor }
+
+        fn bulk_read(&mut self, endpoint: UsbEndpointInfo, buf: &mut [u8]) -> Result<usize, UsbTransportError> {
+            let bytes = self.reads.pop_front().unwrap_or_default();
+            self.device.bulk_read_with(endpoint, buf, |_, request| {
+                assert!(bytes.len() <= request.len as usize);
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), request.data, bytes.len()) };
+                Ok(bytes.len() as i32)
+            })
+        }
+
+        fn bulk_write(&mut self, endpoint: UsbEndpointInfo, buf: &[u8]) -> Result<usize, UsbTransportError> {
+            let outcome = self.write_results.pop_front().expect("unexpected extra ioctl");
+            let requests = &mut self.requests;
+            let accepted = &mut self.accepted;
+            self.device.bulk_write_with(endpoint, buf, |_, request| {
+                let bytes = unsafe { std::slice::from_raw_parts(request.data, request.len as usize) };
+                requests.push(bytes.to_vec());
+                match outcome {
+                    Ok(n) => {
+                        if n >= 0 && n as usize <= bytes.len() { accepted.extend_from_slice(&bytes[..n as usize]); }
+                        Ok(n)
+                    }
+                    Err(errno) => Err(io::Error::from_raw_os_error(errno)),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn adapter_retries_only_unwritten_suffix_using_real_backend_count_logic() {
+        let backend = InjectedBackend::writes([Ok(2), Ok(1), Ok(3)]);
+        let mut transport = crate::FastbootUsbTransport::new(backend).unwrap();
+        transport.write_all(b"abcdef").unwrap();
+        let backend = transport.into_inner();
+        assert_eq!(backend.requests, [b"abcdef".to_vec(), b"cdef".to_vec(), b"def".to_vec()]);
+        assert_eq!(backend.accepted, b"abcdef");
+        assert!(backend.write_results.is_empty());
+    }
+
+    #[test]
+    fn adapter_zero_write_and_error_after_partial_write_fail_without_extra_io() {
+        for outcome in [Ok(0), Err(libc::EIO), Err(libc::ETIMEDOUT), Err(libc::ENODEV), Err(libc::EINTR)] {
+            let backend = InjectedBackend::writes([Ok(2), outcome, Ok(4)]);
+            let mut transport = crate::FastbootUsbTransport::new(backend).unwrap();
+            let error = transport.write_all(b"abcdef").unwrap_err();
+            if outcome == Ok(0) { assert_eq!(error.kind(), io::ErrorKind::WriteZero); }
+            let backend = transport.into_inner();
+            assert_eq!(backend.accepted, b"ab");
+            assert_eq!(backend.requests, [b"abcdef".to_vec(), b"cdef".to_vec()]);
+            assert_eq!(backend.write_results.len(), 1, "no next transfer after failure");
+        }
+    }
+
+    #[test]
+    fn adapter_short_read_then_zero_is_eof_not_fabricated_data() {
+        let mut backend = InjectedBackend::writes([]);
+        backend.reads.push_back(b"abc".to_vec());
+        backend.reads.push_back(Vec::new());
+        let mut transport = crate::FastbootUsbTransport::new(backend).unwrap();
+        let mut bytes = [0xa5; 8];
+        assert_eq!(transport.read(&mut bytes).unwrap(), 3);
+        assert_eq!(&bytes[..3], b"abc");
+        assert_eq!(&bytes[3..], &[0xa5; 5]);
+        assert_eq!(transport.read_exact(&mut bytes).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn syscall_count_is_bounded_by_capped_request_not_caller_buffer() {
+        let mut device = device();
+        let in_ep = device.descriptor.bulk_in.unwrap();
+        let out_ep = device.descriptor.bulk_out.unwrap();
+        let mut bytes = vec![0; 32 * 1024];
+        let error = device.bulk_read_with(in_ep, &mut bytes, |_, request| {
+            assert_eq!(request.len, 16 * 1024);
+            Ok(16 * 1024 + 1)
+        }).unwrap_err();
+        assert_eq!(error, UsbTransportError::InvalidTransfer { received: 16 * 1024 + 1, capacity: 16 * 1024 });
+        let error = device.bulk_write_with(out_ep, &vec![0; 512 * 1024], |_, request| {
+            assert_eq!(request.len, 256 * 1024);
+            Ok(256 * 1024 + 1)
+        }).unwrap_err();
+        assert_eq!(error, UsbTransportError::InvalidTransfer { received: 256 * 1024 + 1, capacity: 256 * 1024 });
+    }
+
+    #[test]
+    fn empty_transfers_and_wrong_direction_never_call_ioctl() {
+        let mut device = device();
+        let in_ep = device.descriptor.bulk_in.unwrap();
+        let out_ep = device.descriptor.bulk_out.unwrap();
+        assert_eq!(device.bulk_read_with(in_ep, &mut [], |_, _| panic!("empty read ioctl")).unwrap(), 0);
+        assert_eq!(device.bulk_write_with(out_ep, &[], |_, _| panic!("empty write ioctl")).unwrap(), 0);
+        assert!(device.bulk_read_with(out_ep, &mut [0; 8], |_, _| panic!("wrong-direction ioctl")).is_err());
+        assert!(device.bulk_write_with(in_ep, b"data", |_, _| panic!("wrong-direction ioctl")).is_err());
+    }
+
+    #[test]
+    fn syscall_errors_propagate_without_inventing_a_success_count() {
+        let mut device = device();
+        let in_ep = device.descriptor.bulk_in.unwrap();
+        let out_ep = device.descriptor.bulk_out.unwrap();
+        for errno in [libc::EACCES, libc::ETIMEDOUT, libc::EAGAIN, libc::ENODEV, libc::EINTR, libc::EIO] {
+            assert!(device.bulk_read_with(in_ep, &mut [0; 64], |_, _| Err(io::Error::from_raw_os_error(errno))).is_err());
+            assert!(device.bulk_write_with(out_ep, b"payload", |_, _| Err(io::Error::from_raw_os_error(errno))).is_err());
+        }
+        assert!(device.bulk_read_with(in_ep, &mut [0; 64], |_, _| Ok(-1)).is_err());
+        assert!(device.bulk_write_with(out_ep, b"payload", |_, _| Ok(-1)).is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {
