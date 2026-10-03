@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+  # Stacked topic PRs must be checked even when their base is not main.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -38,6 +38,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}-${{ matrix.features }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Verify CI failure propagation
+        run: python3 .github/scripts/test_ci_gate.py
+
       - name: Check (default ${{ matrix.features }})
         run: cargo check --workspace ${{ matrix.features }}
 
@@ -63,6 +66,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build pkg-config libusb-1.0-0-dev libudev-dev
-      # Advisory only: does not gate merges yet (pre-existing warnings).
-      - name: Clippy (advisory)
-        run: cargo clippy --workspace --all-features 2>&1 | tail -40
+      # Keep warnings advisory, but propagate compiler/deny-level failures.
+      - name: Clippy
+        run: cargo clippy --workspace --all-features
