@@ -308,24 +308,16 @@ impl std::fmt::Debug for UsbfsFastbootDevice {
 }
 
 impl UsbfsFastbootDevice {
-    /// Try to open the first Fastboot USB device found.
+    /// Open the unique Fastboot USB device, rejecting ambiguous enumeration.
     pub fn open_first() -> Result<Self, UsbAndroidError> {
         let candidates = Self::enumerate()?;
-        match candidates.len() {
-            0 => Err(UsbAndroidError::NoDevice),
-            _ => candidates.into_iter().next().unwrap().open(),
-        }
+        open_selected_with(candidates, None, FastbootDeviceCandidate::open)
     }
 
     /// Open by a specific serial number string.
     pub fn open_by_serial(serial: &str) -> Result<Self, UsbAndroidError> {
         let candidates = Self::enumerate()?;
-        for cand in &candidates {
-            if cand.serial.as_deref() == Some(serial) {
-                return cand.clone().open();
-            }
-        }
-        Err(UsbAndroidError::NoDevice)
+        open_selected_with(candidates, Some(serial), FastbootDeviceCandidate::open)
     }
 
     /// Open by a specific bus:address tuple.
@@ -612,12 +604,47 @@ pub struct FastbootDeviceCandidate {
     pub(crate) descriptor: UsbDescriptor,
 }
 
+// Both production open paths share selection and opening; deterministic tests
+// inject only the enumerated candidates and opener, never an alternate policy.
+fn open_selected_with<D>(
+    candidates: Vec<FastbootDeviceCandidate>,
+    serial: Option<&str>,
+    mut open: impl FnMut(FastbootDeviceCandidate) -> Result<D, UsbAndroidError>,
+) -> Result<D, UsbAndroidError> {
+    let mut matching = candidates.into_iter().filter(|candidate| {
+        serial.is_none() || candidate.serial.as_deref() == serial
+    });
+    let candidate = matching.next().ok_or(UsbAndroidError::NoDevice)?;
+    if matching.next().is_some() {
+        return Err(UsbAndroidError::AmbiguousDevices);
+    }
+    open(candidate)
+}
+
 impl FastbootDeviceCandidate {
     /// Open this candidate and return a fully‑claimed `UsbfsFastbootDevice`.
     pub fn open(self) -> Result<UsbfsFastbootDevice, UsbAndroidError> {
         let dev_path = format!("/dev/bus/usb/{:03}/{:03}", self.bus_number, self.address);
-        UsbfsFastbootDevice::open_device_node(&dev_path, self.bus_number, self.address)
+        let device = UsbfsFastbootDevice::open_device_node(&dev_path, self.bus_number, self.address)?;
+        // Enumeration and open are separate moments. Never begin bulk I/O if
+        // the node now reports another identity (for example after hotplug).
+        verify_opened_serial(self.serial.as_deref(), device.serial.as_deref())?;
+        if device.descriptor != self.descriptor {
+            return Err(UsbAndroidError::Descriptor(UsbTransportError::InvalidDescriptor {
+                reason: "Fastboot interface changed between enumeration and open".into(),
+            }));
+        }
+        Ok(device)
     }
+}
+
+fn verify_opened_serial(expected: Option<&str>, actual: Option<&str>) -> Result<(), UsbAndroidError> {
+    if expected != actual {
+        return Err(UsbAndroidError::Descriptor(UsbTransportError::NoMatchingDevice {
+            selector: expected.unwrap_or("device with no serial").into(),
+        }));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +655,8 @@ impl FastbootDeviceCandidate {
 pub enum UsbAndroidError {
     #[error("USB Fastboot device not found")]
     NoDevice,
+    #[error("multiple Fastboot USB devices match; select one unique serial with -s")]
+    AmbiguousDevices,
     #[error("USB permission denied")]
     PermissionDenied,
     #[error("USB descriptor parse error: {0}")]
@@ -660,6 +689,61 @@ fn map_io_error(e: io::Error) -> UsbTransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selection_candidates(serials: &[&str]) -> Vec<FastbootDeviceCandidate> {
+        serials.iter().enumerate().map(|(index, serial)| FastbootDeviceCandidate {
+            bus_number: 1, address: index as u8 + 1, serial: Some((*serial).into()),
+            descriptor: build_descriptor(2, 1, (0x81, 512), (0x02, 512)),
+        }).collect()
+    }
+
+    #[test]
+    fn target_selection_opens_only_explicit_b_and_never_falls_back() {
+        let mut opened = Vec::new();
+        let selected = open_selected_with(selection_candidates(&["A", "B"]), Some("B"), |candidate| {
+            opened.push(candidate.serial.clone().unwrap());
+            Ok(candidate.address)
+        }).unwrap();
+        assert_eq!(selected, 2);
+        assert_eq!(opened, ["B"]);
+        opened.clear();
+        assert!(open_selected_with(selection_candidates(&["A"]), Some("B"), |candidate| {
+            opened.push(candidate.serial.unwrap()); Ok(())
+        }).is_err());
+        assert!(opened.is_empty());
+    }
+
+    #[test]
+    fn target_selection_ambiguous_or_duplicate_identity_opens_nothing() {
+        for (serials, selector) in [(&["A", "B"][..], None), (&["B", "B"][..], Some("B"))] {
+            let mut opened = Vec::new();
+            assert!(open_selected_with(selection_candidates(serials), selector, |candidate| {
+                opened.push(candidate.serial); Ok(())
+            }).is_err());
+            assert!(opened.is_empty());
+        }
+    }
+
+    #[test]
+    fn target_selection_rejects_changed_identity_after_open() {
+        assert!(verify_opened_serial(Some("B"), Some("B")).is_ok());
+        assert!(verify_opened_serial(None, None).is_ok());
+        assert!(verify_opened_serial(Some("B"), Some("A")).is_err());
+        assert!(verify_opened_serial(Some("B"), None).is_err());
+        assert!(verify_opened_serial(None, Some("A")).is_err());
+    }
+
+    #[test]
+    fn target_selection_unique_and_empty_device_sets() {
+        assert_eq!(open_selected_with(selection_candidates(&["B"]), None, |candidate| Ok(candidate.serial)).unwrap(), Some("B".into()));
+        assert!(open_selected_with::<()>(Vec::new(), None, |_| panic!("empty set must not open")).is_err());
+        let mut opened = 0;
+        let error = open_selected_with::<()>(selection_candidates(&["A", "B"]), Some("B"), |_| {
+            opened += 1; Err(UsbAndroidError::PermissionDenied)
+        }).unwrap_err();
+        assert!(matches!(error, UsbAndroidError::PermissionDenied));
+        assert_eq!(opened, 1, "selected-device open failure must not try A");
+    }
 
     #[test]
     fn usbdevfs_bulktransfer_layout() {
