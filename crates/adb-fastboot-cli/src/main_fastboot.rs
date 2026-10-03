@@ -510,6 +510,42 @@ impl std::io::Write for FastbootConnection {
     }
 }
 
+// Keep response dispatch transport-aware even inside T: FastbootTransport helpers.
+impl FastbootTransport for FastbootConnection {
+    fn send_cmd(&mut self, cmd: &str) -> Result<(), fastboot_protocol::FastbootTransportError> {
+        match self {
+            Self::Tcp(transport) => transport.send_cmd(cmd),
+            Self::Udp(transport) => transport.send_cmd(cmd),
+            #[cfg(feature = "usb")]
+            Self::Usb(transport) => transport.send_cmd(cmd),
+        }
+    }
+
+    fn recv_response_with_info(
+        &mut self,
+        info_logs: &mut Vec<String>,
+    ) -> Result<fastboot_protocol::FastbootResponse, fastboot_protocol::FastbootTransportError> {
+        match self {
+            Self::Tcp(transport) => transport.recv_response_with_info(info_logs),
+            Self::Udp(transport) => transport.recv_response_with_info(info_logs),
+            #[cfg(feature = "usb")]
+            Self::Usb(transport) => transport.recv_response_with_info(info_logs),
+        }
+    }
+}
+
+fn require_terminal_okay(
+    response: &fastboot_protocol::FastbootResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match response {
+        fastboot_protocol::FastbootResponse::Okay(_) => Ok(()),
+        fastboot_protocol::FastbootResponse::Fail(reason) => {
+            Err(format!("remote failure: {reason}").into())
+        }
+        other => Err(format!("unexpected terminal response: {other:?}").into()),
+    }
+}
+
 fn open_transport(
     usb: bool,
     addr: &str,
@@ -851,7 +887,9 @@ fn fetch_to_file(
             remaining -= read_size;
         }
         output.sync_data()?;
-        return Ok(transport.recv_response()?);
+        let response = transport.recv_response()?;
+        require_terminal_okay(&response)?;
+        return Ok(response);
     }
     let mut current_offset = start;
     let mut remaining = total;
@@ -879,9 +917,7 @@ fn fetch_to_file(
         }
         output.sync_data()?;
         final_response = transport.recv_response()?;
-        if let fastboot_protocol::FastbootResponse::Fail(reason) = &final_response {
-            return Err(format!("fetch failed after receiving data: {reason}").into());
-        }
+        require_terminal_okay(&final_response)?;
         if data_size != chunk_size {
             return Err(format!("fetch returned {data_size} bytes, requested {chunk_size}").into());
         }
@@ -900,19 +936,7 @@ fn recv_data_response(
     operation: &str,
 ) -> Result<fastboot_protocol::FastbootResponse, Box<dyn std::error::Error>> {
     let mut info_logs = Vec::new();
-    let response = match transport {
-        // TCP keeps response bytes read ahead of DATA in its internal buffer. Calling
-        // the inherent method here is important: the blanket trait implementation
-        // cannot preserve those bytes for the subsequent payload read.
-        FastbootConnection::Tcp(transport) => transport.recv_response_with_info(&mut info_logs)?,
-        FastbootConnection::Udp(transport) => {
-            FastbootTransport::recv_response_with_info(transport, &mut info_logs)?
-        }
-        #[cfg(feature = "usb")]
-        FastbootConnection::Usb(transport) => {
-            FastbootTransport::recv_response_with_info(transport, &mut info_logs)?
-        }
-    };
+    let response = transport.recv_response_with_info(&mut info_logs)?;
     for info in info_logs {
         println!("[fastboot-rs] INFO {}", info);
     }
@@ -931,19 +955,11 @@ fn recv_and_print_info(
     transport: &mut FastbootConnection,
 ) -> Result<fastboot_protocol::FastbootResponse, Box<dyn std::error::Error>> {
     let mut info_logs = Vec::new();
-    let response = match transport {
-        FastbootConnection::Tcp(transport) => transport.recv_response_with_info(&mut info_logs)?,
-        FastbootConnection::Udp(transport) => {
-            FastbootTransport::recv_response_with_info(transport, &mut info_logs)?
-        }
-        #[cfg(feature = "usb")]
-        FastbootConnection::Usb(transport) => {
-            FastbootTransport::recv_response_with_info(transport, &mut info_logs)?
-        }
-    };
+    let response = transport.recv_response_with_info(&mut info_logs)?;
     for info in info_logs {
         println!("[fastboot-rs] INFO {}", info);
     }
+    require_terminal_okay(&response)?;
     Ok(response)
 }
 
@@ -984,7 +1000,10 @@ fn run_reboot(
 
     // A rebooting device may close the connection before returning a status.
     match transport.recv_response() {
-        Ok(response) => println!("[fastboot-rs] Reboot response: {:?}", response),
+        Ok(response) => {
+            require_terminal_okay(&response)?;
+            println!("[fastboot-rs] Reboot response: {:?}", response);
+        }
         Err(error) => eprintln!(
             "[fastboot-rs] Warning: Could not read reboot response (device may be disconnecting): {}",
             error
@@ -1677,6 +1696,7 @@ fn flash_image_file<T: FastbootTransport>(
             let flash_cmd = fastboot_protocol::flash(wire_partition);
             transport.send_cmd(&flash_cmd)?;
             let flash_resp = transport.recv_response()?;
+            require_terminal_okay(&flash_resp)?;
             println!(
                 "[fastboot-rs] Flash response for split chunk {}/{}: {:?}",
                 idx + 1,
@@ -1787,6 +1807,7 @@ fn flash_image_file<T: FastbootTransport>(
         let flash_cmd = fastboot_protocol::flash(wire_partition);
         transport.send_cmd(&flash_cmd)?;
         let flash_resp = transport.recv_response()?;
+        require_terminal_okay(&flash_resp)?;
         println!("[fastboot-rs] Flash response for partition '{}': {:?}", partition_label, flash_resp);
     }
 
@@ -1923,10 +1944,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 //   Finished. Total time: X.XXXs
                 let start = std::time::Instant::now();
                 let mut info_logs = Vec::new();
-                let _resp = transport.recv_response_with_info(&mut info_logs)?;
+                let response = transport.recv_response_with_info(&mut info_logs)?;
                 for info in info_logs {
                     println!("(bootloader) {}", info);
                 }
+                require_terminal_okay(&response)?;
                 let elapsed = start.elapsed();
                 println!("Finished. Total time: {:.3}s", elapsed.as_secs_f64());
             } else {
@@ -2012,6 +2034,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cmd = format!("erase:{}", wire_partition);
             transport.send_cmd(&cmd)?;
             let resp = transport.recv_response()?;
+            require_terminal_okay(&resp)?;
             println!("[fastboot-rs] Erase response: {:?}", resp);
         }
         Commands::Reboot { target } => run_reboot(use_usb, &addr, target.as_deref())?,
@@ -2042,6 +2065,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cmd = fastboot_protocol::create_logical_partition(&partition, size);
             transport.send_cmd(&cmd)?;
             let resp = transport.recv_response()?;
+            require_terminal_okay(&resp)?;
             println!("[fastboot-rs] Create logical partition response: {:?}", resp);
         }
         Commands::DeleteLogicalPartition { partition } => {
@@ -2055,6 +2079,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cmd = fastboot_protocol::delete_logical_partition(&partition);
             transport.send_cmd(&cmd)?;
             let resp = transport.recv_response()?;
+            require_terminal_okay(&resp)?;
             println!("[fastboot-rs] Delete logical partition response: {:?}", resp);
         }
         Commands::ResizeLogicalPartition { partition, size } => {
@@ -2068,6 +2093,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cmd = fastboot_protocol::resize_logical_partition(&partition, size);
             transport.send_cmd(&cmd)?;
             let resp = transport.recv_response()?;
+            require_terminal_okay(&resp)?;
             println!("[fastboot-rs] Resize logical partition response: {:?}", resp);
         }
         Commands::Boot { kernel, ramdisk, second } => {
