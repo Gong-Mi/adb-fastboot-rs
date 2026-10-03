@@ -1135,31 +1135,23 @@ fn stat_server(
         .map_err(|e| format!("Build STAT req failed: {e}"))?;
     write_raw_sync(transport, &req_buf)?;
 
-    loop {
-        let (sync_hdr, payload) = read_raw_sync(transport)?;
-
-        match sync_hdr.id {
-            SYNC_STAT => {
-                let s = SyncStatResponse::decode(&payload)
-                    .map_err(|e| format!("Bad STAT response: {e}"))?;
-                return Ok(FileStat {
-                    mode: s.mode,
-                    size: s.size,
-                    mtime: s.mtime,
-                });
-            }
-            SYNC_OKAY => {
-                // Stat response already consumed, this is an extra OKAY
-                return Err("STAT request returned no data".into());
-            }
-            SYNC_FAIL => {
-                let msg = String::from_utf8_lossy(&payload).to_string();
-                return Err(format!("Sync FAIL during stat: {msg}").into());
-            }
-            other => {
-                return Err(format!("Unexpected sync id {other:#x} during stat").into());
-            }
+    let (sync_hdr, payload) = read_raw_sync(transport)?;
+    match sync_hdr.id {
+        SYNC_STAT => {
+            let s = SyncStatResponse::decode(&payload)
+                .map_err(|e| format!("Bad STAT response: {e}"))?;
+            Ok(FileStat {
+                mode: s.mode,
+                size: s.size,
+                mtime: s.mtime,
+            })
         }
+        SYNC_OKAY => Err("STAT request returned no data".into()),
+        SYNC_FAIL => {
+            let msg = String::from_utf8_lossy(&payload).to_string();
+            Err(format!("Sync FAIL during stat: {msg}").into())
+        }
+        other => Err(format!("Unexpected sync id {other:#x} during stat").into()),
     }
 }
 
