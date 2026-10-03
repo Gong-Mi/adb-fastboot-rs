@@ -30,6 +30,8 @@ pub enum SparseError {
     InvalidChunkSize(u32),
     #[error("Buffer too short for chunk payload: expected {expected}, got {got}")]
     ChunkPayloadTooShort { expected: usize, got: usize },
+    #[error("Logical block count mismatch: header {expected}, chunks {got}")]
+    BlockCountMismatch { expected: u32, got: u64 },
     #[error("Unknown chunk type: {0:#x}")]
     UnknownChunkType(u16),
 }
@@ -465,134 +467,159 @@ impl SparseFile {
         Ok(Self { header, chunks })
     }
 
+    /// Resparse downloads for repeated flashes of the same partition. Each
+    /// download starts at block zero, so gaps (including other downloads' data)
+    /// must be DONT_CARE chunks and every download must retain the full span.
+    /// This mirrors libsparse sparse_file_resparse/write_all_blocks, not payload
+    /// concatenation. Original whole-image checksums do not describe a split.
     pub fn split(&self, max_size: usize) -> Result<Vec<Self>, SparseError> {
         let blk_sz = self.header.blk_sz as usize;
         if blk_sz == 0 {
             return Err(SparseError::InvalidBlockSize(0));
         }
 
-        let min_required = SparseHeader::SIZE + SparseChunkHeader::SIZE + blk_sz;
-        if max_size < min_required {
-            return Err(SparseError::MaxDownloadSizeTooSmall {
-                max_size,
-                min_required,
+        // Validate before slicing or entering the retry loop. SparseFile/chunks
+        // are public and may also come from a malformed on-wire image.
+        let mut total_blocks = 0u64;
+        for chunk in &self.chunks {
+            let expected = match chunk.chunk_type {
+                CHUNK_TYPE_RAW => (chunk.chunk_blocks as usize)
+                    .checked_mul(blk_sz)
+                    .ok_or(SparseError::InvalidChunkSize(chunk.chunk_blocks))?,
+                CHUNK_TYPE_FILL | CHUNK_TYPE_CRC32 => 4,
+                CHUNK_TYPE_DONT_CARE => 0,
+                other => return Err(SparseError::UnknownChunkType(other)),
+            };
+            if chunk.chunk_type == CHUNK_TYPE_CRC32 {
+                if chunk.chunk_blocks != 0 {
+                    return Err(SparseError::InvalidChunkSize(chunk.chunk_blocks));
+                }
+            } else if chunk.chunk_blocks == 0 {
+                return Err(SparseError::InvalidChunkSize(0));
+            }
+            if chunk.payload.len() != expected {
+                return Err(SparseError::ChunkPayloadTooShort {
+                    expected,
+                    got: chunk.payload.len(),
+                });
+            }
+            total_blocks += u64::from(chunk.chunk_blocks);
+        }
+        if total_blocks != u64::from(self.header.total_blks) {
+            return Err(SparseError::BlockCountMismatch {
+                expected: self.header.total_blks,
+                got: total_blocks,
             });
         }
+        let span = self.header.total_blks;
+        let header_size = SparseHeader::SIZE;
+        let chunk_header = SparseChunkHeader::SIZE;
+        let too_small = |min_required| SparseError::MaxDownloadSizeTooSmall {
+            max_size,
+            min_required,
+        };
+        if max_size < header_size {
+            return Err(too_small(header_size));
+        }
 
+        let finish = |mut file: Self, end: u32| -> Result<Self, SparseError> {
+            if end < span {
+                file.add_chunk(SparseChunk::dont_care(span - end)?);
+            }
+            if file.total_size() > max_size {
+                return Err(too_small(file.total_size()));
+            }
+            Ok(file)
+        };
         let mut splits = Vec::new();
-        let mut current_file = Self::new(self.header.blk_sz);
+        let mut current = Self::new(self.header.blk_sz);
+        let mut current_size = header_size;
+        let mut current_end = 0;
+        let mut logical_block = 0;
 
         for chunk in &self.chunks {
+            if chunk.chunk_type == CHUNK_TYPE_DONT_CARE {
+                logical_block += chunk.chunk_blocks;
+                continue;
+            }
+            if chunk.chunk_type == CHUNK_TYPE_CRC32 {
+                // A full-image CRC is not a CRC of any partial download. As in
+                // libsparse's CRC-disabled writer, emit no stale checksum.
+                continue;
+            }
             let mut remaining_blocks = chunk.chunk_blocks;
             let mut raw_offset = 0;
+            while remaining_blocks > 0 {
+                let gap = logical_block - current_end;
+                let gap_size = if gap > 0 { chunk_header } else { 0 };
+                let base_size = current_size + gap_size + chunk_header;
+                let tail_size = if logical_block + remaining_blocks < span {
+                    chunk_header
+                } else {
+                    0
+                };
+                let take_blocks = if chunk.chunk_type == CHUNK_TYPE_RAW {
+                    // A partial RAW needs a trailing skip even if the original
+                    // RAW ends at the image boundary. Include metadata BEFORE
+                    // choosing how many blocks fit in max-download-size.
+                    let room = max_size.saturating_sub(base_size);
+                    let all_fit = remaining_blocks as usize <= room / blk_sz;
+                    let room = if all_fit && tail_size == 0 {
+                        room
+                    } else {
+                        room.saturating_sub(chunk_header)
+                    };
+                    remaining_blocks.min((room / blk_sz).min(u32::MAX as usize) as u32)
+                } else if base_size + 4 + tail_size <= max_size {
+                    remaining_blocks
+                } else {
+                    0
+                };
 
-            while remaining_blocks > 0 || chunk.chunk_type == CHUNK_TYPE_CRC32 {
-                let current_len = current_file.total_size();
-                let avail = max_size.saturating_sub(current_len);
-
-                match chunk.chunk_type {
-                    CHUNK_TYPE_RAW => {
-                        let avail_payload = avail.saturating_sub(SparseChunkHeader::SIZE);
-                        let blocks_that_fit = avail_payload / blk_sz;
-
-                        if blocks_that_fit == 0 {
-                            if !current_file.chunks.is_empty() {
-                                splits.push(current_file);
-                                current_file = Self::new(self.header.blk_sz);
-                                continue;
-                            } else {
-                                return Err(SparseError::MaxDownloadSizeTooSmall {
-                                    max_size,
-                                    min_required,
-                                });
-                            }
-                        }
-
-                        let take_blocks = std::cmp::min(remaining_blocks, blocks_that_fit as u32);
-                        let take_bytes = take_blocks as usize * blk_sz;
-
-                        let slice_payload = chunk.payload[raw_offset..raw_offset + take_bytes].to_vec();
-                        current_file.add_chunk(SparseChunk {
-                            chunk_type: CHUNK_TYPE_RAW,
-                            chunk_blocks: take_blocks,
-                            payload: slice_payload,
-                        });
-
-                        remaining_blocks -= take_blocks;
-                        raw_offset += take_bytes;
+                if take_blocks == 0 {
+                    if !current.chunks.is_empty() {
+                        // Flush only a file containing actual data. An empty
+                        // download cannot make progress; fail instead of retry.
+                        splits.push(finish(current, current_end)?);
+                        current = Self::new(self.header.blk_sz);
+                        current_size = header_size;
+                        current_end = 0;
+                        continue;
                     }
-                    CHUNK_TYPE_FILL => {
-                        if avail < SparseChunkHeader::SIZE + 4 {
-                            if !current_file.chunks.is_empty() {
-                                splits.push(current_file);
-                                current_file = Self::new(self.header.blk_sz);
-                                continue;
-                            } else {
-                                return Err(SparseError::MaxDownloadSizeTooSmall {
-                                    max_size,
-                                    min_required,
-                                });
-                            }
-                        }
-
-                        current_file.add_chunk(SparseChunk {
-                            chunk_type: CHUNK_TYPE_FILL,
-                            chunk_blocks: remaining_blocks,
-                            payload: chunk.payload.clone(),
-                        });
-                        remaining_blocks = 0;
-                    }
-                    CHUNK_TYPE_DONT_CARE => {
-                        if avail < SparseChunkHeader::SIZE {
-                            if !current_file.chunks.is_empty() {
-                                splits.push(current_file);
-                                current_file = Self::new(self.header.blk_sz);
-                                continue;
-                            } else {
-                                return Err(SparseError::MaxDownloadSizeTooSmall {
-                                    max_size,
-                                    min_required,
-                                });
-                            }
-                        }
-
-                        current_file.add_chunk(SparseChunk {
-                            chunk_type: CHUNK_TYPE_DONT_CARE,
-                            chunk_blocks: remaining_blocks,
-                            payload: Vec::new(),
-                        });
-                        remaining_blocks = 0;
-                    }
-                    CHUNK_TYPE_CRC32 => {
-                        if avail < SparseChunkHeader::SIZE + 4 {
-                            if !current_file.chunks.is_empty() {
-                                splits.push(current_file);
-                                current_file = Self::new(self.header.blk_sz);
-                                continue;
-                            } else {
-                                return Err(SparseError::MaxDownloadSizeTooSmall {
-                                    max_size,
-                                    min_required,
-                                });
-                            }
-                        }
-
-                        current_file.add_chunk(SparseChunk {
-                            chunk_type: CHUNK_TYPE_CRC32,
-                            chunk_blocks: 0,
-                            payload: chunk.payload.clone(),
-                        });
-                        break;
-                    }
-                    other => return Err(SparseError::UnknownChunkType(other)),
+                    let payload_size = if chunk.chunk_type == CHUNK_TYPE_RAW { blk_sz } else { 4 };
+                    let min_tail = if logical_block + 1 < span && chunk.chunk_type == CHUNK_TYPE_RAW {
+                        chunk_header
+                    } else {
+                        tail_size
+                    };
+                    return Err(too_small(base_size + payload_size + min_tail));
                 }
+
+                if gap > 0 {
+                    current.add_chunk(SparseChunk::dont_care(gap)?);
+                }
+                let payload = if chunk.chunk_type == CHUNK_TYPE_RAW {
+                    let take_bytes = take_blocks as usize * blk_sz;
+                    let payload = chunk.payload[raw_offset..raw_offset + take_bytes].to_vec();
+                    raw_offset += take_bytes;
+                    payload
+                } else {
+                    chunk.payload.clone()
+                };
+                current_size = base_size + payload.len();
+                current.add_chunk(SparseChunk {
+                    chunk_type: chunk.chunk_type,
+                    chunk_blocks: take_blocks,
+                    payload,
+                });
+                logical_block += take_blocks;
+                current_end = logical_block;
+                remaining_blocks -= take_blocks;
             }
         }
-
-        if !current_file.chunks.is_empty() {
-            splits.push(current_file);
+        if !current.chunks.is_empty() || splits.is_empty() {
+            splits.push(finish(current, current_end)?);
         }
-
         Ok(splits)
     }
 }
@@ -600,6 +627,72 @@ impl SparseFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Independent wire interpreter: every flash starts at partition offset zero.
+    // Do not use from_bytes/to_raw: DONT_CARE must seek, not zero old data.
+    fn apply_sparse_download(bytes: &[u8], partition: &mut [u8]) -> u32 {
+        let u16_at = |offset| u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+        let u32_at = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!(u32_at(0), 0xed26ff3a);
+        let block_size = u32_at(12) as usize;
+        let span = u32_at(16);
+        let mut wire_offset = u16_at(8) as usize;
+        let chunk_header_size = u16_at(10) as usize;
+        let mut partition_offset = 0;
+        for _ in 0..u32_at(20) {
+            let kind = u16_at(wire_offset);
+            let length = u32_at(wire_offset + 4) as usize * block_size;
+            let wire_size = u32_at(wire_offset + 8) as usize;
+            let payload = &bytes[wire_offset + chunk_header_size..wire_offset + wire_size];
+            assert!(partition_offset + length <= partition.len());
+            match kind {
+                0xcac1 => {
+                    assert_eq!(payload.len(), length);
+                    partition[partition_offset..partition_offset + length].copy_from_slice(payload);
+                }
+                0xcac2 => {
+                    assert_eq!(payload.len(), 4);
+                    for (index, byte) in partition[partition_offset..partition_offset + length].iter_mut().enumerate() {
+                        *byte = payload[index % 4];
+                    }
+                }
+                0xcac3 => assert!(payload.is_empty()),
+                0xcac4 => {
+                    assert_eq!(length, 0);
+                    assert_eq!(payload.len(), 4);
+                }
+                _ => panic!("unexpected sparse chunk {kind:#x}"),
+            }
+            partition_offset += length;
+            wire_offset += wire_size;
+        }
+        assert_eq!(wire_offset, bytes.len());
+        assert_eq!(partition_offset, span as usize * block_size);
+        span
+    }
+
+    fn assert_partition_eq(actual: &[u8], expected: &[u8]) {
+        assert_eq!(actual.len(), expected.len());
+        let mismatch = actual.iter().zip(expected).position(|(actual, expected)| actual != expected);
+        assert_eq!(mismatch, None, "first differing partition byte: {mismatch:?}");
+    }
+
+    #[test]
+    fn test_split_raw_preserves_final_partition_and_full_span() {
+        let raw: Vec<u8> = (1..=3).flat_map(|value| vec![value; 4096]).collect();
+        let file = SparseFile::from_raw(&raw, 4096);
+        let splits = file.split(8500).unwrap();
+        assert_eq!(splits.len(), 2);
+        let mut partition = vec![0; raw.len()];
+        let mut spans = Vec::new();
+        for split in &splits {
+            let wire = split.encode();
+            assert!(wire.len() <= 8500);
+            spans.push(apply_sparse_download(&wire, &mut partition));
+        }
+        assert_partition_eq(&partition, &raw);
+        assert_eq!(spans, vec![3, 3]);
+    }
 
     #[test]
     fn test_sparse_header_decode() {
@@ -715,32 +808,17 @@ mod tests {
 
     #[test]
     fn test_sparse_file_split_large_raw() {
-        // Create 12 KB raw image (3 blocks of 4096)
-        let mut raw_data = Vec::new();
-        for i in 0..3 {
-            raw_data.extend(vec![i as u8 + 1; 4096]);
+        let raw: Vec<u8> = (1..=3).flat_map(|value| vec![value; 4096]).collect();
+        let file = SparseFile::from_raw(&raw, 4096);
+        for max_size in [4160, 8232, 8244, 8500, usize::MAX] {
+            let mut partition = vec![0xa5; raw.len()];
+            for split in file.split(max_size).unwrap() {
+                let bytes = split.encode();
+                assert!(bytes.len() <= max_size);
+                assert_eq!(apply_sparse_download(&bytes, &mut partition), 3);
+            }
+            assert_partition_eq(&partition, &raw);
         }
-
-        let sparse_file = SparseFile::from_raw(&raw_data, 4096);
-        assert_eq!(sparse_file.total_blocks(), 3);
-
-        // max_size = 8500 bytes.
-        // Each block + headers in RAW chunk = 40 + 4096 = 4136.
-        // 2 blocks = 40 + 8192 = 8232 <= 8500.
-        // 3 blocks = 40 + 12288 = 12328 > 8500.
-        // Expect split into 2 files: first with 2 blocks, second with 1 block.
-        let max_size = 8500;
-        let splits = sparse_file.split(max_size).unwrap();
-        assert_eq!(splits.len(), 2);
-
-        assert_eq!(splits[0].total_blocks(), 2);
-        assert!(splits[0].encode().len() <= max_size);
-        assert_eq!(splits[0].chunks[0].payload[0..4096], raw_data[0..4096]);
-        assert_eq!(splits[0].chunks[0].payload[4096..8192], raw_data[4096..8192]);
-
-        assert_eq!(splits[1].total_blocks(), 1);
-        assert!(splits[1].encode().len() <= max_size);
-        assert_eq!(splits[1].chunks[0].payload, raw_data[8192..12288]);
     }
 
     #[test]
@@ -792,33 +870,236 @@ mod tests {
 
     #[test]
     fn test_sparse_file_split_with_fill_chunks() {
-        let builder = SparseChunkBuilder::new(4096);
         let mut file = SparseFile::new(4096);
+        file.add_chunk(SparseChunk::raw(vec![0xff; 8192], 4096).unwrap());
+        file.add_chunk(SparseChunk::fill(0x12345678, 100).unwrap());
+        let splits = file.split(8240).unwrap();
+        let mut expected = vec![0xff; 8192];
+        expected.extend((0..102400).flat_map(|_| [0x78, 0x56, 0x34, 0x12]));
+        let mut partition = vec![0xa5; expected.len()];
+        for split in splits {
+            assert!(split.encode().len() <= 8240);
+            assert_eq!(apply_sparse_download(&split.encode(), &mut partition), 102);
+        }
+        assert_partition_eq(&partition, &expected);
+    }
 
-        // RAW chunk: 2 blocks (2 * 4096 = 8192 payload bytes) -> total chunk size = 12 + 8192 = 8204
-        let raw_data = vec![0xFFu8; 8192];
-        file.add_chunk(builder.raw(raw_data).unwrap());
-        // FILL chunk: 100 blocks -> total chunk size = 12 + 4 = 16 bytes
-        file.add_chunk(builder.fill(0x12345678, 100).unwrap());
+    #[test]
+    fn test_split_raw_metadata_limits_and_padded_boundaries() {
+        let limits = [0, 27, 28, 39, 40, 4135, 4136, 4147, 4148, 4159, 4160, 8231, 8232, 8243, 8244, 8500, usize::MAX];
+        for blocks in 0..=8 {
+            let raw: Vec<u8> = (0..blocks * 4096).map(|index| (index % 251 + 1) as u8).collect();
+            let file = SparseFile::from_raw(&raw, 4096);
+            let minimum = match blocks {
+                0 => 28,
+                1 => 4136,
+                2 => 4148,
+                _ => 4160, // middle download needs both prefix and suffix skips
+            };
+            for limit in limits {
+                let result = file.split(limit);
+                if limit < minimum {
+                    assert!(matches!(result, Err(SparseError::MaxDownloadSizeTooSmall { .. })), "blocks={blocks}, limit={limit}");
+                    continue;
+                }
+                let mut partition = vec![0xa5; raw.len()];
+                for split in result.unwrap() {
+                    let wire = split.encode();
+                    assert!(wire.len() <= limit);
+                    assert_eq!(apply_sparse_download(&wire, &mut partition) as usize, blocks);
+                }
+                assert_partition_eq(&partition, &raw);
+            }
+        }
+        for length in [1, 4095, 4096, 4097] {
+            let raw = vec![0x37; length];
+            let file = SparseFile::from_raw(&raw, 4096);
+            let mut expected = raw.clone();
+            expected.resize(length.div_ceil(4096) * 4096, 0);
+            let mut partition = vec![0xa5; expected.len()];
+            for split in file.split(4160).unwrap() {
+                assert_eq!(apply_sparse_download(&split.encode(), &mut partition), file.header.total_blks);
+            }
+            assert_partition_eq(&partition, &expected);
+        }
+    }
 
-        // Total sparse file size = 28 + 8204 + 16 = 8248 bytes.
-        // Split with max_size = 8240 bytes (fits header + RAW chunk of 2 blocks = 28 + 8204 = 8232 bytes, but NOT the fill chunk).
-        let max_size = 8240;
-        let splits = file.split(max_size).unwrap();
-        assert_eq!(splits.len(), 2);
+    fn mixed_fixture() -> (SparseFile, Vec<u8>) {
+        let mut file = SparseFile::new(16);
+        file.add_chunk(SparseChunk::dont_care(2).unwrap());
+        file.add_chunk(SparseChunk::raw((1..=48).collect(), 16).unwrap());
+        file.add_chunk(SparseChunk::fill(0x12345678, 2).unwrap());
+        file.add_chunk(SparseChunk::dont_care(2).unwrap());
+        file.add_chunk(SparseChunk::raw((49..=112).collect(), 16).unwrap());
+        file.add_chunk(SparseChunk::dont_care(1).unwrap());
+        let mut expected = vec![0xa5; 32];
+        expected.extend(1..=48);
+        expected.extend((0..8).flat_map(|_| [0x78, 0x56, 0x34, 0x12]));
+        expected.extend(vec![0xa5; 32]);
+        expected.extend(49..=112);
+        expected.extend(vec![0xa5; 16]);
+        (file, expected)
+    }
 
-        // First file: RAW chunk
-        assert_eq!(splits[0].chunks.len(), 1);
-        assert_eq!(splits[0].chunks[0].chunk_type, CHUNK_TYPE_RAW);
-        assert_eq!(splits[0].chunks[0].chunk_blocks, 2);
-        assert!(splits[0].encode().len() <= max_size);
+    #[test]
+    fn test_split_mixed_preserves_holes_full_span_and_prior_downloads() {
+        let (file, expected) = mixed_fixture();
+        for max_size in [80, 81, 96, 100, 112, usize::MAX] {
+            let mut partition = vec![0xa5; expected.len()];
+            for split in file.split(max_size).unwrap() {
+                let wire = split.encode();
+                assert!(wire.len() <= max_size);
+                assert_eq!(apply_sparse_download(&wire, &mut partition), 14);
+                // Re-splitting an already offset-preserving download must also
+                // retain those offsets, including leading and trailing skips.
+                let mut resplit_partition = vec![0xa5; expected.len()];
+                for resplit in split.split(80).unwrap() {
+                    assert!(resplit.encode().len() <= 80);
+                    assert_eq!(apply_sparse_download(&resplit.encode(), &mut resplit_partition), 14);
+                }
+                let mut one_split_partition = vec![0xa5; expected.len()];
+                apply_sparse_download(&wire, &mut one_split_partition);
+                assert_partition_eq(&resplit_partition, &one_split_partition);
+            }
+            assert_partition_eq(&partition, &expected);
+        }
+    }
 
-        // Second file: FILL chunk
-        assert_eq!(splits[1].chunks.len(), 1);
-        assert_eq!(splits[1].chunks[0].chunk_type, CHUNK_TYPE_FILL);
-        assert_eq!(splits[1].chunks[0].chunk_blocks, 100);
-        assert_eq!(splits[1].chunks[0].fill_value(), Some(0x12345678));
-        assert!(splits[1].encode().len() <= max_size);
+    #[test]
+    fn test_split_empty_fill_only_and_dont_care_only_exact_limits() {
+        let empty = SparseFile::from_raw(&[], 4096);
+        assert_eq!(empty.split(28).unwrap()[0].encode().len(), 28);
+        let mut holes = SparseFile::new(4096);
+        holes.add_chunk(SparseChunk::dont_care(2).unwrap());
+        let mut partition = vec![0xa5; 8192];
+        assert_eq!(apply_sparse_download(&holes.split(40).unwrap()[0].encode(), &mut partition), 2);
+        assert_partition_eq(&partition, &vec![0xa5; 8192]);
+        assert!(holes.split(39).is_err());
+        let mut fill = SparseFile::new(4096);
+        fill.add_chunk(SparseChunk::fill(0x12345678, 2).unwrap());
+        assert!(fill.split(43).is_err());
+        let bytes = fill.split(44).unwrap()[0].encode();
+        assert_eq!(apply_sparse_download(&bytes, &mut partition), 2);
+        let expected: Vec<u8> = (0..2048).flat_map(|_| [0x78, 0x56, 0x34, 0x12]).collect();
+        assert_partition_eq(&partition, &expected);
+        let mut largest_span = SparseFile::new(4096);
+        largest_span.add_chunk(SparseChunk::dont_care(u32::MAX).unwrap());
+        let output = largest_span.split(40).unwrap();
+        assert_eq!(output[0].header.total_blks, u32::MAX);
+        assert_eq!(output[0].encode().len(), 40);
+    }
+
+    #[test]
+    fn test_split_fill_only_metadata_boundary() {
+        let mut file = SparseFile::new(16);
+        for value in [0x11111111, 0x22222222, 0x33333333] {
+            file.add_chunk(SparseChunk::fill(value, 2).unwrap());
+        }
+        let expected: Vec<u8> = [0x11, 0x22, 0x33].into_iter()
+            .flat_map(|value| vec![value; 32]).collect();
+        let mut partition = vec![0xa5; expected.len()];
+        for split in file.split(68).unwrap() {
+            assert!(split.encode().len() <= 68);
+            assert_eq!(apply_sparse_download(&split.encode(), &mut partition), 6);
+        }
+        assert_partition_eq(&partition, &expected);
+        assert!(file.split(55).is_err());
+    }
+
+    #[test]
+    fn test_split_removes_stale_checksums_and_normalizes_extended_headers() {
+        let (mut file, expected) = mixed_fixture();
+        file.header.file_hdr_sz = 36;
+        file.header.chunk_hdr_sz = 16;
+        file.header.image_checksum = 0xdeadbeef;
+        file.add_chunk(SparseChunk::crc32(0xdeadbeef).unwrap());
+        // Build a genuinely extended on-wire image, then exercise the parser's
+        // representation instead of relying on encode's canonical layout.
+        let mut extended = file.header.encode().to_vec();
+        extended.extend([0; 8]);
+        for chunk in &file.chunks {
+            let header = SparseChunkHeader::new(
+                chunk.chunk_type, chunk.chunk_blocks, 16 + chunk.payload.len() as u32,
+            );
+            extended.extend(header.encode());
+            extended.extend([0; 4]);
+            extended.extend(&chunk.payload);
+        }
+        let file = SparseFile::from_bytes(&extended).unwrap();
+        let mut partition = vec![0xa5; expected.len()];
+        for split in file.split(80).unwrap() {
+            assert_eq!(split.header.file_hdr_sz, 28);
+            assert_eq!(split.header.chunk_hdr_sz, 12);
+            assert_eq!(split.header.image_checksum, 0);
+            assert!(split.chunks.iter().all(|chunk| chunk.chunk_type != CHUNK_TYPE_CRC32));
+            apply_sparse_download(&split.encode(), &mut partition);
+        }
+        assert_partition_eq(&partition, &expected);
+    }
+
+    #[test]
+    fn test_split_impossible_limits_and_malformed_chunks_terminate_with_errors() {
+        // At 4148 the first RAW download fits but a middle download cannot:
+        // it needs a prefix skip + RAW block + trailing skip (4160 bytes).
+        // A retry loop flushing skip-only files would never make progress.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let raw = SparseFile::from_raw(&vec![1; 3 * 4096], 4096);
+            for limit in [0, 28, 4136, 4148, 4159] {
+                assert!(matches!(raw.split(limit), Err(SparseError::MaxDownloadSizeTooSmall { .. })));
+            }
+            assert!(SparseFile::new(0).split(10000).is_err());
+            let invalid_chunks = [
+                SparseChunk { chunk_type: CHUNK_TYPE_RAW, chunk_blocks: 1, payload: vec![] },
+                SparseChunk { chunk_type: CHUNK_TYPE_FILL, chunk_blocks: 1, payload: vec![] },
+                SparseChunk { chunk_type: CHUNK_TYPE_DONT_CARE, chunk_blocks: 0, payload: vec![] },
+                SparseChunk { chunk_type: CHUNK_TYPE_CRC32, chunk_blocks: 1, payload: vec![0; 4] },
+                SparseChunk { chunk_type: 0xffff, chunk_blocks: 0, payload: vec![] },
+            ];
+            for chunk in invalid_chunks {
+                let mut file = SparseFile::new(4096);
+                file.add_chunk(chunk);
+                assert!(file.split(10000).is_err());
+            }
+            let mut wrong_span = raw;
+            wrong_span.header.total_blks = 2;
+            assert_eq!(wrong_span.split(8500), Err(SparseError::BlockCountMismatch { expected: 2, got: 3 }));
+            sender.send(()).unwrap();
+        });
+        receiver.recv_timeout(std::time::Duration::from_secs(2)).expect("split must fail, never hang or panic");
+    }
+
+    #[test]
+    #[ignore = "requires installed AOSP-derived simg2img; no downloads or device access"]
+    fn test_split_simg2img_oracle() {
+        let directory = std::env::temp_dir().join(format!("fastboot-sparse-oracle-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (mixed, mut expected_mixed) = mixed_fixture();
+        // simg2img creates a zero-filled raw file; use zero for original holes.
+        for range in [0..32, 112..144, 208..224] {
+            expected_mixed[range].fill(0);
+        }
+        let raw: Vec<u8> = (1..=3).flat_map(|value| vec![value; 4096]).collect();
+        for (name, file, limit, expected) in [
+            ("raw", SparseFile::from_raw(&raw, 4096), 8500, raw),
+            ("mixed", mixed, 80, expected_mixed),
+        ] {
+            let original = directory.join(format!("{name}.sparse"));
+            std::fs::write(&original, file.encode()).unwrap();
+            let original_raw = directory.join(format!("{name}-original.raw"));
+            assert!(std::process::Command::new("simg2img").arg(&original).arg(&original_raw).status().unwrap().success());
+            let mut command = std::process::Command::new("simg2img");
+            for (index, split) in file.split(limit).unwrap().iter().enumerate() {
+                let path = directory.join(format!("{name}-{index}.sparse"));
+                std::fs::write(&path, split.encode()).unwrap();
+                command.arg(path);
+            }
+            let reconstructed = directory.join(format!("{name}-split.raw"));
+            assert!(command.arg(&reconstructed).status().unwrap().success());
+            assert_partition_eq(&std::fs::read(original_raw).unwrap(), &expected);
+            assert_partition_eq(&std::fs::read(reconstructed).unwrap(), &expected);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
