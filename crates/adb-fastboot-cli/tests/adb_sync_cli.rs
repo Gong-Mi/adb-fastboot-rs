@@ -179,6 +179,33 @@ impl Drop for Fixture {
     }
 }
 
+// This suite exercises SYNC, not RSA prime generation. Use the already-public
+// BoringSSL CRL test identity in a private, disposable HOME, never the user's
+// adbkey. Random 2048-bit key generation before CNXN can exceed the protocol
+// deadline on a loaded Android debug build and make the wrong layer fail.
+fn seed_public_test_identity(home: &std::path::Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let source = include_str!("../../../vendor/boringssl/crypto/x509/x509_test.cc");
+    let (_, note) = source.split_once(
+        "// kCRLTestRoot is a test root certificate. It has private key:",
+    ).expect("vendored public BoringSSL test identity");
+    let mut pem = String::new();
+    for line in note.lines().filter_map(|line| line.strip_prefix("//     ")) {
+        if line == "-----BEGIN RSA PRIVATE KEY-----" || !pem.is_empty() {
+            pem.push_str(line);
+            pem.push('\n');
+            if line == "-----END RSA PRIVATE KEY-----" { break; }
+        }
+    }
+    assert!(pem.starts_with("-----BEGIN RSA PRIVATE KEY-----\n"));
+    assert!(pem.ends_with("-----END RSA PRIVATE KEY-----\n"));
+    let directory = home.join(".android");
+    fs::create_dir_all(&directory).unwrap();
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .open(directory.join("adbkey")).unwrap();
+    file.write_all(pem.as_bytes()).unwrap();
+}
+
 fn run_cli(install: bool, outcome: Outcome) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let root = Fixture(std::env::temp_dir().join(format!(
@@ -186,6 +213,7 @@ fn run_cli(install: bool, outcome: Outcome) {
     )));
     let source = root.0.join("source");
     fs::create_dir_all(&source).unwrap();
+    seed_public_test_identity(&root.0);
     let apk = source.join("base.apk");
     let bytes: Vec<u8> = (0..SYNC_DATA_MAX * 2 + 17).map(|index| (index % 251) as u8).collect();
     fs::write(&apk, &bytes).unwrap();
