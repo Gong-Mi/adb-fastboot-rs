@@ -492,8 +492,8 @@ fn push_file_direct(
         .map_err(|e| format!("Build SEND req failed: {e}"))?;
     protocol::send_wrte(transport, local_id, remote_id, &send_buf)?;
 
-    // send_wrte consumed A_OKAY (transport ACK). SEND has no SYNC reply:
-    // adbd emits the application OKAY/FAIL only after DATA and DONE.
+    // send_wrte consumed A_OKAY (transport ACK), not a SEND approval.
+    // The successful SYNC_OKAY belongs after DATA/DONE; read status there.
 
     // Send DATA chunks (max 64 KB each)
     for chunk in file_data.chunks(MAX_CHUNK) {
