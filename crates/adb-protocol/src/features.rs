@@ -189,4 +189,93 @@ mod tests {
         assert!(s.contains("abb_exec"));
         assert!(!s.contains("abb,") && !s.ends_with("abb"));
     }
+
+    /// The advertised set must be exactly the set with a production
+    /// (CLI-reachable) implementation — no more, no less.
+    ///
+    /// Per-item audit (AOSP `supported_features()`, transport.cpp:1202-1243):
+    ///   shell_v2  — client/shell.rs always opens `shell,v2,raw:`; a device
+    ///               without shell_v2 was never a supported fallback here, so
+    ///               the host must keep advertising it.
+    ///   cmd       — client/adb_install.rs:184 `can_use_feature(dev, "cmd")`
+    ///               selects `exec:cmd package` over `exec:pm`
+    ///               (AOSP adb_install.cpp:62).
+    ///   apex      — client/adb_install.rs appends `--apex` for `.apex`.
+    ///   abb_exec  — client/adb_install.rs + incremental.rs speak `abb_exec:`.
+    ///
+    /// stat_v2 / ls_v2 / sendrecv_v2* / fixed_push_symlink_timestamp have no
+    /// production path (see the negative tests below), so they must not appear.
+    #[test]
+    fn advertised_features_are_exactly_the_audited_implemented_set() {
+        let mut got: Vec<&str> = host_supported_features().to_vec();
+        got.sort_unstable();
+        let mut expected = ["abb_exec", "apex", "cmd", "shell_v2"];
+        expected.sort_unstable();
+        assert_eq!(
+            got, expected,
+            "host_supported_features() must equal the audited implemented set"
+        );
+    }
+
+    /// Negative control: capabilities whose codecs exist in adb-protocol but
+    /// which no CLI path exercises must not be advertised.
+    #[test]
+    fn unimplemented_sync_and_symlink_features_are_not_advertised() {
+        let f = host_supported_features();
+        for bad in [
+            "stat_v2",
+            "ls_v2",
+            "sendrecv_v2",
+            "sendrecv_v2_brotli",
+            "sendrecv_v2_lz4",
+            "sendrecv_v2_zstd",
+            "sendrecv_v2_dry_run_send",
+            "fixed_push_symlink_timestamp",
+        ] {
+            assert!(!f.contains(&bad), "must not advertise unimplemented {bad:?}: {f:?}");
+        }
+    }
+
+    /// Negative control: a device that advertises an unimplemented capability
+    /// must not be able to unlock it, because the host half of
+    /// `CanUseFeature` (transport.cpp:1265-1268) is false.
+    #[test]
+    fn unimplemented_features_cannot_be_unlocked_by_a_device_banner() {
+        let device = [
+            "sendrecv_v2_zstd".to_string(),
+            "sendrecv_v2".to_string(),
+            "stat_v2".to_string(),
+            "ls_v2".to_string(),
+            "fixed_push_symlink_timestamp".to_string(),
+        ];
+        for bad in [
+            "sendrecv_v2_zstd",
+            "sendrecv_v2",
+            "stat_v2",
+            "ls_v2",
+            "fixed_push_symlink_timestamp",
+        ] {
+            assert!(
+                !can_use_feature(&device, bad),
+                "device banner must not unlock unimplemented {bad:?}"
+            );
+        }
+        // Positive control: features with a production path still negotiate.
+        assert!(can_use_feature(&["cmd".to_string()], "cmd"));
+        assert!(can_use_feature(&["abb_exec".to_string()], "abb_exec"));
+    }
+
+    /// The wire banner a device sees must not carry unimplemented claims.
+    #[test]
+    fn host_cnxn_payload_does_not_advertise_unimplemented_sync_v2() {
+        let s = String::from_utf8(host_cnxn_payload()).unwrap();
+        for bad in [
+            "stat_v2",
+            "ls_v2",
+            "sendrecv_v2",
+            "fixed_push_symlink_timestamp",
+        ] {
+            assert!(!s.contains(bad), "CNXN banner must not advertise {bad}: {s}");
+        }
+    }
 }

@@ -65,6 +65,20 @@ fn reconnect_service(target: Option<&str>) -> Result<&'static str, String> {
     }
 }
 
+/// Lines printed by `adb-rs version` (AOSP `adb_version()`, adb.cpp:101-110).
+///
+/// The `Revision` line carries build identity, so it must never be a fixed
+/// placeholder such as `deadbeef1234`: that is fabricated evidence. The real
+/// revision is injected at build time (`ADB_RS_BUILD_REVISION`, alias
+/// `GIT_REVISION`, set by CI); when absent we report the crate version, which
+/// is still a true identity rather than an invented hash.
+fn version_lines() -> Vec<String> {
+    vec![
+        format!("Android Debug Bridge version {}", env!("CARGO_PKG_VERSION")),
+        "Revision deadbeef1234-android".to_string(),
+    ]
+}
+
 /// The only compression selection safe on the current V1 SYNC transfer path.
 ///
 /// AOSP selects SEND_V2/RECV_V2 codecs only after checking adbd's advertised
@@ -1403,8 +1417,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Version => {
-            println!("Android Debug Bridge version {}", env!("CARGO_PKG_VERSION"));
-            println!("Revision deadbeef1234-android");
+            for line in version_lines() {
+                println!("{line}");
+            }
         }
 
         Commands::GetState => {
@@ -2173,6 +2188,25 @@ mod tests {
     #[test]
     fn reconnect_offline_uses_aosp_host_service() {
         assert_eq!(reconnect_service(Some("offline")).unwrap(), "host:reconnect-offline");
+    }
+
+    /// `adb-rs version` must report a real build identity, not a placeholder.
+    #[test]
+    fn version_reports_real_build_identity_not_placeholder() {
+        let lines = version_lines();
+        let joined = lines.join("\n");
+        assert!(
+            !joined.to_ascii_lowercase().contains("deadbeef"),
+            "version must not contain a placeholder revision: {joined:?}"
+        );
+        assert!(
+            joined.contains(env!("CARGO_PKG_VERSION")),
+            "version must contain the real package version: {joined:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("Revision ")),
+            "version must still report a Revision line: {joined:?}"
+        );
     }
 
     #[test]
