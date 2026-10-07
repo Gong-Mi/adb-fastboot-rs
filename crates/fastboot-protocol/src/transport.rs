@@ -108,7 +108,11 @@ fn parse_one_response(buf: &[u8]) -> Result<(FastbootResponse, usize), FastbootR
     }
 }
 
-/// Send, Recv, and I/O abstraction for Fastboot protocol transport
+/// Send, Recv, and I/O abstraction for Fastboot protocol transport.
+///
+/// Implement this explicitly for each transport or mock. The default response
+/// scanner is for unframed byte streams only; message-framed transports must
+/// override `recv_response_with_info` and wrappers must forward that method.
 pub trait FastbootTransport: Read + Write + Send {
     /// Send a fastboot command string (e.g., "getvar:all")
     ///
@@ -211,7 +215,38 @@ pub trait FastbootTransport: Read + Write + Send {
     }
 }
 
-impl<T: Read + Write + Send> FastbootTransport for T {}
+// Opt in explicitly: a blanket Read/Write implementation would prevent framed
+// transports (and forwarding wrappers) from selecting their response parser.
+impl FastbootTransport for crate::udp::FastbootUdpTransport {}
+
+#[cfg(feature = "usb")]
+impl<B: crate::usb::BulkIo> FastbootTransport for crate::usb::FastbootUsbTransport<B> {}
+
+impl<T: FastbootTransport + ?Sized> FastbootTransport for &mut T {
+    fn send_cmd(&mut self, cmd: &str) -> Result<(), FastbootTransportError> {
+        (**self).send_cmd(cmd)
+    }
+
+    fn recv_response_with_info(
+        &mut self,
+        info_logs: &mut Vec<String>,
+    ) -> Result<FastbootResponse, FastbootTransportError> {
+        (**self).recv_response_with_info(info_logs)
+    }
+}
+
+impl<T: FastbootTransport + ?Sized> FastbootTransport for Box<T> {
+    fn send_cmd(&mut self, cmd: &str) -> Result<(), FastbootTransportError> {
+        (**self).send_cmd(cmd)
+    }
+
+    fn recv_response_with_info(
+        &mut self,
+        info_logs: &mut Vec<String>,
+    ) -> Result<FastbootResponse, FastbootTransportError> {
+        (**self).recv_response_with_info(info_logs)
+    }
+}
 
 /// Connect trait abstraction for establishing Fastboot transport connections
 pub trait Connect {
@@ -563,6 +598,15 @@ impl FastbootTcpTransport {
     }
 }
 
+impl FastbootTransport for FastbootTcpTransport {
+    fn recv_response_with_info(
+        &mut self,
+        info_logs: &mut Vec<String>,
+    ) -> Result<FastbootResponse, FastbootTransportError> {
+        FastbootTcpTransport::recv_response_with_info(self, info_logs)
+    }
+}
+
 impl Connect for FastbootTcpTransport {
     type Target = Self;
 
@@ -580,6 +624,10 @@ impl Connect for FastbootTcpTransport {
 
 impl Read for FastbootTcpTransport {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        // A no-op read must not fetch a frame that recv_response would skip.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         match self.mode {
             FbMode::Raw => {
                 // If we have buffered data (from handshake or prior partial reads),

@@ -492,8 +492,8 @@ fn push_file_direct(
         .map_err(|e| format!("Build SEND req failed: {e}"))?;
     protocol::send_wrte(transport, local_id, remote_id, &send_buf)?;
 
-    // Expect SYNC_OKAY
-    protocol::recv_sync_response(transport, local_id, remote_id)?;
+    // send_wrte consumed A_OKAY (transport ACK), not a SEND approval.
+    // The successful SYNC_OKAY belongs after DATA/DONE; read status there.
 
     // Send DATA chunks (max 64 KB each)
     for chunk in file_data.chunks(MAX_CHUNK) {
@@ -679,8 +679,8 @@ fn push_file_direct_with_ids(
     let mut send_buf = Vec::new();
     build_sync_send_req(remote, 0o644, &mut send_buf)
         .map_err(|e| format!("Build SEND req failed: {e}"))?;
+    // SEND is acknowledged only at the ADB transport layer.
     protocol::send_wrte(transport, local_id, remote_id, &send_buf)?;
-    protocol::recv_sync_response(transport, local_id, remote_id)?;
 
     // Send DATA chunks
     for chunk in file_data.chunks(MAX_CHUNK) {
@@ -908,15 +908,8 @@ fn push_file_server(
         .map_err(|e| format!("Build SEND req failed: {e}"))?;
     write_raw_sync(transport, &send_buf)?;
 
-    // Expect SYNC_OKAY
-    let (resp_hdr, _payload) = read_raw_sync(transport)?;
-    if resp_hdr.id == SYNC_FAIL {
-        let msg = String::from_utf8_lossy(&_payload).to_string();
-        return Err(format!("Sync FAIL: {msg}").into());
-    }
-    if resp_hdr.id != SYNC_OKAY {
-        return Err(format!("Expected SYNC_OKAY, got {:#x}", resp_hdr.id).into());
-    }
+    // A server bridge carries raw SYNC bytes: no response follows SEND.
+    // Read the application OKAY/FAIL only after sending DATA and DONE.
 
     // Send DATA chunks
     for chunk in file_data.chunks(MAX_CHUNK) {
@@ -1031,15 +1024,7 @@ fn push_file_server_inner(
         .map_err(|e| format!("Build SEND req failed: {e}"))?;
     write_raw_sync(transport, &send_buf)?;
 
-    // Expect SYNC_OKAY
-    let (resp_hdr, _payload) = read_raw_sync(transport)?;
-    if resp_hdr.id == SYNC_FAIL {
-        let msg = String::from_utf8_lossy(&_payload).to_string();
-        return Err(format!("Push '{}' Sync FAIL: {msg}", local).into());
-    }
-    if resp_hdr.id != SYNC_OKAY {
-        return Err(format!("Expected SYNC_OKAY, got {:#x}", resp_hdr.id).into());
-    }
+    // SEND has no SYNC response; the terminal result belongs after DONE.
 
     // Send DATA chunks
     for chunk in file_data.chunks(MAX_CHUNK) {
@@ -1135,31 +1120,23 @@ fn stat_server(
         .map_err(|e| format!("Build STAT req failed: {e}"))?;
     write_raw_sync(transport, &req_buf)?;
 
-    loop {
-        let (sync_hdr, payload) = read_raw_sync(transport)?;
-
-        match sync_hdr.id {
-            SYNC_STAT => {
-                let s = SyncStatResponse::decode(&payload)
-                    .map_err(|e| format!("Bad STAT response: {e}"))?;
-                return Ok(FileStat {
-                    mode: s.mode,
-                    size: s.size,
-                    mtime: s.mtime,
-                });
-            }
-            SYNC_OKAY => {
-                // Stat response already consumed, this is an extra OKAY
-                return Err("STAT request returned no data".into());
-            }
-            SYNC_FAIL => {
-                let msg = String::from_utf8_lossy(&payload).to_string();
-                return Err(format!("Sync FAIL during stat: {msg}").into());
-            }
-            other => {
-                return Err(format!("Unexpected sync id {other:#x} during stat").into());
-            }
+    let (sync_hdr, payload) = read_raw_sync(transport)?;
+    match sync_hdr.id {
+        SYNC_STAT => {
+            let s = SyncStatResponse::decode(&payload)
+                .map_err(|e| format!("Bad STAT response: {e}"))?;
+            Ok(FileStat {
+                mode: s.mode,
+                size: s.size,
+                mtime: s.mtime,
+            })
         }
+        SYNC_OKAY => Err("STAT request returned no data".into()),
+        SYNC_FAIL => {
+            let msg = String::from_utf8_lossy(&payload).to_string();
+            Err(format!("Sync FAIL during stat: {msg}").into())
+        }
+        other => Err(format!("Unexpected sync id {other:#x} during stat").into()),
     }
 }
 
@@ -1192,6 +1169,170 @@ mod tests {
     }
 
     impl Transport for ScriptedTransport {}
+
+    #[derive(Clone, Copy, Debug)]
+    enum SendOutcome { Okay, Fail, Disconnect }
+
+    /// A strict adbd SYNC peer: SEND has no application reply. Only a complete
+    /// DATA sequence followed by DONE produces the terminal status.
+    struct SendPeer {
+        expected: std::collections::VecDeque<(String, Vec<u8>)>,
+        active: Option<(Vec<u8>, Vec<u8>)>,
+        incoming: std::collections::VecDeque<(AdbMessageHeader, Vec<u8>)>,
+        raw_reply: Cursor<Vec<u8>>,
+        direct: bool,
+        outcome: SendOutcome,
+        completed: usize,
+        status_acks: usize,
+    }
+
+    impl SendPeer {
+        fn accept_sync(&mut self, payload: &[u8]) {
+            let header = SyncMessageHeader::decode(payload).unwrap();
+            let data = &payload[8..];
+            match header.id {
+                adb_protocol::SYNC_SEND => {
+                    assert!(self.active.is_none(), "SEND before previous DONE");
+                    assert_eq!(header.length as usize, data.len());
+                    let (path, bytes) = self.expected.pop_front().expect("unexpected SEND");
+                    assert_eq!(data, format!("{path},{}", 0o644).as_bytes());
+                    self.active = Some((bytes, Vec::new()));
+                }
+                SYNC_DATA => {
+                    assert_eq!(header.length as usize, data.len());
+                    assert!(data.len() <= MAX_CHUNK);
+                    let (expected, received) = self.active.as_mut().expect("DATA before SEND");
+                    received.extend_from_slice(data);
+                    assert!(received.len() <= expected.len(), "extra DATA bytes");
+                    assert_eq!(received.as_slice(), &expected[..received.len()]);
+                }
+                SYNC_DONE => {
+                    assert!(data.is_empty(), "DONE has no payload");
+                    assert_eq!(header.length, u32::MAX, "DONE mtime changed");
+                    let (expected, received) = self.active.take().expect("DONE before SEND");
+                    assert_eq!(received, expected, "DONE before complete DATA");
+                    self.completed += 1;
+                    let (id, message): (u32, &[u8]) = match self.outcome {
+                        SendOutcome::Okay => (SYNC_OKAY, b""),
+                        SendOutcome::Fail => (SYNC_FAIL, b"strict peer rejected file"),
+                        SendOutcome::Disconnect => {
+                            if self.direct {
+                                self.incoming.push_back((AdbMessageHeader::new(A_CLSE, 41, 7, &[]), Vec::new()));
+                            }
+                            return;
+                        }
+                    };
+                    let mut reply = [0u8; 8];
+                    SyncMessageHeader::new(id, message.len() as u32).encode(&mut reply);
+                    let reply = [reply.as_slice(), message].concat();
+                    if self.direct {
+                        self.incoming.push_back((AdbMessageHeader::new(A_WRTE, 41, 7, &reply), reply));
+                    } else {
+                        self.raw_reply = Cursor::new(reply);
+                    }
+                }
+                other => panic!("unexpected SYNC request {other:#x}"),
+            }
+        }
+    }
+
+    impl Read for SendPeer {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            assert!(!self.direct);
+            if self.active.is_some() {
+                return Err(std::io::Error::other("host waited for SYNC_OKAY before DATA/DONE"));
+            }
+            self.raw_reply.read(buf)
+        }
+    }
+
+    impl Write for SendPeer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            assert!(!self.direct);
+            self.accept_sync(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    impl Transport for SendPeer {
+        fn send_message(&mut self, header: &AdbMessageHeader, payload: &[u8]) -> Result<(), adb_protocol::TransportError> {
+            assert!(self.direct);
+            assert_eq!((header.arg0, header.arg1), (7, 41));
+            match header.command {
+                A_WRTE => {
+                    // A_OKAY only acknowledges delivery of this WRTE, including SEND.
+                    self.incoming.push_back((AdbMessageHeader::new(A_OKAY, 41, 7, &[]), Vec::new()));
+                    self.accept_sync(payload);
+                }
+                A_OKAY => { assert!(payload.is_empty()); self.status_acks += 1; }
+                A_CLSE => {
+                    assert!(self.active.is_none());
+                    self.incoming.push_back((AdbMessageHeader::new(A_CLSE, 41, 7, &[]), Vec::new()));
+                }
+                other => panic!("unexpected ADB command {other:#x}"),
+            }
+            Ok(())
+        }
+        fn recv_message(&mut self) -> Result<(AdbMessageHeader, Vec<u8>), adb_protocol::TransportError> {
+            self.incoming.pop_front().ok_or_else(|| adb_protocol::TransportError::Protocol(
+                "host waited for SYNC_OKAY before DATA/DONE".into()
+            ))
+        }
+    }
+
+    fn check_send_paths(outcome: SendOutcome) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!("adb-sync-send-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir_all(&root).unwrap();
+        let bytes: Vec<u8> = (0..MAX_CHUNK * 2 + 9).map(|index| (index % 251) as u8).collect();
+        let file = root.join("payload");
+        let empty = root.join("empty");
+        fs::write(&file, &bytes).unwrap();
+        fs::write(&empty, b"").unwrap();
+        for (direct, batch) in [(true, false), (true, true), (false, false), (false, true)] {
+            let files = vec![
+                FilePair { local: file.to_str().unwrap().into(), remote: "/remote/payload".into() },
+                FilePair { local: empty.to_str().unwrap().into(), remote: "/remote/empty".into() },
+            ];
+            let mut peer = SendPeer {
+                expected: [(files[0].remote.clone(), bytes.clone()), (files[1].remote.clone(), Vec::new())].into(),
+                active: None, incoming: Default::default(), raw_reply: Cursor::new(Vec::new()),
+                direct, outcome, completed: 0, status_acks: 0,
+            };
+            let result = match (direct, batch) {
+                (true, false) => push_file_direct(&mut peer, 7, 41, &files[0].local, &files[0].remote),
+                (true, true) => push_files_direct(&mut peer, 7, 41, &files),
+                (false, false) => push_file_server(&mut peer, &files[0].local, &files[0].remote),
+                (false, true) => push_files_server(&mut peer, &files),
+            };
+            match outcome {
+                SendOutcome::Okay => result.unwrap_or_else(|e| panic!("direct={direct}, batch={batch}: {e}")),
+                SendOutcome::Fail => assert!(result.unwrap_err().to_string().contains("strict peer rejected file")),
+                SendOutcome::Disconnect => {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("closed") || error.contains("fill whole buffer"), "{error}");
+                }
+            }
+            assert_eq!(peer.completed, if batch && matches!(outcome, SendOutcome::Okay) { 2 } else { 1 });
+            assert!(peer.active.is_none());
+            if direct && !matches!(outcome, SendOutcome::Disconnect) {
+                assert_eq!(peer.status_acks, peer.completed);
+                assert!(peer.incoming.is_empty());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn send_paths_wait_for_result_only_after_data_and_done() { check_send_paths(SendOutcome::Okay); }
+
+    #[test]
+    fn send_paths_propagate_final_fail_without_sending_next_file() { check_send_paths(SendOutcome::Fail); }
+
+    #[test]
+    fn send_paths_reject_disconnect_instead_of_treating_adb_ack_as_success() { check_send_paths(SendOutcome::Disconnect); }
 
     fn adb_frame(command: u32, arg0: u32, arg1: u32, payload: &[u8]) -> Vec<u8> {
         let header = AdbMessageHeader::new(command, arg0, arg1, payload);

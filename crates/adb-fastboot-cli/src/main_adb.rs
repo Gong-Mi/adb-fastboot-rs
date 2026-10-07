@@ -1806,8 +1806,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("[adb-rs] Syncing {} -> {} ({} bytes)",
                             relative_str, remote_path, file_data.len());
 
+                        // SEND gets an ADB A_OKAY transport ACK, not a SYNC result.
                         protocol::send_wrte(transport, local_id, remote_id, &send_buf)?;
-                        protocol::recv_sync_response(transport, local_id, remote_id)?;
 
                         const MAX_CHUNK: usize = 64 * 1024;
                         for chunk in file_data.chunks(MAX_CHUNK) {
