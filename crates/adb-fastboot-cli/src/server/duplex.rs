@@ -440,6 +440,22 @@ mod tests {
             0
         );
     }
+    fn small_recv_buffer(s: &TcpStream) {
+        use std::os::fd::AsRawFd;
+        let size = 4096i32;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    (&size as *const i32).cast(),
+                    std::mem::size_of::<i32>() as _,
+                )
+            },
+            0
+        );
+    }
     #[test]
     fn framing_preserves_every_byte_fragment_and_coalesced_tail() {
         let first = wire(b"WRTE", 73, 29, b"hello");
@@ -555,6 +571,82 @@ mod tests {
         );
         assert_eq!(output, data);
         assert!(handle.join().unwrap().unwrap_err().contains("EOF"));
+    }
+    // Negative control (a): a live but slow local consumer (>1s to accept the
+    // tail) must receive every accepted byte. An absolute close-phase 1s cap
+    // truncates this tail; a progress-bounded drain must not.
+    #[test]
+    fn fakewire_slow_consumer_drains_whole_tail_without_close_timeout() {
+        let (mut device, server_device) = pair();
+        let (mut client, server_client) = pair();
+        small_send_buffer(&server_client);
+        small_recv_buffer(&client);
+        let active = Arc::new(AtomicBool::new(true));
+        let flag = active.clone();
+        let handle = thread::spawn(move || owner(server_device).bridge(server_client, &flag));
+        let data = vec![b'z'; 256 * 1024];
+        device.write_all(&wire(b"WRTE", 73, 29, &data)).unwrap();
+        device.shutdown(Shutdown::Write).unwrap();
+        // ~1 KiB every 10 ms (>=2.5 s for 256 KiB) is far slower than 1 MiB/s
+        // but makes real forward progress on every read.
+        let mut output = Vec::new();
+        let mut buf = [0u8; 1024];
+        while output.len() < data.len() {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    output.extend_from_slice(&buf[..n]);
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("slow consumer read: {e}"),
+            }
+        }
+        let error = handle.join().unwrap().unwrap_err();
+        assert_eq!(
+            output.len(),
+            data.len(),
+            "a slow consumer must not truncate an accepted tail; owner said: {error}"
+        );
+        assert_eq!(output, data);
+        assert!(
+            !error.contains("close drain timeout"),
+            "progressing drain must not hit the close deadline: {error}"
+        );
+        assert!(error.contains("EOF"), "terminal_error preserved: {error}");
+    }
+    // Negative control (b): a peer that never reads makes no progress, so the
+    // bounded close drain must still fail instead of hanging forever.
+    #[test]
+    fn fakewire_stalled_reader_still_fails_close_drain_in_bounded_time() {
+        let (mut device, server_device) = pair();
+        let (client, server_client) = pair();
+        small_send_buffer(&server_client);
+        small_recv_buffer(&client);
+        let active = Arc::new(AtomicBool::new(true));
+        let flag = active.clone();
+        let (done, wait) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            done.send(owner(server_device).bridge(server_client, &flag))
+                .unwrap();
+        });
+        let data = vec![b'z'; 256 * 1024];
+        device.write_all(&wire(b"WRTE", 73, 29, &data)).unwrap();
+        device.shutdown(Shutdown::Write).unwrap();
+        let start = Instant::now();
+        let error = wait
+            .recv_timeout(Duration::from_secs(20))
+            .expect("no-progress close drain must not hang")
+            .unwrap_err();
+        assert!(
+            error.contains("close drain timeout"),
+            "a stalled reader is a real no-progress bound: {error}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "no-progress bound must be timely, took {:?}",
+            start.elapsed()
+        );
+        handle.join().unwrap();
     }
     #[test]
     fn fakewire_cancel_silent_reader_joins_and_closes_both_peers() {
