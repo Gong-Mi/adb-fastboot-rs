@@ -196,6 +196,7 @@ struct MultiPackageApk {
     local_path: PathBuf,
     split_name: String,
     size: u64,
+    is_apex: bool,
 }
 
 fn shell_quote(value: &str) -> String {
@@ -750,7 +751,8 @@ pub fn install_multi_package(
                 .and_then(|name| name.to_str())
                 .ok_or("Invalid APK filename")?;
             let extension = local_path.extension().and_then(|value| value.to_str()).unwrap_or_default();
-            if !extension.eq_ignore_ascii_case("apk") && !extension.eq_ignore_ascii_case("apex") {
+            let is_apex = extension.eq_ignore_ascii_case("apex");
+            if !extension.eq_ignore_ascii_case("apk") && !is_apex {
                 return Err(format!("Expected an .apk or .apex input, got {split}").into());
             }
             if !basenames.insert(file_name.to_string()) {
@@ -761,6 +763,7 @@ pub fn install_multi_package(
                 local_path: local_path.to_path_buf(),
                 split_name: format!("{}_{}", package_index + 1, file_name),
                 size,
+                is_apex,
             });
         }
         packages.push(package);
@@ -771,6 +774,7 @@ pub fn install_multi_package(
         &packages,
         options,
         CommandTransport::from_banner(device_banner),
+        CommandTransport::apex_supported(device_banner),
     )
 }
 
@@ -779,9 +783,24 @@ fn install_multi_package_sessions(
     packages: &[Vec<MultiPackageApk>],
     options: &InstallOptions,
     cmd_transport: CommandTransport,
+    apex_supported: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // AOSP install_multi_package (adb_install.cpp:756-758, 803-815): any
+    // .apex input flips the whole transaction into staged mode — parent
+    // install-create gets --staged, child install-create gets --staged and
+    // the APEX child additionally --apex.
+    let apex_found = packages
+        .iter()
+        .flatten()
+        .any(|apk| apk.is_apex);
+    if apex_found && !apex_supported {
+        return Err(".apex is not supported on the target device".into());
+    }
     let mut parent_args: Vec<String> = vec!["install-create".to_string(), "--multi-package".to_string()];
     parent_args.extend(options.to_pm_flags());
+    if apex_found {
+        parent_args.push("--staged".to_string());
+    }
     let parent_output = run_install_command(transport, cmd_transport, &parent_args)?;
     let parent_id = parse_install_session_id(&parent_output).ok_or_else(|| {
         format!("Failed to create multi-package parent session: {}", parent_output.trim())
@@ -792,6 +811,17 @@ fn install_multi_package_sessions(
         for package in packages {
             let mut child_args: Vec<String> = vec!["install-create".to_string()];
             child_args.extend(options.to_pm_flags());
+            // AOSP: every child session gets --staged when apex_found;
+            // a child whose first split is an .apex additionally gets --apex
+            // (adb_install.cpp:803-815 — the APEX command template applies to
+            // any package argument containing an .apex file).
+            let package_has_apex = package.iter().any(|apk| apk.is_apex);
+            if apex_found {
+                child_args.push("--staged".to_string());
+                if package_has_apex {
+                    child_args.push("--apex".to_string());
+                }
+            }
             let child_output = run_install_command(transport, cmd_transport, &child_args)?;
             let child_id = parse_install_session_id(&child_output)
                 .ok_or_else(|| format!("Failed to create child session: {}", child_output.trim()))?;
@@ -1681,6 +1711,62 @@ mod tests {
             assert_eq!(peer.staged_apks.len(), 1);
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn multi_package_apex_inputs_flip_transaction_to_staged_with_apex_child() {
+        let (root, _) = fixture_apks();
+        let apex = root.join("main.apex");
+        fs::write(&apex, b"apex").unwrap();
+        let apk = root.join("app.apk");
+        fs::write(&apk, b"apk").unwrap();
+        let package_args = vec![apex.display().to_string(), apk.display().to_string()];
+        let mut peer = FakeTransport::new(false);
+        let banner = "device::features=cmd,shell_v2,apex";
+
+        install_multi_package(&mut peer, &package_args, banner, &InstallOptions::default())
+            .unwrap();
+
+        let commands = exec_commands(&peer);
+        // Parent gets --staged; APEX child gets --staged --apex; the plain
+        // APK child gets --staged only.
+        assert!(
+            commands.iter().any(|command| command == "cmd package install-create --multi-package --staged"),
+            "parent missing --staged: {commands:?}"
+        );
+        let creates: Vec<&String> = commands
+            .iter()
+            .filter(|command| *command == "cmd package install-create --staged --apex" || *command == "cmd package install-create --staged")
+            .collect();
+        assert_eq!(creates.len(), 2, "child creates: {commands:?}");
+        assert!(commands.iter().any(|command| command == "cmd package install-create --staged --apex"));
+        assert!(commands.iter().any(|command| command == "cmd package install-create --staged"));
+        assert!(commands.iter().any(|command| command == "cmd package install-add-session 42 43 44"));
+        assert!(commands.iter().any(|command| command == "cmd package install-commit 42"));
+        assert!(!commands.iter().any(|command| command.contains("install-abandon")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multi_package_apex_requires_device_apex_feature_before_services() {
+        let (root, _) = fixture_apks();
+        let apex = root.join("main.apex");
+        fs::write(&apex, b"apex").unwrap();
+        let mut peer = FakeTransport::new(false);
+        let banner = "device::features=cmd,shell_v2";
+
+        let error = install_multi_package(
+            &mut peer,
+            &[apex.display().to_string()],
+            banner,
+            &InstallOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("not supported on the target device"), "{error}");
+        assert!(peer.opened_services.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
