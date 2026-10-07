@@ -9,10 +9,13 @@
 //! - Reduces install time for large APKs by allowing apps to start before
 //!   the full APK is transferred
 //!
-//! Current status: AOSP Incremental File System installation is not implemented.
-//! This module refuses explicit incremental requests instead of pretending that
-//! `pm install --incremental` plus a `/proc/fs/incfs` probe implements AOSP's
-//! signature/database/inc-server/`abb_exec` protocol.
+//! Current status: the full AOSP pipeline is implemented for explicit
+//! `adb install --incremental` over raw-socket transports — v4 signature
+//! database, `abb_exec` service, unsigned streams, the `inc-pump` bridge and
+//! the inc-server (which outlives the client like AOSP's). Remaining gaps:
+//! incremental paths for `install-multiple`/`install-multi-package`,
+//! `--fastdeploy` (silent policy + fallback), and TLS transports (the pump
+//! hand-off needs a raw socket; TLS reports a clear error).
 
 mod incremental_server;
 mod incremental_utils;
