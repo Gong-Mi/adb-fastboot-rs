@@ -22,6 +22,8 @@ use std::collections::VecDeque;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::RawFd;
 
+use adb_protocol::{AdbMessageHeader, Transport, A_CLSE, A_OKAY, A_WRTE, MAX_PAYLOAD_V2};
+
 use crate::server::sysdeps_unix::{adb_poll, adb_read, adb_write};
 
 use super::incremental_utils::{
@@ -74,6 +76,13 @@ enum FdReadOutcome {
     None,
     /// Connection closed, poll failed, or a completed session timed out; AOSP
     /// maps this to a DESTROY request and `Serve()` returns true.
+    Disconnected,
+}
+
+/// Outcome of a request read over a framed transport (the fork-continue
+/// serving path, `serve_over_transport`).
+enum TransportRead {
+    Request(RequestCommand),
     Disconnected,
 }
 
@@ -889,6 +898,163 @@ impl IncrementalServer {
         let output = std::mem::take(&mut self.output);
         if write_fd_exactly(connection_fd, &output) != output.len() {
             eprintln!("Failed to write {} bytes", output.len());
+        }
+    }
+
+    /// Send `data` as A_WRTE frames, waiting for the A_OKAY of each frame
+    /// (the same one-in-flight discipline as `write_exec_payload` in
+    /// adb_install.rs). Inbound payloads observed while waiting are acked and
+    /// appended to `incoming` for the request scanner.
+    fn send_framed(
+        &mut self,
+        transport: &mut dyn Transport,
+        local_id: u32,
+        remote_id: u32,
+        data: &[u8],
+    ) -> Result<(), String> {
+        for chunk in data.chunks(MAX_PAYLOAD_V2 as usize - 24) {
+            let header = AdbMessageHeader::new(A_WRTE, local_id, remote_id, chunk);
+            transport
+                .send_message(&header, chunk)
+                .map_err(|e| e.to_string())?;
+            loop {
+                match transport.recv_message() {
+                    Ok((header, payload)) => match header.command {
+                        A_OKAY if header.arg0 == remote_id && header.arg1 == local_id => break,
+                        A_WRTE if header.arg0 == remote_id && header.arg1 == local_id => {
+                            let ack = AdbMessageHeader::new(A_OKAY, local_id, remote_id, &[]);
+                            transport.send_message(&ack, &[]).map_err(|e| e.to_string())?;
+                            self.incoming.extend_from_slice(&payload);
+                        }
+                        A_CLSE => {
+                            return Err("inc-server: connection closed while sending".to_string());
+                        }
+                        other => {
+                            return Err(format!("inc-server: unexpected frame {other:#x}"));
+                        }
+                    },
+                    Err(error) => return Err(format!("inc-server: {error}")),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush pending output and ship it over the transport (a failed send is
+    /// reported but not fatal; the next read fails instead).
+    fn ship_framed(&mut self, transport: &mut dyn Transport, local_id: u32, remote_id: u32) {
+        self.flush();
+        if self.output.is_empty() {
+            return;
+        }
+        let output = std::mem::take(&mut self.output);
+        if let Err(error) = self.send_framed(transport, local_id, remote_id, &output) {
+            eprintln!("{error}");
+        }
+    }
+
+    /// AOSP `SkipToRequest` over a framed transport: forward non-protocol
+    /// device output to `output_fd`, decode requests, and treat CLSE/errors
+    /// as a disconnect.
+    fn read_request_transport(
+        &mut self,
+        transport: &mut dyn Transport,
+        local_id: u32,
+        remote_id: u32,
+        output_fd: RawFd,
+    ) -> TransportRead {
+        loop {
+            let mut forward = Vec::new();
+            let request = self.take_request(&mut forward);
+            if !forward.is_empty() {
+                let _ = write_fd_exactly(output_fd, &forward);
+            }
+            if let Some(request) = request {
+                return TransportRead::Request(request);
+            }
+
+            match transport.recv_message() {
+                Ok((header, payload)) => match header.command {
+                    A_WRTE if header.arg0 == remote_id && header.arg1 == local_id => {
+                        let ack = AdbMessageHeader::new(A_OKAY, local_id, remote_id, &[]);
+                        if transport.send_message(&ack, &[]).is_err() {
+                            let _ = write_fd_exactly(output_fd, &self.incoming);
+                            return TransportRead::Disconnected;
+                        }
+                        self.incoming.extend_from_slice(&payload);
+                    }
+                    A_CLSE => {
+                        let _ = write_fd_exactly(output_fd, &self.incoming);
+                        return TransportRead::Disconnected;
+                    }
+                    // Stray acks for already-finished sends are ignored.
+                    A_OKAY => {}
+                    other => {
+                        eprintln!("inc-server: unexpected frame {other:#x}");
+                        let _ = write_fd_exactly(output_fd, &self.incoming);
+                        return TransportRead::Disconnected;
+                    }
+                },
+                Err(_) => {
+                    let _ = write_fd_exactly(output_fd, &self.incoming);
+                    return TransportRead::Disconnected;
+                }
+            }
+        }
+    }
+
+    /// Serve over a framed transport instead of raw fds — the fork-continue
+    /// path for transports whose socket cannot be handed to a separate
+    /// process (a userspace TLS session).
+    ///
+    /// Structurally this mirrors `serve_fds` (AOSP `Serve()`), except:
+    /// - The connection is the A_WRTE-framed transport; this process owns the
+    ///   session, so it survives the adb client.
+    /// - The 300 s idle-exit timeout (AOSP `kPollTimeoutMillis`) is not
+    ///   replicated: a quiet session stays until CLSE/EOF/kill.
+    /// - Pending output is always flushed before the blocking read (there is
+    ///   no poll here to keep the prefetch queue pumping while waiting).
+    ///
+    /// Returns true when serving stopped normally (DESTROY/disconnect).
+    pub fn serve_over_transport(
+        &mut self,
+        transport: &mut dyn Transport,
+        local_id: u32,
+        remote_id: u32,
+        output_fd: RawFd,
+    ) -> bool {
+        if let Err(error) = self.send_framed(transport, local_id, remote_id, b"OKAY") {
+            eprintln!("Connection is dead. Abort. ({error})");
+            return false;
+        }
+
+        let mut done_sent = false;
+        loop {
+            if !done_sent && self.prefetches.is_empty() && self.all_files_sent() {
+                eprintln!("All files should be loaded. Notifying the device.");
+                self.send_done();
+                done_sent = true;
+                self.ship_framed(transport, local_id, remote_id);
+            }
+
+            // Unlike AOSP, flush unconditionally: the read below blocks with
+            // no poll loop to keep unshipped prefetch data moving.
+            self.flush();
+            self.ship_framed(transport, local_id, remote_id);
+
+            match self.read_request_transport(transport, local_id, remote_id, output_fd) {
+                TransportRead::Request(request) => {
+                    if request.request_type == DESTROY {
+                        return true;
+                    }
+                    self.handle_request(request);
+                    self.ship_framed(transport, local_id, remote_id);
+                }
+                TransportRead::Disconnected => return true,
+            }
+
+            self.run_prefetching();
+            self.ship_framed(transport, local_id, remote_id);
         }
     }
 
@@ -1736,5 +1902,142 @@ mod tests {
         out.read_exact(&mut tail).unwrap();
         assert_eq!(&tail, b" pm\n");
         assert!(server_thread.join().unwrap());
+    }
+
+    /// Frame codec over a plain TCP socket (the fake device side of the
+    /// transport-serve test).
+    struct FramePeer(std::net::TcpStream);
+
+    impl FramePeer {
+        fn recv(&mut self) -> (u32, u32, u32, Vec<u8>) {
+            use std::io::Read as _;
+            let mut header = [0u8; 24];
+            self.0.read_exact(&mut header).unwrap();
+            let field = |offset: usize| {
+                u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap())
+            };
+            let (command, arg0, arg1) = (field(0), field(4), field(8));
+            assert_eq!(field(20), command ^ u32::MAX, "ADB magic");
+            let mut payload = vec![0u8; field(12) as usize];
+            self.0.read_exact(&mut payload).unwrap();
+            (command, arg0, arg1, payload)
+        }
+
+        fn send(&mut self, command: u32, arg0: u32, arg1: u32, payload: &[u8]) {
+            use std::io::Write as _;
+            for field in [
+                command,
+                arg0,
+                arg1,
+                payload.len() as u32,
+                0,
+                command ^ u32::MAX,
+            ] {
+                self.0.write_all(&field.to_le_bytes()).unwrap();
+            }
+            self.0.write_all(payload).unwrap();
+        }
+    }
+
+    #[test]
+    fn serve_over_transport_handshakes_serves_and_stops_on_destroy() {
+        use crate::server::sysdeps_unix::{adb_close, adb_socketpair};
+        use std::net::TcpListener;
+        use std::os::unix::io::FromRawFd;
+
+        const LOCAL: u32 = 1;
+        const REMOTE: u32 = 0x51;
+
+        let data = lcg_bytes(0x0FED_1234, BLOCK_SIZE as usize + 100);
+        let file = ServerFile::new(
+            "tls.apk".into(),
+            data.len() as i64,
+            Box::new(MemorySource {
+                data: data.clone(),
+                tree: None,
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (out_server, out_client) = adb_socketpair().unwrap();
+
+        let server_thread = std::thread::spawn(move || {
+            let mut transport = adb_protocol::TcpTransport::connect_timeout(
+                addr,
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+            let mut server = IncrementalServer::new(vec![file]);
+            let result = server.serve_over_transport(&mut transport, LOCAL, REMOTE, out_server);
+            adb_close(out_server);
+            result
+        });
+
+        let (device_socket, _) = listener.accept().unwrap();
+        device_socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut peer = FramePeer(device_socket);
+
+        // Handshake: the transport-serve "OKAY".
+        let (command, arg0, arg1, payload) = peer.recv();
+        assert_eq!(command, A_WRTE);
+        assert_eq!((arg0, arg1), (LOCAL, REMOTE));
+        assert_eq!(payload, b"OKAY");
+        peer.send(A_OKAY, REMOTE, LOCAL, &[]);
+
+        // Device text is acked and forwarded to the output fd.
+        peer.send(A_WRTE, REMOTE, LOCAL, b"Performing Streamed Install\n");
+        let (command, arg0, arg1, _) = peer.recv();
+        assert_eq!(command, A_OKAY);
+        assert_eq!((arg0, arg1), (LOCAL, REMOTE));
+
+        // Block request → chunks + done marker, each frame acked.
+        peer.send(A_WRTE, REMOTE, LOCAL, &encode_request(BLOCK_MISSING, 0, 0));
+        let (command, ..) = peer.recv();
+        assert_eq!(command, A_OKAY);
+
+        let mut stream = Vec::new();
+        let mut blocks = parse_blocks(&stream);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !blocks.iter().any(|(header, _)| header.file_id == -1) {
+            assert!(std::time::Instant::now() < deadline, "no done marker");
+            let (command, arg0, arg1, payload) = peer.recv();
+            assert_eq!(command, A_WRTE);
+            assert_eq!((arg0, arg1), (LOCAL, REMOTE));
+            peer.send(A_OKAY, REMOTE, LOCAL, &[]);
+            stream.extend_from_slice(&payload);
+            blocks = parse_blocks(&stream);
+        }
+        let mut reassembled = Vec::new();
+        for (header, payload) in &blocks {
+            if header.file_id == -1 || header.block_type != TYPE_DATA {
+                continue;
+            }
+            if header.compression_type == COMPRESSION_LZ4 {
+                let offset = header.block_idx as usize * BLOCK_SIZE as usize;
+                let size = std::cmp::min(BLOCK_SIZE as usize, data.len() - offset);
+                reassembled
+                    .extend_from_slice(&lz4_flex::block::decompress(payload, size).unwrap());
+            } else {
+                reassembled.extend_from_slice(payload);
+            }
+        }
+        assert_eq!(reassembled, data);
+
+        // DESTROY stops the serving loop.
+        peer.send(A_WRTE, REMOTE, LOCAL, &encode_request(DESTROY, 0, 0));
+        let (command, ..) = peer.recv();
+        assert_eq!(command, A_OKAY);
+        assert!(server_thread.join().unwrap());
+
+        // The forwarded device text reached the output fd.
+        let mut out = unsafe { std::os::unix::net::UnixStream::from_raw_fd(out_client) };
+        out.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut text = [0u8; 28];
+        out.read_exact(&mut text).unwrap();
+        assert_eq!(&text, b"Performing Streamed Install\n");
     }
 }

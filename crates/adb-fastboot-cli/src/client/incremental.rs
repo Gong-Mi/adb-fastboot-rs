@@ -10,12 +10,12 @@
 //!   the full APK is transferred
 //!
 //! Current status: the full AOSP pipeline is implemented for explicit
-//! `adb install --incremental` over raw-socket transports — v4 signature
-//! database, `abb_exec` service, unsigned streams, the `inc-pump` bridge and
-//! the inc-server (which outlives the client like AOSP's). Remaining gaps:
-//! incremental paths for `install-multiple`/`install-multi-package`,
-//! `--fastdeploy` (silent policy + fallback), and TLS transports (the pump
-//! hand-off needs a raw socket; TLS reports a clear error).
+//! `adb install --incremental` and the incremental-by-default path — v4
+//! signature database, `abb_exec` service, unsigned streams, and the
+//! serving process (inc-pump + inc-server for raw-socket transports; a
+//! fork-continue server child for userspace-TLS transports). Remaining gaps:
+//! incremental paths for `install-multi-package`, and `--fastdeploy` (an
+//! independent APK-patching subsystem).
 
 mod incremental_server;
 mod incremental_utils;
@@ -83,6 +83,16 @@ pub fn incfs_mountpoint_visible(transport: &mut dyn Transport) -> Result<bool, B
     Ok(stdout.contains("incfs") || stdout.contains("incremental"))
 }
 
+/// The background processes serving an incremental install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncServerProcesses {
+    /// The `inc-pump` bridge (raw-socket transports only; the fork-continue
+    /// path has none).
+    pub pump: Option<libc::pid_t>,
+    /// The serving process (inc-server, or the fork-continue server child).
+    pub server: libc::pid_t,
+}
+
 /// AOSP `install` (incremental.cpp:436-467): the full incremental install
 /// pipeline — build the database, open the `abb_exec` service with it, send
 /// unsigned files, then spawn the pump + inc-server pair and wait for `pm`'s
@@ -98,7 +108,7 @@ pub fn install(
     passthrough_args: &[String],
     silent: bool,
     executor: &str,
-) -> Result<(libc::pid_t, libc::pid_t), String> {
+) -> Result<IncServerProcesses, String> {
     let check_policy = if silent {
         CheckPolicy::Normal
     } else {
@@ -122,18 +132,24 @@ pub fn install(
 /// serves on.
 fn start_inc_server(
     executor: &str,
-    transport: &dyn Transport,
+    transport: &mut dyn Transport,
     local_id: u32,
     remote_id: u32,
     database: &[IsDatabaseEntry],
-) -> Result<(libc::pid_t, libc::pid_t), String> {
+) -> Result<IncServerProcesses, String> {
     use crate::server::sysdeps_unix::{adb_close, adb_launch_process, adb_socketpair, close_on_exec};
 
-    let transport_fd = transport.as_raw_fd().ok_or_else(|| {
-        "incremental install: this transport cannot hand its socket to a separate process \
-         (TLS transports are not supported yet)"
-            .to_string()
-    })?;
+    // Test/ops override: force the fork-continue transport-serve path even on
+    // raw-socket transports (exercised by the CLI integration tests).
+    let force_transport_serve = std::env::var("ADB_INCREMENTAL_TRANSPORT_SERVE")
+        .map(|value| value != "0")
+        .unwrap_or(false);
+    let raw_fd = if force_transport_serve { None } else { transport.as_raw_fd() };
+    let Some(transport_fd) = raw_fd else {
+        // No handable raw socket (a userspace TLS session): the transport
+        // cannot cross exec, so the serving process fork-continues instead.
+        return start_forked_server(transport, local_id, remote_id, database);
+    };
 
     // Plain-byte channel between the pump and the inc-server. CLOEXEC keeps
     // each end out of the other child (the spawn helper only clears it for
@@ -172,7 +188,10 @@ fn start_inc_server(
     let result = start_inc_server_and_stream_signed_files(executor, channel_server_fd, database);
     adb_close(channel_server_fd);
     match result {
-        Ok(server) => Ok((pump, server)),
+        Ok(server) => Ok(IncServerProcesses {
+            pump: Some(pump),
+            server,
+        }),
         Err(error) => {
             unsafe {
                 libc::kill(pump, libc::SIGTERM);
@@ -180,6 +199,95 @@ fn start_inc_server(
             Err(error)
         }
     }
+}
+
+/// Fork-continue serving: the child keeps the live transport session (its
+/// socket cannot cross `exec` when TLS lives in userspace) and serves over
+/// the framed transport until the session ends. The child never returns into
+/// the caller's stack — it serves and `_exit`s.
+fn start_forked_server(
+    transport: &mut dyn Transport,
+    local_id: u32,
+    remote_id: u32,
+    database: &[IsDatabaseEntry],
+) -> Result<IncServerProcesses, String> {
+    use crate::server::sysdeps_unix::{adb_close, adb_socketpair, close_on_exec};
+
+    // Forking is only safe from a single-threaded process; refuse anything
+    // else (callers fall back) rather than risk a wedged child.
+    if process_thread_count() > 1 {
+        return Err(
+            "incremental install: cannot fork the serving process from a multithreaded caller"
+                .to_string(),
+        );
+    }
+
+    // Open the signed files before forking so errors surface here.
+    let mut files = Vec::with_capacity(database.len());
+    for entry in database {
+        let IsDatabaseEntry::Signed { path, .. } = entry else {
+            continue;
+        };
+        files.push(ServerFile::open_local(&path.to_string_lossy())?);
+    }
+
+    // Child output channel (server → this process).
+    let (pipe_read_fd, pipe_write_fd) = adb_socketpair()
+        .map_err(|_| "adb: failed to create socket pair for child to print to parent".to_string())?;
+    // The read end stays in this process only (fork ignores CLOEXEC, but keep
+    // the invariant for any future exec).
+    close_on_exec(pipe_read_fd);
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        adb_close(pipe_read_fd);
+        adb_close(pipe_write_fd);
+        return Err("adb: failed to fork".to_string());
+    }
+    if pid == 0 {
+        // Child: detach from the terminal like `serve()` does, drop the
+        // inherited read end, then serve until the session ends.
+        println!("Serving...");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        adb_close(pipe_read_fd);
+        unsafe {
+            libc::close(libc::STDIN_FILENO);
+            libc::close(libc::STDOUT_FILENO);
+        }
+        let mut server = IncrementalServer::new(files);
+        server.serve_over_transport(transport, local_id, remote_id, pipe_write_fd);
+        unsafe { libc::_exit(0) };
+    }
+
+    // Parent: wait for pm's verdict; on failure kill the server child.
+    adb_close(pipe_write_fd);
+    match wait_for_installation_fd(pipe_read_fd) {
+        Ok(()) => {
+            adb_close(pipe_read_fd);
+            Ok(IncServerProcesses { pump: None, server: pid })
+        }
+        Err(error) => {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            adb_close(pipe_read_fd);
+            Err(error)
+        }
+    }
+}
+
+/// Thread count of this process (the fork-continue safety gate), from
+/// `/proc/self/status`; treated as 1 when unknown.
+fn process_thread_count() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Threads:")?.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(1)
 }
 
 /// AOSP `should_use_incremental_by_default` (incremental.cpp:295-315):

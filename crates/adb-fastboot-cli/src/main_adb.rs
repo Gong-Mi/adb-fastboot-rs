@@ -851,13 +851,13 @@ fn run_incremental_attempt(
     let executor = std::env::current_exe()
         .map_err(|error| Some(format!("Cannot resolve the adb executable path: {error}")))?;
     match client::incremental::install(transport, files, &[], silent, &executor.to_string_lossy()) {
-        Ok((_pump, server)) => {
+        Ok(processes) => {
             println!(
                 "Install command complete in {} ms",
                 started.elapsed().as_millis()
             );
             if wait {
-                client::incremental::wait_for_incremental_server(server);
+                client::incremental::wait_for_incremental_server(processes.server);
             }
             Ok(())
         }

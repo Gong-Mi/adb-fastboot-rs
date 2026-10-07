@@ -880,3 +880,116 @@ fn install_auto_honors_device_probe_false() {
     );
     let _ = std::fs::remove_dir_all(apk.parent().unwrap());
 }
+
+#[test]
+fn incremental_install_fork_server_serves_and_outlives_cli() {
+    // ADB_INCREMENTAL_TRANSPORT_SERVE forces the fork-continue path (the
+    // transport-serve server child, used for userspace-TLS transports) even
+    // on this raw-socket transport; the dialogue is identical from the
+    // device's point of view.
+    let apk = make_fixture("fork");
+    let apk_bytes = std::fs::read(&apk).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_adb-rs"))
+        .arg("-s")
+        .arg(address.to_string())
+        .arg("install")
+        .arg("--incremental")
+        .arg(&apk)
+        .env("ADB_INCREMENTAL_TRANSPORT_SERVE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let (cli_exited_tx, cli_exited_rx) = std::sync::mpsc::channel::<()>();
+
+    let fake = thread::spawn(move || {
+        let mut peer = prepare_peer(accept_with_deadline(&listener));
+        let (command, _, _, _) = peer.recv_message().unwrap();
+        assert_eq!(command, A_CNXN);
+        peer.send_message(A_CNXN, 0x0100_0001, 1024 * 1024, DEFAULT_BANNER);
+
+        // Explicit --incremental: no probe, straight to the service.
+        let (command, local_id, _, payload) = peer.recv_message().unwrap();
+        assert_eq!(command, A_OPEN);
+        let service = String::from_utf8_lossy(&payload);
+        assert!(
+            service.starts_with("abb_exec:package\u{0}install-incremental\u{0}"),
+            "service: {service}"
+        );
+        peer.send(A_OKAY, local_id, &[]);
+
+        // The forked server's "OKAY", then text past the 256-byte window.
+        let payload = peer.expect(A_WRTE, local_id);
+        assert_eq!(payload, b"OKAY");
+        peer.send(A_OKAY, local_id, &[]);
+
+        let mut text = b"Performing Streamed Install\nSuccess\n".to_vec();
+        text.extend_from_slice(&[b'.'; 240]);
+        peer.send(A_WRTE, local_id, &text);
+        peer.expect(A_OKAY, local_id);
+
+        // Blocks are requested only after the CLI is gone: the fork child
+        // must still be serving over the inherited transport.
+        cli_exited_rx.recv().unwrap();
+        peer.send(A_WRTE, local_id, &encode_request(BLOCK_MISSING, 0, 0));
+        peer.expect(A_OKAY, local_id);
+
+        let mut stream = Vec::new();
+        let mut blocks = parse_blocks(&stream);
+        let block_deadline = Instant::now() + Duration::from_secs(15);
+        while !blocks.iter().any(|(file_id, ..)| *file_id == -1) {
+            assert!(
+                Instant::now() < block_deadline,
+                "no done marker; got {blocks:?}"
+            );
+            let payload = peer.expect(A_WRTE, local_id);
+            peer.send(A_OKAY, local_id, &[]);
+            stream.extend_from_slice(&payload);
+            blocks = parse_blocks(&stream);
+        }
+        let mut reassembled = Vec::new();
+        for (file_id, block_type, compression, block_idx, payload) in &blocks {
+            if *file_id == -1 || *block_type != 0 {
+                continue;
+            }
+            reassembled.extend_from_slice(&decode_payload(
+                *compression,
+                payload,
+                apk_bytes.len(),
+                *block_idx,
+            ));
+        }
+        assert_eq!(reassembled, apk_bytes);
+
+        // DESTROY stops the fork child; the transport then reaches EOF.
+        peer.send(A_WRTE, local_id, &encode_request(DESTROY, 0, 0));
+        peer.expect(A_OKAY, local_id);
+        read_until_eof(&mut peer);
+    });
+
+    let status = wait_child(&mut child, 25);
+    assert_eq!(status.code(), Some(0));
+    cli_exited_tx.send(()).unwrap();
+    fake.join().unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("Performing Incremental Install"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("Serving..."), "stdout: {stdout}");
+    assert!(stdout.contains("Success"), "stdout: {stdout}");
+    assert!(
+        stderr.contains("All files should be loaded"),
+        "stderr: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(apk.parent().unwrap());
+}
