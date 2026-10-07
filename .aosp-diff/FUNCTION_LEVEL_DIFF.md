@@ -13,7 +13,7 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 | transport 注册表 | 12 | server/transport.rs+models.rs TransportRegistry 已实现 | 命名差分 |
 | mdns 后端 | 8 | `crates/adb-mdns` callback 由 runner 启动；Create/Update/Delete 已进 TransportRegistry；报文 fixture 覆盖 PTR→SRV→A/AAAA→TXT→Create、TXT/SRV Update 和 TTL-zero PTR→Delete | 代码接线+离线状态/packet 测试完成；无设备/组播依赖 |
 | incremental/fastdeploy | 48 | `incremental.rs` now treats IncFS mountpoint probe as advisory only and rejects explicit incremental install requests | Functional vacuum: no `.idsig`/v4 verification, protobuf database, `inc-server`, `abb_exec` or fastdeploy agent |
-| adb_install 安装分支 | 21 | CLI `install` 解析设备 CNXN feature banner；`--streaming`/`--no-streaming` 可控；`install-multiple` split session 与 `install-multi-package` parent/child transaction 都有 fake-peer coverage | 0 个同名函数；功能缺口：incremental/fastdeploy、abb_exec、APEX staged path 与其余 install flags；install-multiple 仍先 sync staging 而非 AOSP direct streaming |
+| adb_install 安装分支 | 21 | CLI `install` 解析设备 CNXN feature banner；`--streaming`/`--no-streaming` 可控；`install-multiple` split session 与 `install-multi-package` parent/child transaction 都有 fake-peer coverage | 0 个同名函数；abb_exec transport 与 APEX streamed 已落地 @ b7ec437；install-multiple 接受 .dm/.sdm/.fsv_sig/.idsig；功能缺口：incremental/fastdeploy、APEX staged child、abb interactive |
 | usb hotplug | 18 | transport_usb.rs+usb_android.rs usbfs 直连+watcher 实现 | 命名差分 |
 | adb_client server 协议 | 20 | AdbServerTransport+server_cmds/host_command 核心 | 命名差分 |
 | console 模拟器控制台 | 5 | console.cpp 网络层 + 六个离线测试：token 文件/空 token/serial 选择/命令字节/双 OK marker/fake TCP peer | 自动化切片完成；不要求 emulator/device |
@@ -53,7 +53,7 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 
 ## Remaining build/test tasks
 
-1. Incremental/fastdeploy and APEX/`abb_exec` remain unsupported; map their capability/data paths and dependencies before exposing options.
+1. Incremental/fastdeploy and APEX staged child / abb interactive remain unsupported; abb_exec transport + APEX streamed install landed @ b7ec437.
 2. Add forward listener format/remove-all tests; sysdeps `adb_launch_process` tests via child process fixture; emulator scanner state tests with fake console ports.
 
 ## 附录: 逐文件 × 逐函数明细
