@@ -116,6 +116,61 @@ pub fn read_id_sig_headers(reader: &mut dyn std::io::Read) -> Result<IdSigHeader
     })
 }
 
+/// Port of AOSP `skip_id_sig_headers` (incremental_utils.cpp:163-183):
+/// parse past the same header layout without accumulating the signature
+/// bytes, returning `(tree_offset, tree_size)` where `tree_offset` is the
+/// stream position where the verity tree data starts. Used by inc-server
+/// when opening `<file>.idsig`.
+pub fn skip_id_sig_headers(
+    reader: &mut (impl std::io::Read + std::io::Seek),
+) -> Result<(u64, i32), String> {
+    fn skip_int(reader: &mut (impl std::io::Read + std::io::Seek)) -> Result<(), String> {
+        let mut buffer = [0u8; 4];
+        reader
+            .read_exact(&mut buffer)
+            .map_err(|error| format!("Failed to seek: {error}"))?;
+        Ok(())
+    }
+
+    fn skip_bytes_with_size(
+        reader: &mut (impl std::io::Read + std::io::Seek),
+    ) -> Result<(), String> {
+        let mut size_buffer = [0u8; 4];
+        reader
+            .read_exact(&mut size_buffer)
+            .map_err(|error| format!("Failed to read int: {error}"))?;
+        let size = i32::from_le_bytes(size_buffer);
+        if size < 0 {
+            return Err(format!("Invalid size {size}"));
+        }
+        if size == 0 {
+            return Ok(());
+        }
+        // Bounded by kMaxSignatureSize upstream; a heap buffer is fine here.
+        let mut discard = vec![0u8; size as usize];
+        reader
+            .read_exact(&mut discard)
+            .map_err(|error| format!("Failed to seek: {error}"))?;
+        Ok(())
+    }
+
+    skip_int(reader)?; // version
+    skip_bytes_with_size(reader)?; // hashingInfo
+    skip_bytes_with_size(reader)?; // signingInfo
+
+    let mut tree_size_buffer = [0u8; 4];
+    reader
+        .read_exact(&mut tree_size_buffer)
+        .map_err(|error| format!("Failed to read int: {error}"))?;
+    let tree_size = i32::from_le_bytes(tree_size_buffer);
+    // Position after the header block; for a File this equals the seek
+    // offset. For in-memory readers we track consumed bytes ourselves.
+    let offset = reader
+        .stream_position()
+        .map_err(|error| format!("Failed to get offset: {error}"))?;
+    Ok((offset, tree_size))
+}
+
 /// AOSP `validate_signature` (incremental.cpp:141-157): signature length
 /// bound plus verity tree size agreement with the file size.
 pub fn validate_signature(

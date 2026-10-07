@@ -25,6 +25,7 @@ adb-protocol = { path = "../adb-protocol" }
 adb-mdns = { path = "../adb-mdns" }
 fastboot-protocol = { path = "../fastboot-protocol", default-features = false }
 base64 = "0.22"
+lz4_flex = "0.11"
 clap = { version = "4.4", features = ["derive"] }
 thiserror = "1.0"
 libc = "0.2"

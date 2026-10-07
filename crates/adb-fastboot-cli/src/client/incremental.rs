@@ -14,11 +14,18 @@
 //! `pm install --incremental` plus a `/proc/fs/incfs` probe implements AOSP's
 //! signature/database/inc-server/`abb_exec` protocol.
 
+mod incremental_server;
 mod incremental_utils;
 
+#[allow(unused_imports)]
+pub use incremental_server::{
+    IncrementalServer, RequestCommand, ResponseHeader, SendResult, ServerFile,
+};
+
+#[allow(unused_imports)]
 pub use incremental_utils::{
     encode_signature, read_id_sig_headers, read_signature, requires_v4_signature,
-    validate_signature, verity_tree_blocks_for_file, verity_tree_size_for_file,
+    skip_id_sig_headers, validate_signature, verity_tree_blocks_for_file, verity_tree_size_for_file,
 };
 
 use std::io::Read;
@@ -488,7 +495,6 @@ mod tests {
 
     #[test]
     fn should_use_incremental_requires_valid_idsig_for_apks() {
-        use incremental_utils::verity_tree_size_for_file;
         let root = std::env::temp_dir().join(format!("incr-default-{}", std::process::id()));
 
         // Missing file → false.
