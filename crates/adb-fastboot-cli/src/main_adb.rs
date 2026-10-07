@@ -6,8 +6,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use adb_protocol::{
     AdbAuth, AdbMessageHeader, AdbServerTransport, TcpTransport, Transport,
-    ADB_VERSION, A_AUTH, A_AUTH_TOKEN,
-    A_CLSE, A_CNXN, A_OPEN, A_STLS, MAX_PAYLOAD_V2,
+    A_CLSE, A_OPEN,
     build_sync_send_req, build_sync_data_chunk, build_sync_done,
     host_cnxn_payload,
 };
@@ -677,160 +676,21 @@ pub(crate) fn persist_adb_pubkey(auth: &AdbAuth) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Connect to adbd, perform CNXN handshake with A_STLS TLS upgrade support.
-///
-/// If the device responds with A_STLS, the transport is upgraded to TLS
-/// using the auth key, and the CNXN handshake is retried over the encrypted channel.
-#[cfg(feature = "tls")]
+/// Connect through the shared production CNXN/AUTH/STLS handshake.
+/// AOSP adb.cpp replies STLS before TLS; client/auth.cpp waits for device CNXN.
 pub fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     transport: T,
     cnxn_payload: &[u8],
     auth: &AdbAuth,
 ) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
-    let mut transport: Box<dyn Transport> = Box::new(transport);
-
-    // AOSP client semantics (adb.cpp handle_packet → A_AUTH/TOKEN, auth.cpp
-    // send_auth_response): answer each A_AUTH TOKEN with a SIGNATURE from the
-    // next key; when keys are exhausted send RSAPUBLICKEY once and wait.
-    let mut responder = adb_protocol::AuthResponder::single(auth.clone());
-
-    // Send initial CNXN
-    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-    transport.send_message(&cnxn_hdr, cnxn_payload)?;
-
-    loop {
-        let (resp_hdr, payload) = transport.recv_message()?;
-
-        match resp_hdr.command {
-            A_CNXN => {
-                // Normal path — no TLS required
-                let banner = String::from_utf8_lossy(&payload).to_string();
-
-                // Persist the public key so future SIGNATURE verifications
-                // succeed without requiring another authorization dialog
-                // (HyperOS does not always persist via AdbDebuggingManager).
-                #[cfg(target_os = "android")]
-                if responder.pubkey_sent() {
-                    persist_adb_pubkey(auth)?;
-                }
-
-                return Ok((DeviceInfo { banner }, transport));
-            }
-            A_AUTH if resp_hdr.arg0 == A_AUTH_TOKEN => {
-                if payload.len() != 20 {
-                    return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
-                }
-                if let Some((hdr, auth_payload)) = responder.respond_to_token(&payload)? {
-                    transport.send_message(&hdr, &auth_payload)?;
-                }
-                continue;
-            }
-            A_STLS => break, // TLS upgrade path below
-            _ => {
-                return Err(format!(
-                    "Unexpected handshake response: cmd={:#x}",
-                    resp_hdr.command
-                )
-                .into());
-            }
-        }
-    }
-
-    // A_STLS received — upgrade to TLS and re-send CNXN.
-    {
-        use adb_protocol::tls;
-        use adb_protocol::AdbTlsTransport;
-
-        let rsa_pem = match adb_protocol::auth::export_private_key_to_pem(auth.private_key()) {
-            Ok(pem) => pem,
-            Err(e) => return Err(format!("Failed to export RSA key: {e}").into()),
-        };
-        let (cert_der, key_der) = match tls::generate_self_signed_cert(&rsa_pem) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[adb-auth] TLS cert generation failed (falling back to non-TLS): {e}");
-                return Ok((DeviceInfo { banner: String::new() }, transport));
-            }
-        };
-        let config = match tls::create_tls_config(cert_der, key_der) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[adb-auth] TLS config creation failed (falling back to non-TLS): {e}");
-                return Ok((DeviceInfo { banner: String::new() }, transport));
-            }
-        };
-
-        let tls_transport = match AdbTlsTransport::new(transport, config, "adb") {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[adb-auth] TLS upgrade failed: {e}");
-                return Err(format!("TLS upgrade failed: {e}").into());
-            }
-        };
-
-        // Re-send CNXN over TLS
-        let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-        let mut tls_box: Box<dyn Transport> = Box::new(tls_transport);
-        tls_box.send_message(&cnxn_hdr, cnxn_payload)?;
-
-        let (resp_hdr2, payload2) = tls_box.recv_message()?;
-        if resp_hdr2.command != A_CNXN {
-            return Err(format!(
-                "Unexpected handshake response after TLS upgrade: cmd={:#x}",
-                resp_hdr2.command
-            )
-            .into());
-        }
-
-        let banner = String::from_utf8_lossy(&payload2).to_string();
-        Ok((DeviceInfo { banner }, tls_box))
-    }
-}
-
-/// Non-TLS fallback — A_STLS will return an error if the device requires TLS.
-#[cfg(not(feature = "tls"))]
-fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
-    transport: T,
-    cnxn_payload: &[u8],
-    auth: &AdbAuth,
-) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
-    let mut transport: Box<dyn Transport> = Box::new(transport);
-    let mut responder = adb_protocol::AuthResponder::single(auth.clone());
-    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-
-    transport.send_message(&cnxn_hdr, cnxn_payload)?;
-
-    loop {
-        let (resp_hdr, payload) = transport.recv_message()?;
-        if resp_hdr.command == A_STLS {
-            return Err("Device requires TLS (A_STLS) but the `tls` feature is not enabled. \
-                        Rebuild with --features tls"
-                .into());
-        }
-        if resp_hdr.command == A_AUTH && resp_hdr.arg0 == A_AUTH_TOKEN {
-            if payload.len() != 20 {
-                return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
-            }
-            if let Some((hdr, auth_payload)) = responder.respond_to_token(&payload)? {
-                transport.send_message(&hdr, &auth_payload)?;
-            }
-            continue;
-        }
-        if resp_hdr.command != A_CNXN {
-            return Err(format!("Unexpected handshake response: cmd={:#x}", resp_hdr.command).into());
-        }
-
-        let banner = String::from_utf8_lossy(&payload).to_string();
-
-        // Persist the public key so future SIGNATURE verifications succeed
-        // without requiring another authorization dialog.
-        #[cfg(target_os = "android")]
-        if responder.pubkey_sent() {
-            persist_adb_pubkey(auth)?;
-        }
-
-        return Ok((DeviceInfo { banner }, transport));
-    }
+    let (info, transport) =
+        client::transport::connect_and_handshake_with_tls_upgrade(transport, cnxn_payload, auth)?;
+    Ok((
+        DeviceInfo {
+            banner: info.banner,
+        },
+        transport,
+    ))
 }
 
 /// AOSP install_app_incremental (adb_install.cpp:299-357) over an already
