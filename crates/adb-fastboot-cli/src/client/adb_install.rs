@@ -86,6 +86,8 @@ pub enum InstallModeRequest {
 pub enum InstallMode {
     Push,
     Streamed,
+    /// AOSP `INSTALL_INCREMENTAL` (adb_install.cpp:52-58).
+    Incremental,
 }
 
 /// AOSP `send_command` (adb_install.cpp:152-158) transport selection:
@@ -189,6 +191,106 @@ pub fn select_install_mode(
         InstallModeRequest::Auto if supports_cmd => Ok(InstallMode::Streamed),
         InstallModeRequest::Auto => Ok(InstallMode::Push),
     }
+}
+
+/// AOSP `CmdlineOption` (adb_install.cpp:44-49): the `--incremental` /
+/// `--no-incremental` command-line request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdlineIncremental {
+    None,
+    Enable,
+    Disable,
+}
+
+/// AOSP `android::base::ParseBool` (libbase/strings.cpp): exact-match
+/// lowercase tokens only; anything else is unparseable (`None`).
+pub fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" | "y" | "yes" | "on" | "true" => Some(true),
+        "0" | "n" | "no" | "off" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// AOSP `calculate_install_mode` (adb_install.cpp:353-415): resolve the
+/// primary install mode and optional fallback.
+///
+/// The `(Incremental, Some(regular))` result is the incremental-by-default
+/// posture: attempt incremental silently, fall back to the regular mode on
+/// failure. `probe_device_default` performs the device-side gate
+/// (`settings get global enable_adb_incremental_install_default`) and is only
+/// invoked when the abb_exec / env / mode-from-args gates allow it; the
+/// closure's `None` means "unparseable or unavailable" (incremental stays on).
+pub fn calculate_install_mode(
+    mode_from_args: Option<InstallMode>,
+    incremental_request: CmdlineIncremental,
+    abb_exec_supported: bool,
+    env_value: Option<String>,
+    best_mode: InstallMode,
+    mut probe_device_default: impl FnMut() -> Option<bool>,
+) -> Result<(InstallMode, Option<InstallMode>), String> {
+    // (`--incremental` vs `--fastdeploy` cannot conflict here: this port has
+    // no --fastdeploy flag.)
+    if let Some(mode) = mode_from_args {
+        if incremental_request == CmdlineIncremental::Enable {
+            return Err("--incremental is not compatible with other installation modes".to_string());
+        }
+        return Ok((mode, None));
+    }
+
+    let mut request = incremental_request;
+    if request != CmdlineIncremental::Disable && !abb_exec_supported {
+        if request == CmdlineIncremental::None {
+            request = CmdlineIncremental::Disable;
+        } else {
+            return Err("Device doesn't support incremental installations".to_string());
+        }
+    }
+    if request == CmdlineIncremental::None {
+        // Check whether the host is OK with incremental by default.
+        if let Some(value) = env_value.as_deref() {
+            if parse_bool(value) == Some(false) {
+                request = CmdlineIncremental::Disable;
+            }
+        }
+    }
+    if request == CmdlineIncremental::None {
+        // Still OK: ask the device whether it allows incremental by default.
+        if probe_device_default() == Some(false) {
+            request = CmdlineIncremental::Disable;
+        }
+    }
+
+    if request == CmdlineIncremental::Enable {
+        // Explicitly requested — no fallback.
+        return Ok((InstallMode::Incremental, None));
+    }
+    if request == CmdlineIncremental::None {
+        // No opinion — use incremental, fall back to regular on failure.
+        return Ok((InstallMode::Incremental, Some(best_mode)));
+    }
+    // Incremental turned off — the regular best mode without a fallback.
+    Ok((best_mode, None))
+}
+
+/// AOSP calculate_install_mode's device gate (adb_install.cpp:391-408): ask
+/// the device for `settings get global enable_adb_incremental_install_default`.
+///
+/// Returns the parsed value (`None` = unparseable/missing), or an error when
+/// the probe command itself failed. Deviation note: upstream feeds
+/// `read_status_line`'s buffer (trailing newline included) straight into
+/// `ParseBool`, which makes the gate effectively inert; this port trims the
+/// line before parsing so an explicit `false` actually disables.
+pub fn probe_incremental_default_disabled(
+    transport: &mut dyn Transport,
+) -> Result<Option<bool>, String> {
+    const SERVICE: &str = "abb_exec:settings\0get\0global\0enable_adb_incremental_install_default";
+    let (local_id, remote_id) =
+        super::protocol::open_service(transport, SERVICE, 1).map_err(|e| e.to_string())?;
+    let output =
+        read_exec_output(transport, local_id, remote_id, Vec::new()).map_err(|e| e.to_string())?;
+    let first_line = output.lines().next().unwrap_or("");
+    Ok(parse_bool(first_line.trim()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -983,6 +1085,132 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use adb_protocol::{SyncMessageHeader, TransportError, SYNC_DATA, SYNC_DONE, SYNC_FAIL, SYNC_OKAY, SYNC_SEND};
+
+    #[test]
+    fn parse_bool_matches_libbase_exactly() {
+        for true_token in ["1", "y", "yes", "on", "true"] {
+            assert_eq!(parse_bool(true_token), Some(true), "{true_token}");
+        }
+        for false_token in ["0", "n", "no", "off", "false"] {
+            assert_eq!(parse_bool(false_token), Some(false), "{false_token}");
+        }
+        // Exact-match, lowercase only — anything else is unparseable.
+        for garbage in ["", "False", "TRUE", "false ", "null", "2"] {
+            assert_eq!(parse_bool(garbage), None, "{garbage:?}");
+        }
+    }
+
+    #[test]
+    fn calculate_install_mode_matches_aosp_gates() {
+        use CmdlineIncremental::{Disable, Enable, None as NoRequest};
+        let never = || -> Option<bool> { panic!("device probe must not run") };
+
+        // Explicit --incremental: no fallback, conflicts with a mode flag.
+        assert_eq!(
+            calculate_install_mode(None, Enable, true, None, InstallMode::Streamed, never),
+            Ok((InstallMode::Incremental, None))
+        );
+        assert_eq!(
+            calculate_install_mode(
+                Some(InstallMode::Streamed),
+                Enable,
+                true,
+                None,
+                InstallMode::Streamed,
+                never
+            ),
+            Err("--incremental is not compatible with other installation modes".to_string())
+        );
+        // Explicit --incremental without abb_exec: hard error.
+        assert_eq!(
+            calculate_install_mode(None, Enable, false, None, InstallMode::Streamed, never),
+            Err("Device doesn't support incremental installations".to_string())
+        );
+
+        // Mode from args wins; --no-incremental is compatible with it.
+        assert_eq!(
+            calculate_install_mode(
+                Some(InstallMode::Push),
+                Disable,
+                true,
+                None,
+                InstallMode::Streamed,
+                never
+            ),
+            Ok((InstallMode::Push, None))
+        );
+
+        // No abb_exec → gate off, no env/probe consultation.
+        assert_eq!(
+            calculate_install_mode(None, NoRequest, false, None, InstallMode::Push, never),
+            Ok((InstallMode::Push, None))
+        );
+
+        // Env gate: "false" (libbase token) disables; garbage keeps the default.
+        assert_eq!(
+            calculate_install_mode(
+                None,
+                NoRequest,
+                true,
+                Some("false".to_string()),
+                InstallMode::Streamed,
+                never
+            ),
+            Ok((InstallMode::Streamed, None))
+        );
+        assert_eq!(
+            calculate_install_mode(
+                None,
+                NoRequest,
+                true,
+                Some("0".to_string()),
+                InstallMode::Streamed,
+                never
+            ),
+            Ok((InstallMode::Streamed, None))
+        );
+
+        // Device gate: probed only when earlier gates allow.
+        assert_eq!(
+            calculate_install_mode(
+                None,
+                NoRequest,
+                true,
+                None,
+                InstallMode::Streamed,
+                || Some(false)
+            ),
+            Ok((InstallMode::Streamed, None))
+        );
+        assert_eq!(
+            calculate_install_mode(
+                None,
+                NoRequest,
+                true,
+                None,
+                InstallMode::Streamed,
+                || Some(true)
+            ),
+            Ok((InstallMode::Incremental, Some(InstallMode::Streamed)))
+        );
+        // Unparseable/unavailable probe → incremental stays on (with fallback).
+        assert_eq!(
+            calculate_install_mode(None, NoRequest, true, None, InstallMode::Push, || None),
+            Ok((InstallMode::Incremental, Some(InstallMode::Push)))
+        );
+        // Garbage env keeps incremental on too, and the probe then runs.
+        assert_eq!(
+            calculate_install_mode(
+                None,
+                NoRequest,
+                true,
+                Some("garbage".to_string()),
+                InstallMode::Streamed,
+                || None
+            ),
+            Ok((InstallMode::Incremental, Some(InstallMode::Streamed)))
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum SyncOutcome { Okay, Fail, Disconnect }

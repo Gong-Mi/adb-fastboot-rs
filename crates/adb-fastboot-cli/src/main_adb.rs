@@ -833,6 +833,52 @@ fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     }
 }
 
+/// AOSP install_app_incremental (adb_install.cpp:299-357) over an already
+/// connected transport. Returns `Err(None)` for a silent failure (the caller
+/// falls back to the regular install) and `Err(Some(message))` for a hard
+/// failure (the caller prints `adb: <message>` and exits).
+fn run_incremental_attempt(
+    transport: &mut dyn Transport,
+    files: &[&Path],
+    silent: bool,
+    wait: bool,
+) -> Result<(), Option<String>> {
+    if silent && !client::incremental::should_use_incremental_by_default(files) {
+        return Err(None);
+    }
+    println!("Performing Incremental Install");
+    let started = std::time::Instant::now();
+    let executor = std::env::current_exe()
+        .map_err(|error| Some(format!("Cannot resolve the adb executable path: {error}")))?;
+    match client::incremental::install(transport, files, &[], silent, &executor.to_string_lossy()) {
+        Ok((_pump, server)) => {
+            println!(
+                "Install command complete in {} ms",
+                started.elapsed().as_millis()
+            );
+            if wait {
+                client::incremental::wait_for_incremental_server(server);
+            }
+            Ok(())
+        }
+        Err(_) if silent => Err(None),
+        Err(error) => Err(Some(error)),
+    }
+}
+
+/// Open a fresh connection to the device. AOSP's fallback installs run their
+/// own `send_command` (each opens a new connection via `adb_connect`); mirror
+/// that for the incremental fallback path so a consumed connection is left
+/// behind.
+fn fresh_transport(
+    addr: &str,
+) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
+    let transport = TcpTransport::connect_timeout(addr, Duration::from_secs(3))
+        .map_err(|error| format!("Cannot connect to adbd at {addr}: {error}"))?;
+    let cnxn_payload = host_cnxn_payload();
+    connect_and_handshake_with_tls_upgrade(transport, &cnxn_payload, default_auth())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let addr = resolve_target_addr(cli.serial.as_deref(), ADBD_PORT);
@@ -1120,8 +1166,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             streaming,
             no_streaming,
             incremental,
+            no_incremental,
             wait,
-            ..
         } => {
             let apk_path = Path::new(apk);
             if !apk_path.exists() {
@@ -1135,12 +1181,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("This install command currently supports .apk files only; APEX install is not implemented".into());
             }
 
-            let request = if *streaming {
-                client::adb_install::InstallModeRequest::Streaming
+            let mode_from_args = if *streaming {
+                Some(client::adb_install::InstallMode::Streamed)
             } else if *no_streaming {
-                client::adb_install::InstallModeRequest::NoStreaming
+                Some(client::adb_install::InstallMode::Push)
             } else {
-                client::adb_install::InstallModeRequest::Auto
+                None
+            };
+            let incremental_request = if *incremental {
+                client::adb_install::CmdlineIncremental::Enable
+            } else if *no_incremental {
+                client::adb_install::CmdlineIncremental::Disable
+            } else {
+                client::adb_install::CmdlineIncremental::None
             };
             let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
                 .map_err(|error| format!("Cannot connect to adbd at {addr}: {error}"))?;
@@ -1151,47 +1204,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 default_auth(),
             )?;
 
-            if *incremental {
-                // AOSP calculate_install_mode (adb_install.cpp:371-377):
-                // an explicit --incremental requires the abb_exec feature.
-                if !client::adb_install::abb_exec_supported(&device_info.banner) {
-                    eprintln!("Device doesn't support incremental installations");
+            // AOSP calculate_install_mode (adb_install.cpp:353-415): pick the
+            // primary mode and optional fallback; the incremental-by-default
+            // path consults the abb_exec, env and device-setting gates.
+            let best_mode = client::adb_install::select_install_mode(
+                &device_info.banner,
+                client::adb_install::InstallModeRequest::Auto,
+            )?;
+            let env_value = std::env::var("ADB_INSTALL_DEFAULT_INCREMENTAL").ok();
+            let (primary, fallback) = match client::adb_install::calculate_install_mode(
+                mode_from_args,
+                incremental_request,
+                client::adb_install::abb_exec_supported(&device_info.banner),
+                env_value,
+                best_mode,
+                || match client::adb_install::probe_incremental_default_disabled(&mut transport) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        eprintln!(
+                            "adb: retrieving the default device installation mode failed: {message}"
+                        );
+                        None
+                    }
+                },
+            ) {
+                Ok(plan) => plan,
+                Err(message) => {
+                    eprintln!("{message}");
                     std::process::exit(1);
                 }
-                // AOSP install_app_incremental (adb_install.cpp:299-357):
-                // explicit request → AllowMissingSignatures policy, then the
-                // full incremental pipeline. The pump/inc-server pair keeps
-                // streaming after this process exits.
-                println!("Performing Incremental Install");
-                let started = std::time::Instant::now();
-                let executor = std::env::current_exe()
-                    .map_err(|error| format!("Cannot resolve the adb executable path: {error}"))?;
+            };
+            if (primary == client::adb_install::InstallMode::Streamed
+                || fallback.unwrap_or(client::adb_install::InstallMode::Push)
+                    == client::adb_install::InstallMode::Streamed)
+                && best_mode == client::adb_install::InstallMode::Push
+            {
+                eprintln!("Attempting to use streaming install on unsupported device");
+                std::process::exit(1);
+            }
+
+            let mut mode = primary;
+            if mode == client::adb_install::InstallMode::Incremental {
+                let silent = fallback.is_some();
                 let files: [&Path; 1] = [apk_path];
-                match client::incremental::install(
-                    &mut transport,
-                    &files,
-                    &[],
-                    false,
-                    &executor.to_string_lossy(),
-                ) {
-                    Ok((_pump, server)) => {
-                        println!(
-                            "Install command complete in {} ms",
-                            started.elapsed().as_millis()
-                        );
-                        if *wait {
-                            client::incremental::wait_for_incremental_server(server);
-                        }
-                        return Ok(());
+                match run_incremental_attempt(&mut transport, &files, silent, *wait) {
+                    Ok(()) => return Ok(()),
+                    Err(None) => {
+                        // AOSP's fallback install opens its own connection
+                        // (`send_command` → `adb_connect`); mirror that so
+                        // the consumed incremental connection is left behind.
+                        mode = fallback.expect("silent attempts carry a fallback");
+                        let (_, fresh) = fresh_transport(&addr)?;
+                        transport = fresh;
                     }
-                    Err(error) => {
-                        eprintln!("adb: {error}");
+                    Err(Some(message)) => {
+                        eprintln!("adb: {message}");
                         std::process::exit(1);
                     }
                 }
             }
 
-            let mode = client::adb_install::select_install_mode(&device_info.banner, request)?;
             let options = client::adb_install::InstallOptions {
                 reinstall: true,
                 ..Default::default()
@@ -1199,6 +1271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match mode {
                 client::adb_install::InstallMode::Streamed => {
+                    println!("Performing Streamed Install");
                     let cmd_transport = client::adb_install::CommandTransport::from_banner(&device_info.banner);
                     let output = client::adb_install::install_apk_streamed(
                         &mut transport,
@@ -1210,6 +1283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("[adb-rs] Streamed install succeeded: {}", output.trim());
                 }
                 client::adb_install::InstallMode::Push => {
+                    println!("Performing Push Install");
                     let mut printer = client::line_printer::LinePrinter::new();
                     client::adb_install::install_apk(
                         &mut transport,
@@ -1219,10 +1293,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                     println!("[adb-rs] Push install succeeded");
                 }
+                client::adb_install::InstallMode::Incremental => {
+                    eprintln!("invalid install mode");
+                    std::process::exit(1);
+                }
             }
         }
 
-        Commands::InstallMultiple { apks, incremental, wait, .. } => {
+        Commands::InstallMultiple { apks, incremental, no_incremental, wait } => {
             let apk_paths: Vec<&Path> = apks.iter().map(|apk| Path::new(apk)).collect();
             let missing: Vec<&str> = apks
                 .iter()
@@ -1239,46 +1317,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (device_info, mut transport) =
                 connect_and_handshake_with_tls_upgrade(transport, &cnxn_payload, default_auth())?;
 
-            if *incremental {
-                // AOSP install_multiple_app (adb_install.cpp:680-717): the
-                // same incremental pipeline, with every listed file.
-                if !client::adb_install::abb_exec_supported(&device_info.banner) {
-                    eprintln!("Device doesn't support incremental installations");
+            // AOSP install_multiple_app (adb_install.cpp:680-717): same
+            // mode resolution as `install` (no mode flags on this command).
+            let incremental_request = if *incremental {
+                client::adb_install::CmdlineIncremental::Enable
+            } else if *no_incremental {
+                client::adb_install::CmdlineIncremental::Disable
+            } else {
+                client::adb_install::CmdlineIncremental::None
+            };
+            let best_mode = client::adb_install::select_install_mode(
+                &device_info.banner,
+                client::adb_install::InstallModeRequest::Auto,
+            )?;
+            let env_value = std::env::var("ADB_INSTALL_DEFAULT_INCREMENTAL").ok();
+            let (primary, fallback) = match client::adb_install::calculate_install_mode(
+                None,
+                incremental_request,
+                client::adb_install::abb_exec_supported(&device_info.banner),
+                env_value,
+                best_mode,
+                || match client::adb_install::probe_incremental_default_disabled(&mut transport) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        eprintln!(
+                            "adb: retrieving the default device installation mode failed: {message}"
+                        );
+                        None
+                    }
+                },
+            ) {
+                Ok(plan) => plan,
+                Err(message) => {
+                    eprintln!("{message}");
                     std::process::exit(1);
                 }
-                println!("Performing Incremental Install");
-                let started = std::time::Instant::now();
-                let executor = std::env::current_exe()
-                    .map_err(|error| format!("Cannot resolve the adb executable path: {error}"))?;
-                match client::incremental::install(
-                    &mut transport,
-                    &apk_paths,
-                    &[],
-                    false,
-                    &executor.to_string_lossy(),
-                ) {
-                    Ok((_pump, server)) => {
-                        println!(
-                            "Install command complete in {} ms",
-                            started.elapsed().as_millis()
-                        );
-                        if *wait {
-                            client::incremental::wait_for_incremental_server(server);
-                        }
-                        return Ok(());
+            };
+
+            let mut mode = primary;
+            if mode == client::adb_install::InstallMode::Incremental {
+                let silent = fallback.is_some();
+                match run_incremental_attempt(&mut transport, &apk_paths, silent, *wait) {
+                    Ok(()) => return Ok(()),
+                    Err(None) => {
+                        mode = fallback.expect("silent attempts carry a fallback");
+                        let (_, fresh) = fresh_transport(&addr)?;
+                        transport = fresh;
                     }
-                    Err(error) => {
-                        eprintln!("adb: {error}");
+                    Err(Some(message)) => {
+                        eprintln!("adb: {message}");
                         std::process::exit(1);
                     }
                 }
             }
 
             let mut printer = client::line_printer::LinePrinter::new();
-            let mode = client::adb_install::select_install_mode(
-                &device_info.banner,
-                client::adb_install::InstallModeRequest::Auto,
-            )?;
             let options = client::adb_install::InstallOptions {
                 streaming: Some(mode == client::adb_install::InstallMode::Streamed),
                 reinstall: true,
