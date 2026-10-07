@@ -1,198 +1,11 @@
-//! Production ADB STLS tests, not a generic TLS echo test. The independent
-//! fake adbd follows AOSP adb.cpp:318-325,447-453 and client/auth.cpp:487-505:
-//! host CNXN -> device STLS -> host STLS -> TLS 1.3 -> device CNXN -> host OPEN.
-//! No server process, USB, real device, or persisted host identity is used.
+//! Real CLI STLS/TLS tests with independent public host/server keys.
+//! AOSP adb.cpp:318-325,447-453; client/auth.cpp:487-505; daemon/auth.cpp:341-384.
+//! Disposable persisted HOME identity; no user keys, device or system server.
 #![cfg(feature = "tls")]
-
-use adb_protocol::{tls, AdbAuth, A_CNXN, A_OPEN, A_STLS, A_STLS_VERSION};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant};
-
-const TIMEOUT: Duration = Duration::from_secs(15);
-const BANNER: &[u8] = b"device::features=cmd,shell_v2\0";
-
-fn word(bytes: &[u8]) -> u32 {
-    u32::from_le_bytes(bytes[..4].try_into().unwrap())
-}
-
-// Intentionally independent of the production Transport codec.
-fn recv_frame(io: &mut (impl Read + ?Sized)) -> std::io::Result<(u32, u32, u32, Vec<u8>)> {
-    let mut header = [0; 24];
-    io.read_exact(&mut header)?;
-    let command = word(&header);
-    assert_eq!(word(&header[20..]), command ^ u32::MAX, "ADB magic");
-    let length = word(&header[12..]) as usize;
-    assert!(length <= 1024 * 1024, "bounded ADB payload");
-    let mut payload = vec![0; length];
-    io.read_exact(&mut payload)?;
-    Ok((command, word(&header[4..]), word(&header[8..]), payload))
-}
-
-fn send_frame(io: &mut (impl Write + ?Sized), command: u32, arg0: u32, payload: &[u8]) {
-    for field in [
-        command,
-        arg0,
-        0,
-        payload.len() as u32,
-        payload.iter().map(|&b| u32::from(b)).sum(),
-        command ^ u32::MAX,
-    ] {
-        io.write_all(&field.to_le_bytes()).unwrap();
-    }
-    io.write_all(payload).unwrap();
-    io.flush().unwrap();
-}
-
-fn fixture_identity() -> &'static (Vec<u8>, Vec<u8>, String) {
-    static IDENTITY: OnceLock<(Vec<u8>, Vec<u8>, String)> = OnceLock::new();
-    IDENTITY.get_or_init(|| {
-        let auth = AdbAuth::generate("fake-adbd-stls").unwrap();
-        let pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key()).unwrap();
-        let (cert, key) = tls::generate_self_signed_cert(&pem).unwrap();
-        (cert, key, pem)
-    })
-}
-
-#[derive(Debug)]
-struct RequireClientCertificate {
-    reject: bool,
-}
-impl rustls::server::danger::ClientCertVerifier for RequireClientCertificate {
-    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        &[]
-    }
-    fn verify_client_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        if self.reject {
-            return Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            ));
-        }
-        // Fixture trust is not Android pairing. Require a real certificate and
-        // verify CertificateVerify cryptographically below, like adbd's TLS.
-        Ok(rustls::server::danger::ClientCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::General("fixture requires TLS 1.3".into()))
-    }
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-fn server_config() -> Arc<rustls::ServerConfig> {
-    client_auth_server_config(false)
-}
-
-fn client_auth_server_config(reject: bool) -> Arc<rustls::ServerConfig> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    let (cert, key, _) = fixture_identity();
-    Arc::new(
-        rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_client_cert_verifier(Arc::new(RequireClientCertificate { reject }))
-        .with_single_cert(
-            vec![CertificateDer::from(cert.clone())],
-            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key.clone())),
-        )
-        .unwrap(),
-    )
-}
-
-fn accept_stls(listener: TcpListener) -> TcpStream {
-    listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + TIMEOUT;
-    let mut socket = loop {
-        match listener.accept() {
-            Ok((socket, _)) => break socket,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < deadline, "CLI never connected");
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("accept: {error}"),
-        }
-    };
-    socket.set_read_timeout(Some(TIMEOUT)).unwrap();
-    socket.set_write_timeout(Some(TIMEOUT)).unwrap();
-    let (command, _, _, payload) = recv_frame(&mut socket).unwrap();
-    assert_eq!(command, A_CNXN, "initial plaintext host CNXN");
-    assert!(payload.starts_with(b"host::"));
-    send_frame(&mut socket, A_STLS, A_STLS_VERSION, &[]);
-    // Check the first four bytes before decoding: a ClientHello in place of
-    // this reply is the missing-host-STLS regression, not a TLS setup error.
-    let mut command = [0; 4];
-    socket.read_exact(&mut command).expect("host STLS reply");
-    assert_eq!(
-        &command, b"STLS",
-        "host must reply STLS before TLS ClientHello"
-    );
-    let mut rest = [0; 20];
-    socket.read_exact(&mut rest).unwrap();
-    assert_eq!(word(&rest), A_STLS_VERSION);
-    assert_eq!(word(&rest[4..]), 0, "STLS arg1");
-    assert_eq!(word(&rest[8..]), 0, "STLS has no payload");
-    assert_eq!(word(&rest[12..]), 0, "empty STLS checksum");
-    assert_eq!(word(&rest[16..]), A_STLS ^ u32::MAX);
-    socket
-}
-
-struct Home(PathBuf);
-impl Home {
-    fn new(tag: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("adb-stls-{tag}-{}", std::process::id()));
-        let android = path.join(".android");
-        std::fs::create_dir_all(&android).unwrap();
-        // Generated test-only key, never read from the user's HOME or committed.
-        // Preload it so RSA generation is outside socket/CLI deadlines.
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut key = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(android.join("adbkey"))
-            .unwrap();
-        key.write_all(fixture_identity().2.as_bytes()).unwrap();
-        Self(path)
-    }
-}
-impl Drop for Home {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+#[path = "support/adb_tls.rs"]
+#[allow(dead_code)]
+mod support;
+use support::*;
 
 fn run_cli(addr: std::net::SocketAddr, home: &Home) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_adb-rs"))
@@ -219,8 +32,175 @@ fn run_cli(addr: std::net::SocketAddr, home: &Home) -> Output {
 }
 
 #[test]
+fn identity_oracle_rejects_valid_certificate_for_other_host_key() {
+    use rustls::server::danger::ClientCertVerifier;
+    let (cert, _, _) = server_identity();
+    assert_ne!(certificate_spki(cert).unwrap(), public_spki(HOST_PEM));
+    let verifier = RequireClientCertificate {
+        reject: false,
+        authorized_spki: public_spki(HOST_PEM),
+    };
+    assert!(
+        verifier
+            .verify_client_cert(
+                &rustls::pki_types::CertificateDer::from(cert.clone()),
+                &[],
+                rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1)),
+            )
+            .is_err(),
+        "valid cert for an unauthorized key must be rejected, not just counted"
+    );
+}
+
+#[test]
+fn identity_oracle_persisted_key_matches_upstream_spki_and_rejects_bad_der() {
+    use base64::Engine;
+    use rustls::server::danger::ClientCertVerifier;
+    let home = Home::new("spki-vector");
+    let pem = std::fs::read_to_string(home.0.join(".android/adbkey")).unwrap();
+    let expected = base64::engine::general_purpose::STANDARD
+        .decode(include_str!("fixtures/public-rsa2048-host-spki.b64").trim())
+        .unwrap();
+    assert_eq!(
+        public_spki(&pem),
+        expected,
+        "independent upstream public DER vector"
+    );
+    let (cert, _) = tls::generate_self_signed_cert(&pem).unwrap();
+    assert_eq!(certificate_spki(&cert).unwrap(), expected);
+    let verifier = RequireClientCertificate {
+        reject: false,
+        authorized_spki: expected.clone(),
+    };
+    let verify = |cert: Vec<u8>| {
+        verifier.verify_client_cert(
+            &rustls::pki_types::CertificateDer::from(cert),
+            &[],
+            rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1)),
+        )
+    };
+    assert!(verify(cert.clone()).is_ok());
+    assert!(
+        verify(vec![0x30, 0x80, 0, 0]).is_err(),
+        "indefinite DER length"
+    );
+    assert!(
+        verify(vec![0x30, 0xff]).is_err(),
+        "truncated/oversize DER length"
+    );
+    for end in [0, 1, cert.len() / 2, cert.len() - 1] {
+        assert!(
+            verify(cert[..end].to_vec()).is_err(),
+            "truncated cert {end}"
+        );
+    }
+    let mut containing_authorized_key = server_identity().0.clone();
+    containing_authorized_key.extend_from_slice(&expected);
+    assert!(
+        verify(containing_authorized_key).is_err(),
+        "bytes-contains is not authorization"
+    );
+}
+
+#[test]
+fn other_host_has_valid_tls_certificate_verify_but_is_not_authorized() {
+    use rustls::pki_types::CertificateDer;
+    use rustls::server::danger::ClientCertVerifier;
+    let (wrong_cert, wrong_key, wrong_pem) = server_identity();
+    // Positive cryptographic control only: authorize exactly this other key.
+    // Never disable/relax the identity verifier or signature checks.
+    let config = server_config_for(false, public_spki(wrong_pem));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(TIMEOUT)).unwrap();
+        socket.set_write_timeout(Some(TIMEOUT)).unwrap();
+        let mut connection = rustls::ServerConnection::new(config).unwrap();
+        while connection.is_handshaking() {
+            connection.complete_io(&mut socket).unwrap();
+        }
+        assert_eq!(
+            connection.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3)
+        );
+        let mut stream = rustls::StreamOwned::new(connection, socket);
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"P");
+        stream.write_all(b"K").unwrap();
+        stream.flush().unwrap();
+    });
+    let client_config = tls::create_tls_config(wrong_cert.clone(), wrong_key.clone()).unwrap();
+    let socket = TcpStream::connect(addr).unwrap();
+    socket.set_read_timeout(Some(TIMEOUT)).unwrap();
+    socket.set_write_timeout(Some(TIMEOUT)).unwrap();
+    let connection =
+        rustls::ClientConnection::new(client_config, "adb".try_into().unwrap()).unwrap();
+    let mut stream = rustls::StreamOwned::new(connection, socket);
+    stream.write_all(b"P").unwrap();
+    stream.flush().unwrap();
+    let mut byte = [0];
+    stream.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"K");
+    peer.join().unwrap();
+    let verifier = RequireClientCertificate {
+        reject: false,
+        authorized_spki: public_spki(HOST_PEM),
+    };
+    assert!(verifier
+        .verify_client_cert(
+            &CertificateDer::from(wrong_cert.clone()),
+            &[],
+            rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1))
+        )
+        .is_err());
+    eprintln!("generic TLS proof control: other key completes TLS1.3 + application exchange; authorized-host SPKI oracle rejects same cert");
+}
+
+#[test]
+fn adb_tls_cli_wrong_persisted_host_identity_is_rejected_during_handshake() {
+    let home = Home::with_pem("wrong-host-identity", &server_identity().2);
+    let config = server_config(); // authorizes HOST_PEM, NOT this child's HOME key
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+        let mut socket = accept_stls(listener);
+        let mut connection = rustls::ServerConnection::new(config).unwrap();
+        let error = loop {
+            match connection.complete_io(&mut socket) {
+                Err(error) => break error,
+                Ok(_) => assert!(
+                    connection.is_handshaking(),
+                    "unauthorized identity completed TLS"
+                ),
+            }
+        };
+        assert!(
+            error.to_string().contains("ApplicationVerificationFailure"),
+            "{error}"
+        );
+        eprintln!("adbd rejected wrong host SPKI: {error}; no encrypted CNXN/OPEN");
+    });
+    let output = run_cli(addr, &home);
+    peer.join().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("TLS upgrade failed"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Reboot request sent"));
+    eprintln!(
+        "wrong persisted host identity: CLI rc={:?}, stderr={stderr}",
+        output.status.code()
+    );
+}
+
+#[test]
 fn adb_tls_cli_stls_then_encrypted_cnxn_and_open() {
-    let config = server_config();
+    let home = Home::new("success");
+    let persisted_pem = std::fs::read_to_string(home.0.join(".android/adbkey")).unwrap();
+    let authorized_spki = public_spki(&persisted_pem);
+    let expected_spki = authorized_spki.clone();
+    let config = server_config_for(false, authorized_spki);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let peer = thread::spawn(move || {
@@ -237,6 +217,11 @@ fn adb_tls_cli_stls_then_encrypted_cnxn_and_open() {
             1,
             "host TLS client certificate required"
         );
+        assert_eq!(
+            certificate_spki(stream.conn.peer_certificates().unwrap()[0].as_ref()).unwrap(),
+            expected_spki,
+            "actual CLI cert identity equals persisted authorized adbkey"
+        );
         let (command, local, remote, payload) = recv_frame(&mut stream).unwrap();
         assert_eq!(
             command, A_OPEN,
@@ -245,7 +230,6 @@ fn adb_tls_cli_stls_then_encrypted_cnxn_and_open() {
         assert_eq!((local, remote), (1, 0));
         assert_eq!(payload, b"reboot:tls-fixture");
     });
-    let home = Home::new("success");
     let output = run_cli(addr, &home);
     let peer_result = peer.join();
     assert!(output.status.success(), "production CLI: {output:?}");
@@ -337,16 +321,11 @@ impl rustls::server::ResolvesServerCert for FixedCert {
 
 fn bad_certificate_config(malformed: bool) -> Arc<rustls::ServerConfig> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    let (cert, _, _) = fixture_identity();
+    let (cert, _, _) = server_identity();
     // Generate another fixture identity, then bypass ServerConfig's normal
     // key/certificate consistency check ONLY on the adversarial fake peer.
     // CertificateVerify is signed with the wrong private key (or bad DER).
-    static OTHER_KEY: OnceLock<Vec<u8>> = OnceLock::new();
-    let key = OTHER_KEY.get_or_init(|| {
-        let auth = AdbAuth::generate("fake-adbd-wrong-cert-key").unwrap();
-        let pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key()).unwrap();
-        tls::generate_self_signed_cert(&pem).unwrap().1
-    });
+    let key = tls::generate_self_signed_cert(HOST_PEM).unwrap().1;
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&PrivateKeyDer::from(
         PrivatePkcs8KeyDer::from(key.clone()),
     ))
