@@ -79,7 +79,7 @@ fn zip(entries: &[Entry], zip64: bool, prefix: &[u8], comment: &[u8]) -> Fixture
     for entry in entries {
         offsets.push((bytes.len() - prefix.len()) as u64);
         u32le(&mut bytes, 0x04034b50);
-        u16le(&mut bytes, 20);
+        u16le(&mut bytes, if zip64 { 45 } else { 20 });
         u16le(&mut bytes, entry.flags);
         u16le(&mut bytes, entry.method);
         u16le(&mut bytes, 0);
@@ -88,7 +88,9 @@ fn zip(entries: &[Entry], zip64: bool, prefix: &[u8], comment: &[u8]) -> Fixture
         u32le(&mut bytes, if descriptor { 0 } else { crc32(&entry.data) });
         u32le(
             &mut bytes,
-            if descriptor {
+            if zip64 {
+                u32::MAX
+            } else if descriptor {
                 0
             } else {
                 entry.packed.len() as u32
@@ -96,22 +98,52 @@ fn zip(entries: &[Entry], zip64: bool, prefix: &[u8], comment: &[u8]) -> Fixture
         );
         u32le(
             &mut bytes,
-            if descriptor {
+            if zip64 {
+                u32::MAX
+            } else if descriptor {
                 0
             } else {
                 entry.data.len() as u32
             },
         );
+        let mut local_extra = Vec::new();
+        if zip64 {
+            u16le(&mut local_extra, 1);
+            u16le(&mut local_extra, 16);
+            u64le(
+                &mut local_extra,
+                if descriptor {
+                    0
+                } else {
+                    entry.data.len() as u64
+                },
+            );
+            u64le(
+                &mut local_extra,
+                if descriptor {
+                    0
+                } else {
+                    entry.packed.len() as u64
+                },
+            );
+        }
+        local_extra.extend(&entry.extra);
         u16le(&mut bytes, entry.name.len() as u16);
-        u16le(&mut bytes, entry.extra.len() as u16);
+        u16le(&mut bytes, local_extra.len() as u16);
         bytes.extend(&entry.name);
-        bytes.extend(&entry.extra);
+        bytes.extend(&local_extra);
         bytes.extend(&entry.packed);
         if descriptor {
             u32le(&mut bytes, 0x08074b50);
             u32le(&mut bytes, crc32(&entry.data));
-            u32le(&mut bytes, entry.packed.len() as u32);
-            u32le(&mut bytes, entry.data.len() as u32);
+            // APPNOTE 4.3.9.1-2: ZIP64 descriptor sizes are eight bytes.
+            if zip64 {
+                u64le(&mut bytes, entry.packed.len() as u64);
+                u64le(&mut bytes, entry.data.len() as u64);
+            } else {
+                u32le(&mut bytes, entry.packed.len() as u32);
+                u32le(&mut bytes, entry.data.len() as u32);
+            }
         }
     }
     let cd = bytes.len();
