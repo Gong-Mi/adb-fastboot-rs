@@ -228,6 +228,11 @@ pub enum Commands {
     InstallMultiPackage {
         #[arg(required = true)]
         apks: Vec<String>,
+        /// Seconds to wait for staged APEX sessions to become ready before
+        /// commit; forwarded verbatim to `install-commit` on success
+        /// (adb_install.cpp:930-941).
+        #[arg(long, value_name = "SECONDS")]
+        staged_ready_timeout: Option<String>,
     },
     /// Sync a local directory to the device, pushing changed/new files
     Sync {
@@ -1165,7 +1170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[adb-rs] Install-multiple succeeded");
         }
 
-        Commands::InstallMultiPackage { apks } => {
+        Commands::InstallMultiPackage { apks, staged_ready_timeout } => {
             if apks.is_empty() {
                 return Err("No APK files specified".into());
             }
@@ -1183,6 +1188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &apks,
                 &device_info.banner,
                 &client::adb_install::InstallOptions::default(),
+                staged_ready_timeout.as_deref(),
             )?;
             println!("[adb-rs] Atomic multi-package install succeeded");
         }

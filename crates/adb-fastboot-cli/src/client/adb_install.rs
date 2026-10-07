@@ -727,6 +727,7 @@ pub fn install_multi_package(
     package_arguments: &[String],
     device_banner: &str,
     options: &InstallOptions,
+    staged_ready_timeout: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if package_arguments.is_empty() {
         return Err("No packages provided".into());
@@ -775,6 +776,7 @@ pub fn install_multi_package(
         options,
         CommandTransport::from_banner(device_banner),
         CommandTransport::apex_supported(device_banner),
+        staged_ready_timeout,
     )
 }
 
@@ -784,6 +786,7 @@ fn install_multi_package_sessions(
     options: &InstallOptions,
     cmd_transport: CommandTransport,
     apex_supported: bool,
+    staged_ready_timeout: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // AOSP install_multi_package (adb_install.cpp:756-758, 803-815): any
     // .apex input flips the whole transaction into staged mode — parent
@@ -861,7 +864,14 @@ fn install_multi_package_sessions(
             return Err(format!("install-add-session failed: {}", add_output.trim()).into());
         }
 
-        let commit_args = vec!["install-commit".to_string(), parent_id.clone()];
+        let mut commit_args = vec!["install-commit".to_string()];
+        // AOSP forwards `--staged-ready-timeout <value>` to install-commit
+        // verbatim (adb_install.cpp:930-941).
+        if let Some(timeout) = staged_ready_timeout {
+            commit_args.push("--staged-ready-timeout".to_string());
+            commit_args.push(timeout.to_string());
+        }
+        commit_args.push(parent_id.clone());
         let commit_output = run_install_command(transport, cmd_transport, &commit_args)?;
         if !commit_output.lines().any(|line| line.starts_with("Success")) {
             return Err(format!("parent install-commit failed: {}", commit_output.trim()).into());
@@ -1724,7 +1734,7 @@ mod tests {
         let mut peer = FakeTransport::new(false);
         let banner = "device::features=cmd,shell_v2,apex";
 
-        install_multi_package(&mut peer, &package_args, banner, &InstallOptions::default())
+        install_multi_package(&mut peer, &package_args, banner, &InstallOptions::default(), None)
             .unwrap();
 
         let commands = exec_commands(&peer);
@@ -1760,6 +1770,7 @@ mod tests {
             &[apex.display().to_string()],
             banner,
             &InstallOptions::default(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -1786,6 +1797,7 @@ mod tests {
             &package_args,
             banner,
             &InstallOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -1829,6 +1841,7 @@ mod tests {
             &package_args,
             banner,
             &InstallOptions::default(),
+            None,
         );
 
         assert!(result.is_err());
@@ -1854,6 +1867,7 @@ mod tests {
             &package_args,
             banner,
             &InstallOptions::default(),
+            None,
         );
 
         assert!(result.is_err());
@@ -1863,6 +1877,38 @@ mod tests {
         assert!(commands.iter().any(|command| command == "cmd package install-abandon 43"));
         assert!(commands.iter().any(|command| command == "cmd package install-abandon 44"));
         assert!(!commands.iter().any(|command| command.contains("install-commit")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multi_package_staged_ready_timeout_is_forwarded_to_commit() {
+        let (root, paths) = fixture_apks();
+        let extra = root.join("feature.apk");
+        fs::write(&extra, b"feature").unwrap();
+        let package_args = vec![
+            format!("{}:{}", paths[0].display(), extra.display()),
+            paths[1].display().to_string(),
+        ];
+        let mut peer = FakeTransport::new(false);
+        let banner = "device::features=cmd,shell_v2,apex";
+
+        install_multi_package(
+            &mut peer,
+            &package_args,
+            banner,
+            &InstallOptions::default(),
+            Some("30"),
+        )
+        .unwrap();
+
+        let commands = exec_commands(&peer);
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "cmd package install-commit --staged-ready-timeout 30 42"),
+            "commit missing forwarded timeout: {commands:?}"
+        );
+        assert!(!commands.iter().any(|command| command.contains("install-abandon")));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1877,6 +1923,7 @@ mod tests {
             &package_args,
             "device::features=shell_v2",
             &InstallOptions::default(),
+            None,
         )
         .unwrap_err()
         .to_string();
