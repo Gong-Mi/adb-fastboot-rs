@@ -21,6 +21,7 @@ pub use incremental_utils::{
     validate_signature, verity_tree_blocks_for_file, verity_tree_size_for_file,
 };
 
+use std::io::Read;
 use std::path::Path;
 
 use adb_protocol::Transport;
@@ -167,11 +168,13 @@ pub enum IsDatabaseEntry {
         path: std::path::PathBuf,
     },
     /// `ISUnsignedDatabaseEntry` — sent over the connection stdin before
-    /// any signed streaming (incremental.cpp:96-110).
+    /// any signed streaming (incremental.cpp:96-110). AOSP holds an open
+    /// fd; this port records `local_path` and re-opens at send time.
     Unsigned {
         filename: String,
         size: u64,
         file_id: i32,
+        local_path: std::path::PathBuf,
     },
 }
 
@@ -204,6 +207,7 @@ impl IsDatabaseEntry {
                 filename,
                 size,
                 file_id,
+                ..
             } => format!("{filename}:{size}:{file_id}"),
         }
     }
@@ -289,6 +293,7 @@ pub fn build_database(
                 file_id += 1;
                 id
             },
+            local_path: file.clone(),
         });
     }
 
@@ -310,10 +315,87 @@ pub fn incremental_service_string(
     service
 }
 
+/// Open the incremental connection: `abb_exec:` service with the database
+/// arguments (AOSP `connect_and_send_database`, incremental.cpp:285-289).
+/// Returns (local_id, remote_id) of the open stream; subsequent writes go
+/// to `pm` shell's stdin, reads come from its stdout.
+pub fn connect_incremental(
+    transport: &mut dyn Transport,
+    database: &[IsDatabaseEntry],
+    passthrough_args: &[String],
+) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    let service = incremental_service_string(database, passthrough_args);
+    super::protocol::open_service(transport, &service, 1)
+}
+
+/// AOSP `send_unsigned_files` (incremental.cpp:317-335): stream each
+/// unsigned file's raw bytes over the connection before any signed streaming
+/// begins. AOSP keeps open fds in the database entries; this port re-opens
+/// from `Unsigned.local_path` (recorded deviation — no fd table).
+pub fn send_unsigned_files(
+    transport: &mut dyn Transport,
+    local_id: u32,
+    remote_id: u32,
+    database: &[IsDatabaseEntry],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut printed = false;
+    for entry in database {
+        let IsDatabaseEntry::Unsigned { local_path, .. } = entry else {
+            continue;
+        };
+        if !printed {
+            println!("Sending unsigned files...");
+            printed = true;
+        }
+        let mut file = std::fs::File::open(local_path)?;
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let length = file.read(&mut chunk)?;
+            if length == 0 {
+                break;
+            }
+            let mut pending = Vec::new();
+            super::adb_install::write_exec_payload(
+                transport,
+                local_id,
+                remote_id,
+                &chunk[..length],
+                &mut pending,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// AOSP `wait_for_installation` (incremental.cpp:341-386): read up to 256
+/// bytes of `pm` output; "Success" wins, "Failure [...]" fails, anything
+/// else is a parse error. Streaming may still be running when this returns.
+pub fn wait_for_installation(
+    transport: &mut dyn Transport,
+    local_id: u32,
+    remote_id: u32,
+) -> Result<String, Box<dyn std::error::Error>> {
+    const MAX_MESSAGE_SIZE: usize = 256;
+    let output = super::adb_install::read_exec_output(transport, local_id, remote_id, Vec::new())?;
+    let truncated: String = output.chars().take(MAX_MESSAGE_SIZE).collect();
+    if truncated.contains("Success") {
+        return Ok(truncated);
+    }
+    if let Some(begin) = truncated.find("Failure [") {
+        if truncated.rfind(']').is_some_and(|end| end >= begin) {
+            return Err(format!("Install failed: {}", truncated.trim()).into());
+        }
+    }
+    if truncated.chars().count() == MAX_MESSAGE_SIZE {
+        return Err("Output too long".into());
+    }
+    Err(format!("Failed to parse output: {}", truncated.trim()).into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adb_protocol::{AdbMessageHeader, TransportError};
+    use adb_protocol::{AdbMessageHeader, TransportError, A_CLSE, A_OKAY, A_WRTE};
     use std::io::{Read, Write};
 
     #[derive(Default)]
@@ -485,6 +567,7 @@ mod tests {
                 filename,
                 size,
                 file_id,
+                ..
             } => {
                 assert_eq!(filename, "notes.txt");
                 assert_eq!(*size, 5);
@@ -519,6 +602,150 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Fake abb_exec stream peer: expects one A_OPEN (records the service
+    /// string), OKAYs it, consumes A_WRTE payloads with per-chunk OKAYs
+    /// (non-1 remote id, matching install-domain fake peers), then answers
+    /// with a configurable final WRTE + CLSE.
+    struct FakeAbbStream {
+        incoming: std::collections::VecDeque<(AdbMessageHeader, Vec<u8>)>,
+        opened_services: Vec<String>,
+        streamed_bytes: Vec<u8>,
+        final_output: Vec<u8>,
+        close_pending: bool,
+    }
+
+    impl FakeAbbStream {
+        fn new(final_output: &[u8]) -> Self {
+            Self {
+                incoming: std::collections::VecDeque::new(),
+                opened_services: Vec::new(),
+                streamed_bytes: Vec::new(),
+                final_output: final_output.to_vec(),
+                close_pending: false,
+            }
+        }
+
+        fn enqueue(&mut self, command: u32, arg0: u32, arg1: u32, payload: &[u8]) {
+            self.incoming.push_back((
+                AdbMessageHeader::new(command, arg0, arg1, payload),
+                payload.to_vec(),
+            ));
+        }
+    }
+
+    impl Read for FakeAbbStream {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for FakeAbbStream {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Transport for FakeAbbStream {
+        fn send_message(
+            &mut self,
+            header: &AdbMessageHeader,
+            payload: &[u8],
+        ) -> Result<(), TransportError> {
+            const REMOTE_ID: u32 = 97;
+            match header.command {
+                adb_protocol::A_OPEN => {
+                    let destination = String::from_utf8_lossy(payload).into_owned();
+                    self.opened_services.push(destination);
+                    self.enqueue(adb_protocol::A_OKAY, REMOTE_ID, header.arg0, &[]);
+                }
+                adb_protocol::A_WRTE => {
+                    if header.arg1 != REMOTE_ID {
+                        return Err(TransportError::Protocol(format!(
+                            "host wrote to stream {}, expected {REMOTE_ID}",
+                            header.arg1
+                        )));
+                    }
+                    self.streamed_bytes.extend_from_slice(payload);
+                    self.enqueue(adb_protocol::A_OKAY, REMOTE_ID, header.arg0, &[]);
+                }
+                adb_protocol::A_CLSE => {
+                    if header.arg1 != REMOTE_ID || !self.close_pending {
+                        return Err(TransportError::Protocol("unexpected A_CLSE".into()));
+                    }
+                    self.close_pending = false;
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn recv_message(&mut self) -> Result<(AdbMessageHeader, Vec<u8>), TransportError> {
+            self.incoming
+                .pop_front()
+                .ok_or_else(|| TransportError::Protocol("fake abb stream exhausted".into()))
+        }
+    }
+
+    #[test]
+    fn connect_send_unsigned_and_wait_roundtrip_over_abb_exec() {
+        let root = std::env::temp_dir().join(format!("incr-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let unsigned_file = root.join("data.txt");
+        std::fs::write(&unsigned_file, b"unsigned-payload").unwrap();
+
+        let database = vec![IsDatabaseEntry::Unsigned {
+            filename: "data.txt".into(),
+            size: 15,
+            file_id: 0,
+            local_path: unsigned_file.clone(),
+        }];
+
+        let mut peer = FakeAbbStream::new(b"Success\n");
+        let (local_id, remote_id) = connect_incremental(&mut peer, &database, &["-r".to_string()]).unwrap();
+
+        // Service string opened on the wire with non-1 remote id.
+        assert_eq!(
+            peer.opened_services,
+            ["abb_exec:package\0install-incremental\0-r\0data.txt:15:0"]
+        );
+
+        send_unsigned_files(&mut peer, local_id, remote_id, &database).unwrap();
+        assert_eq!(peer.streamed_bytes, b"unsigned-payload");
+
+        // Trigger the final output delivery.
+        peer.enqueue(A_WRTE, remote_id, local_id, &peer.final_output.clone());
+        peer.close_pending = true;
+        peer.enqueue(A_CLSE, remote_id, local_id, &[]);
+        let output = wait_for_installation(&mut peer, local_id, remote_id).unwrap();
+        assert!(output.contains("Success"));
+
+        assert!(!peer.close_pending);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wait_for_installation_parses_failure_and_garbage() {
+        // Failure [...] → error containing the message.
+        let mut peer = FakeAbbStream::new(b"Failure [INSTALL_FAILED_INVALID_APK]\n");
+        peer.enqueue(A_WRTE, 97, 1, &peer.final_output.clone());
+        peer.close_pending = true;
+        peer.enqueue(A_CLSE, 97, 1, &[]);
+        let error = wait_for_installation(&mut peer, 1, 97).unwrap_err().to_string();
+        assert!(error.contains("Install failed"), "{error}");
+
+        // Garbage → parse error.
+        let mut peer = FakeAbbStream::new(b"what is this");
+        peer.enqueue(A_WRTE, 97, 1, &peer.final_output.clone());
+        peer.close_pending = true;
+        peer.enqueue(A_CLSE, 97, 1, &[]);
+        let error = wait_for_installation(&mut peer, 1, 97).unwrap_err().to_string();
+        assert!(error.contains("Failed to parse output"), "{error}");
+    }
+
     #[test]
     fn incremental_service_string_is_abb_exec_with_nul_joined_entries() {
         let entries = vec![
@@ -533,6 +760,7 @@ mod tests {
                 filename: "b.txt".into(),
                 size: 3,
                 file_id: 1,
+                local_path: std::path::PathBuf::from("/tmp/b.txt"),
             },
         ];
 

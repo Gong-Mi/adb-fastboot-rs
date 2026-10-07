@@ -243,7 +243,7 @@ fn run_shell_command(
     Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
-fn write_exec_payload(
+pub(crate) fn write_exec_payload(
     transport: &mut dyn Transport,
     local_id: u32,
     remote_id: u32,
@@ -279,7 +279,7 @@ fn write_exec_payload(
     }
 }
 
-fn read_exec_output(
+pub(crate) fn read_exec_output(
     transport: &mut dyn Transport,
     local_id: u32,
     remote_id: u32,
