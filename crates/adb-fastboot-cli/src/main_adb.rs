@@ -207,7 +207,7 @@ pub enum Commands {
         remote: Option<String>,
         local: Option<String>,
     },
-    /// Install one APK; streamed mode is chosen from the device feature banner by default
+    /// Install one APK or APEX; APEX requires streamed mode and device apex support
     Install {
         /// Require streamed install; fail if the device lacks the cmd feature
         #[arg(long, conflicts_with = "no_streaming")]
@@ -1173,15 +1173,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !apk_path.exists() {
                 return Err(format!("APK not found: {apk}").into());
             }
-            if !apk_path
+            let extension = apk_path
                 .extension()
                 .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("apk"))
-            {
-                return Err("This install command currently supports .apk files only; APEX install is not implemented".into());
+                .unwrap_or_default();
+            let is_apex = extension.eq_ignore_ascii_case("apex");
+            if !extension.eq_ignore_ascii_case("apk") && !is_apex {
+                return Err(format!("filename doesn't end .apk or .apex: {apk}").into());
+            }
+            if is_apex && *no_streaming {
+                return Err("APEX packages are only compatible with Streamed Install".into());
+            }
+            if is_apex && *incremental {
+                return Err("--incremental does not support .apex files".into());
             }
 
-            let mode_from_args = if *streaming {
+            // APEX is a streamed-only package, not an unsigned incremental
+            // companion. An explicit regular mode also bypasses the automatic
+            // incremental settings probe in calculate_install_mode.
+            let mode_from_args = if *streaming || is_apex {
                 Some(client::adb_install::InstallMode::Streamed)
             } else if *no_streaming {
                 Some(client::adb_install::InstallMode::Push)
@@ -1203,6 +1213,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &cnxn_payload,
                 default_auth(),
             )?;
+
+            if is_apex
+                && !client::adb_install::CommandTransport::apex_supported(&device_info.banner)
+            {
+                return Err(".apex is not supported on the target device".into());
+            }
 
             // AOSP calculate_install_mode (adb_install.cpp:353-415): pick the
             // primary mode and optional fallback; the incremental-by-default
