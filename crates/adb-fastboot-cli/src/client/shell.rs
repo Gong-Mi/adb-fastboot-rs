@@ -8,7 +8,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use adb_protocol::{
-    AdbMessageHeader, ShellV2Packet, Transport, TransportError,
+    AdbMessageHeader, ShellV2Error, ShellV2Packet, Transport, TransportError,
     A_CLSE, A_OKAY, A_WRTE,
 };
 
@@ -17,15 +17,85 @@ use super::auth::default_auth;
 #[allow(unused_imports)]
 use super::transport::connect_and_handshake_with_tls_upgrade;
 
-/// Stream shell output (Shell v2 packets) to stdout/stderr until exit or CLSE.
-pub fn stream_shell_v2(
+/// Reassemble a ShellV2 byte stream and demultiplex it into stdout/stderr,
+/// recording the remote exit code.
+///
+/// The buffer is deliberately *accumulated* across ADB WRTE frames: a single
+/// ShellV2 packet can span several frames, so parsing each frame in isolation
+/// would split a real packet and (previously) leak its header bytes to stdout.
+/// AOSP `shell_service_protocol.cpp` frames as 1-byte id + little-endian u32
+/// length, and `read_and_dump_protocol` only ever acts on stdout/stderr/exit.
+///
+/// Incomplete trailing bytes are left in `remainder` for the caller to extend
+/// with the next frame. An unrecognized-but-complete id is consumed and
+/// ignored (never surfaced as raw output).
+fn drain_shell_v2_stream(
+    remainder: &mut Vec<u8>,
+    captured: &mut Option<Vec<u8>>,
+    exit_code: &mut Option<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        match ShellV2Packet::parse(remainder) {
+            Ok((pkt, consumed)) => {
+                match pkt {
+                    ShellV2Packet::Stdout(data) => {
+                        if let Some(buf) = captured.as_mut() {
+                            buf.extend_from_slice(data);
+                        }
+                        std::io::stdout().write_all(data)?;
+                        std::io::stdout().flush()?;
+                    }
+                    ShellV2Packet::Stderr(data) => {
+                        if let Some(buf) = captured.as_mut() {
+                            buf.extend_from_slice(data);
+                        }
+                        std::io::stderr().write_all(data)?;
+                        std::io::stderr().flush()?;
+                    }
+                    ShellV2Packet::ExitCode(code) => {
+                        *exit_code = Some(code);
+                    }
+                    _ => {}
+                }
+                remainder.drain(..consumed);
+            }
+            // Incomplete packet: wait for the remainder of the frame(s).
+            Err(ShellV2Error::HeaderTooShort) | Err(ShellV2Error::PayloadTooShort { .. }) => {
+                break;
+            }
+            // Complete packet with an unknown id: skip it (AOSP ignores it)
+            // rather than dumping it to stdout as raw bytes.
+            Err(ShellV2Error::UnknownStreamId(_)) => {
+                let len = u32::from_le_bytes([
+                    remainder[1],
+                    remainder[2],
+                    remainder[3],
+                    remainder[4],
+                ]) as usize;
+                remainder.drain(..5 + len);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stream shell output (Shell v2 packets) to stdout/stderr until exit or CLSE,
+/// returning the captured bytes plus the remote exit code.
+///
+/// `exit_code` is `None` when the stream ended without an ExitCode packet
+/// (matching AOSP, which reserves 255 for unexpected disconnection). This is
+/// the entry point for callers that must relay the remote code as their own
+/// process status; use [`stream_shell_v2`] for the legacy error-on-nonzero
+/// contract.
+pub fn stream_shell_v2_exit(
     transport: &mut dyn Transport,
     local_id: u32,
     mut _remote_id: u32,
     capture: bool,
-) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+) -> Result<(Option<Vec<u8>>, Option<u8>), Box<dyn std::error::Error>> {
     let mut captured = if capture { Some(Vec::new()) } else { None };
     let mut exit_code = None;
+    let mut remainder: Vec<u8> = Vec::new();
     loop {
         let (hdr, payload) = match transport.recv_message() {
             Ok(msg) => msg,
@@ -33,8 +103,7 @@ pub fn stream_shell_v2(
                 break
             }
             Err(e) => {
-                eprintln!("Error: Stream error: {}", e);
-                std::process::exit(1);
+                return Err(format!("Stream error: {e}").into());
             }
         };
 
@@ -46,57 +115,37 @@ pub fn stream_shell_v2(
                 let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
                 let _ = transport.send_message(&ack, &[]);
 
-                let mut rest = payload.as_slice();
-                while !rest.is_empty() {
-                    match ShellV2Packet::parse(rest) {
-                        Ok((pkt, consumed)) => {
-                            match pkt {
-                                ShellV2Packet::Stdout(data) => {
-                                    if let Some(ref mut buf) = captured {
-                                        buf.extend_from_slice(data);
-                                    }
-                                    std::io::stdout().write_all(data)?;
-                                    std::io::stdout().flush()?;
-                                }
-                                ShellV2Packet::Stderr(data) => {
-                                    if let Some(ref mut buf) = captured {
-                                        buf.extend_from_slice(data);
-                                    }
-                                    std::io::stderr().write_all(data)?;
-                                    std::io::stderr().flush()?;
-                                }
-                                ShellV2Packet::ExitCode(code) => {
-                                    exit_code = Some(code);
-                                }
-                                _ => {}
-                            }
-                            rest = &rest[consumed..];
-                        }
-                        Err(_) => {
-                            // Raw bytes (non-shell v2 format)
-                            if let Some(ref mut buf) = captured {
-                                buf.extend_from_slice(rest);
-                            }
-                            std::io::stdout().write_all(rest)?;
-                            std::io::stdout().flush()?;
-                            break;
-                        }
-                    }
-                }
+                // Accumulate this frame's payload with any bytes left over from
+                // a previous frame so cross-frame packets are reassembled.
+                remainder.extend_from_slice(&payload);
+                drain_shell_v2_stream(&mut remainder, &mut captured, &mut exit_code)?;
             }
             A_CLSE => {
                 let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
                 let _ = transport.send_message(&ack, &[]);
-                if let Some(code) = exit_code {
-                    if code != 0 {
-                        return Err(format!("remote shell exited with code {code}").into());
-                    }
-                    std::thread::sleep(Duration::from_millis(500));
-                    return Ok(captured);
-                }
                 break;
             }
             _ => {}
+        }
+    }
+    Ok((captured, exit_code))
+}
+
+/// Stream shell output (Shell v2 packets) to stdout/stderr until exit or CLSE.
+///
+/// Legacy contract: a non-zero remote exit code is reported as an error whose
+/// text is `remote shell exited with code N`. Callers that need the real remote
+/// code as their own exit status should use [`stream_shell_v2_exit`].
+pub fn stream_shell_v2(
+    transport: &mut dyn Transport,
+    local_id: u32,
+    remote_id: u32,
+    capture: bool,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let (captured, exit_code) = stream_shell_v2_exit(transport, local_id, remote_id, capture)?;
+    if let Some(code) = exit_code {
+        if code != 0 {
+            return Err(format!("remote shell exited with code {code}").into());
         }
     }
     Ok(captured)
@@ -108,14 +157,16 @@ pub fn stream_shell_v2(
 /// the server returns the shell output as a raw byte stream (no ADB
 /// WRTE framing), followed by a CLSE or connection close.
 ///
-/// The server sends the full ShellV2 packet stream as raw bytes;
-/// we parse and strip the ShellV2 framing to produce clean stdout.
+/// The stream is still ShellV2-framed, so it is reassembled across reads and
+/// demultiplexed into stdout/stderr; the remote exit code is returned so the
+/// caller can relay it.
 pub fn stream_shell_v2_server(
     transport: &mut dyn Transport,
     capture: bool,
-) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+) -> Result<(Option<Vec<u8>>, Option<u8>), Box<dyn std::error::Error>> {
 
     let mut captured = if capture { Some(Vec::new()) } else { None };
+    let mut exit_code = None;
     let mut buf = [0u8; 8192];
     let mut remainder = Vec::new();
 
@@ -136,35 +187,10 @@ pub fn stream_shell_v2_server(
         };
 
         remainder.extend_from_slice(&buf[..n]);
-
-        // Parse ShellV2 packets from the accumulated buffer
-        while !remainder.is_empty() {
-            match ShellV2Packet::parse(&remainder) {
-                Ok((pkt, consumed)) => {
-                    match pkt {
-                        ShellV2Packet::Stdout(data) | ShellV2Packet::Stderr(data) => {
-                            if let Some(ref mut buf) = captured {
-                                buf.extend_from_slice(data);
-                            }
-                            std::io::stdout().write_all(data)?;
-                            std::io::stdout().flush()?;
-                        }
-                        ShellV2Packet::ExitCode(_) => {
-                            // Don't print exit codes to stdout
-                        }
-                        _ => {}
-                    }
-                    remainder.drain(..consumed);
-                }
-                Err(_) => {
-                    // Incomplete packet — wait for more data
-                    break;
-                }
-            }
-        }
+        drain_shell_v2_stream(&mut remainder, &mut captured, &mut exit_code)?;
     }
 
-    Ok(captured)
+    Ok((captured, exit_code))
 }
 
 /// Open shell connection and stream output to stdout.

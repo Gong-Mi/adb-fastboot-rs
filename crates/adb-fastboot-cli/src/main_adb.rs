@@ -811,9 +811,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Send shell service via host service protocol
                     server.send_host_request(&shell_service)?;
                     server.read_status()?; // OKAY -> server created A_OPEN, device OK'd
-                    // Now in raw forwarding mode — stream shell output
-                    shell::stream_shell_v2_server(&mut server, false)?;
-                    return Ok(());
+                    // Now in raw forwarding mode — stream shell output and
+                    // relay the remote exit code as our own process status.
+                    let (_captured, exit_code) = shell::stream_shell_v2_server(&mut server, false)?;
+                    std::process::exit(exit_code.unwrap_or(255) as i32);
                 }
             }
 
@@ -847,8 +848,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => return Err(e),
             };
 
-            let (_lid, remote_id) = protocol::open_service(&mut transport, &shell_service, 1)?;
-            shell::stream_shell_v2(&mut transport, _lid, remote_id, false)?;
+            let (local_id, remote_id) = protocol::open_service(&mut transport, &shell_service, 1)?;
+            // Relay the remote exit code (AOSP read_and_dump_protocol); 255 for
+            // an unexpected disconnection without an ExitCode packet.
+            let (_captured, exit_code) =
+                shell::stream_shell_v2_exit(&mut transport, local_id, remote_id, false)?;
+            std::process::exit(exit_code.unwrap_or(255) as i32);
         }
         Commands::ExecOut { command } | Commands::ExecIn { command } => {
             // AOSP commandline.cpp:1802: exec-in/exec-out open the raw `exec:`
