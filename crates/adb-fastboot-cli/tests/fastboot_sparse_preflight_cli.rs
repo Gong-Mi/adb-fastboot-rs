@@ -164,7 +164,7 @@ fn run_update(name: &str, system: &[u8]) -> (Output, Effects) {
             boot: b"untouched-boot".to_vec(),
             system: b"untouched-system".to_vec(),
         };
-        let mut staged = None;
+        let mut staged: Option<Vec<u8>> = None;
         while let Some(bytes) = packet(&mut socket) {
             let command = String::from_utf8(bytes).unwrap();
             effects.commands.push(command.clone());
