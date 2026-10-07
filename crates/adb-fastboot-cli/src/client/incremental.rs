@@ -152,6 +152,164 @@ fn idsig_path_for(file: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+/// AOSP `ISDatabaseEntry` hierarchy (incremental.cpp:60-110): one entry per
+/// input file, carrying its IncrementalServer file id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IsDatabaseEntry {
+    /// `ISSignedDatabaseEntry` — v4-signed, later streamed by inc-server.
+    Signed {
+        filename: String,
+        size: u64,
+        file_id: i32,
+        /// Base64-encoded signature (with embedded length prefixes).
+        signature: String,
+        /// Local path, needed by inc-server args (incremental.cpp:455-457).
+        path: std::path::PathBuf,
+    },
+    /// `ISUnsignedDatabaseEntry` — sent over the connection stdin before
+    /// any signed streaming (incremental.cpp:96-110).
+    Unsigned {
+        filename: String,
+        size: u64,
+        file_id: i32,
+    },
+}
+
+impl IsDatabaseEntry {
+    pub fn is_v4_signed(&self) -> bool {
+        matches!(self, IsDatabaseEntry::Signed { .. })
+    }
+
+    pub fn file_id(&self) -> i32 {
+        match self {
+            IsDatabaseEntry::Signed { file_id, .. } | IsDatabaseEntry::Unsigned { file_id, .. } => *file_id,
+        }
+    }
+
+    /// AOSP `serialize()` (incremental.cpp:85-92):
+    /// signed → `filename:size:file_id:signature:protocolVersion`,
+    /// unsigned → `filename:size:file_id`. kProtocolVersion = 1
+    /// (incremental.cpp:94).
+    pub fn serialize(&self) -> String {
+        const PROTOCOL_VERSION: i32 = 1;
+        match self {
+            IsDatabaseEntry::Signed {
+                filename,
+                size,
+                file_id,
+                signature,
+                ..
+            } => format!("{filename}:{size}:{file_id}:{signature}:{PROTOCOL_VERSION}"),
+            IsDatabaseEntry::Unsigned {
+                filename,
+                size,
+                file_id,
+            } => format!("{filename}:{size}:{file_id}"),
+        }
+    }
+}
+
+/// AOSP `CheckPolicy` (incremental.cpp:44-49).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckPolicy {
+    Normal,
+    /// Allows missing signatures for files that would normally require a v4
+    /// signature (stderr warning instead of failure).
+    AllowMissingSignatures,
+}
+
+/// AOSP `build_database` (incremental.cpp:181-267): read `.idsig` for every
+/// file, validate v4 signatures per check policy, then assign file ids —
+/// signed files first (ids match list indexes so inc-server args line up),
+/// unsigned files after, both in input order.
+pub fn build_database(
+    files: &[&Path],
+    check_policy: CheckPolicy,
+) -> Result<Vec<IsDatabaseEntry>, String> {
+    let mut signatures_by_file: Vec<(std::path::PathBuf, Vec<u8>, i32)> = Vec::new();
+    for file in files {
+        let signature = read_signature(&idsig_path_for(file))?;
+        if requires_v4_signature(&file.to_string_lossy()) && signature.signature.is_empty() {
+            let message = format!("V4 signature missing for '{}'", file.display());
+            if check_policy == CheckPolicy::AllowMissingSignatures {
+                eprintln!("{message}.");
+            } else {
+                return Err(message);
+            }
+        }
+        signatures_by_file.push((file.to_path_buf(), signature.signature, signature.tree_size));
+    }
+
+    let mut database = Vec::with_capacity(files.len());
+    let mut file_id: i32 = 0;
+
+    // Signed files first: file ids must equal list indexes (incremental.cpp:232-237).
+    for (file, signature, tree_size) in &signatures_by_file {
+        if signature.is_empty() {
+            continue;
+        }
+        let size = std::fs::metadata(file)
+            .map_err(|error| format!("Failed to open input file '{}': {}", file.display(), error))?
+            .len();
+        validate_signature(signature, *tree_size, size as i64)?;
+        database.push(IsDatabaseEntry::Signed {
+            filename: file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("Invalid filename: {}", file.display()))?
+                .to_string(),
+            size,
+            file_id: {
+                let id = file_id;
+                file_id += 1;
+                id
+            },
+            signature: encode_signature(signature),
+            path: file.clone(),
+        });
+    }
+
+    // Unsigned files after, in input order (incremental.cpp:244-266).
+    for (file, signature, _) in &signatures_by_file {
+        if !signature.is_empty() {
+            continue;
+        }
+        let size = std::fs::metadata(file)
+            .map_err(|error| format!("Failed to open input file '{}': {}", file.display(), error))?
+            .len();
+        database.push(IsDatabaseEntry::Unsigned {
+            filename: file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("Invalid filename: {}", file.display()))?
+                .to_string(),
+            size,
+            file_id: {
+                let id = file_id;
+                file_id += 1;
+                id
+            },
+        });
+    }
+
+    Ok(database)
+}
+
+/// AOSP `connect_and_send_database` (incremental.cpp:269-293): the service
+/// string is `abb_exec:package\0install-incremental\0<passthrough...>\0<entries...>`
+/// — NUL-joined raw args over the device `abb_exec` service.
+pub fn incremental_service_string(
+    database: &[IsDatabaseEntry],
+    passthrough_args: &[String],
+) -> String {
+    let mut args: Vec<String> = vec!["package".to_string(), "install-incremental".to_string()];
+    args.extend(passthrough_args.iter().cloned());
+    args.extend(database.iter().map(|entry| entry.serialize()));
+    let mut service = String::from("abb_exec:");
+    service.push_str(&args.join("\0"));
+    service
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +439,107 @@ mod tests {
         assert!(should_use_incremental_by_default(&[txt.as_path()]));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn build_database_assigns_signed_ids_first_then_unsigned() {
+        let root = std::env::temp_dir().join(format!("incr-db-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Signed APK (8192 bytes = 2 blocks, needs tree size 4096).
+        let apk = root.join("app.apk");
+        std::fs::write(&apk, vec![0u8; 8192]).unwrap();
+        write_idsig(&root.join("app.apk.idsig"), 8192);
+
+        // Unsigned non-apk file (no v4 requirement, no idsig).
+        let txt = root.join("notes.txt");
+        std::fs::write(&txt, b"hello").unwrap();
+
+        let database = build_database(
+            &[apk.as_path(), txt.as_path()],
+            CheckPolicy::Normal,
+        )
+        .unwrap();
+
+        assert_eq!(database.len(), 2);
+        // Signed first, file_id 0 = its list index; carries base64 signature + path.
+        match &database[0] {
+            IsDatabaseEntry::Signed {
+                filename,
+                size,
+                file_id,
+                signature,
+                path,
+            } => {
+                assert_eq!(filename, "app.apk");
+                assert_eq!(*size, 8192);
+                assert_eq!(*file_id, 0);
+                assert_eq!(path, &apk);
+                assert!(!signature.is_empty());
+            }
+            other => panic!("expected signed entry first, got {other:?}"),
+        }
+        // Unsigned after, id 1; serialization omits signature/version.
+        match &database[1] {
+            IsDatabaseEntry::Unsigned {
+                filename,
+                size,
+                file_id,
+            } => {
+                assert_eq!(filename, "notes.txt");
+                assert_eq!(*size, 5);
+                assert_eq!(*file_id, 1);
+            }
+            other => panic!("expected unsigned entry second, got {other:?}"),
+        }
+
+        assert_eq!(
+            database[0].serialize(),
+            format!("app.apk:8192:0:{}:1", database[0].serialize().split(':').nth(3).unwrap())
+        );
+        assert_eq!(database[1].serialize(), "notes.txt:5:1");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn build_database_rejects_missing_v4_signature_under_normal_policy() {
+        let root = std::env::temp_dir().join(format!("incr-db-miss-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let apk = root.join("bare.apk");
+        std::fs::write(&apk, vec![0u8; 8192]).unwrap();
+
+        let error = build_database(&[apk.as_path()], CheckPolicy::Normal).unwrap_err();
+        assert!(error.contains("V4 signature missing"), "{error}");
+
+        // AllowMissingSignatures warns but proceeds — the file lands unsigned.
+        let database = build_database(&[apk.as_path()], CheckPolicy::AllowMissingSignatures).unwrap();
+        assert_eq!(database.len(), 1);
+        assert!(matches!(database[0], IsDatabaseEntry::Unsigned { .. }));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incremental_service_string_is_abb_exec_with_nul_joined_entries() {
+        let entries = vec![
+            IsDatabaseEntry::Signed {
+                filename: "a.apk".into(),
+                size: 4096,
+                file_id: 0,
+                signature: "QUJD".into(),
+                path: std::path::PathBuf::from("/tmp/a.apk"),
+            },
+            IsDatabaseEntry::Unsigned {
+                filename: "b.txt".into(),
+                size: 3,
+                file_id: 1,
+            },
+        ];
+
+        let service = incremental_service_string(&entries, &["-r".to_string()]);
+        assert_eq!(
+            service,
+            "abb_exec:package\0install-incremental\0-r\0a.apk:4096:0:QUJD:1\0b.txt:3:1"
+        );
     }
 }
