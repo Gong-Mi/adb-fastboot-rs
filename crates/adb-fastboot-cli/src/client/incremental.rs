@@ -576,6 +576,15 @@ pub fn start_inc_server_and_stream_signed_files(
     }
 }
 
+/// AOSP incremental `--wait` (adb_install.cpp:346-348): block until the
+/// inc-server process exits (the streaming session ended).
+pub fn wait_for_incremental_server(pid: libc::pid_t) {
+    let mut status = 0;
+    unsafe {
+        libc::waitpid(pid, &mut status, 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

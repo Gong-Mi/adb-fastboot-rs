@@ -104,11 +104,18 @@ pub enum CommandTransport {
     ExecPm,
 }
 
+/// Whether the device advertises the `abb_exec` feature (AOSP
+/// `is_abb_exec_supported()`, adb_install.cpp:73-76). Incremental installs
+/// require it (calculate_install_mode, adb_install.cpp:371-377).
+pub fn abb_exec_supported(device_banner: &str) -> bool {
+    let device_features = adb_protocol::features::parse_banner_features(device_banner);
+    adb_protocol::features::can_use_feature(&device_features, "abb_exec")
+}
+
 impl CommandTransport {
     /// Pick the transport from the device banner (AOSP `is_abb_exec_supported()`).
     pub fn from_banner(device_banner: &str) -> Self {
-        let device_features = adb_protocol::features::parse_banner_features(device_banner);
-        if adb_protocol::features::can_use_feature(&device_features, "abb_exec") {
+        if abb_exec_supported(device_banner) {
             CommandTransport::AbbExec
         } else {
             CommandTransport::ExecCmd

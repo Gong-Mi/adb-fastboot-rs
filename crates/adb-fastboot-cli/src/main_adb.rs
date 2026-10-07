@@ -217,8 +217,14 @@ pub enum Commands {
         no_streaming: bool,
         /// Incremental (IncFS) install: requires a v4-signed file (with
         /// .idsig) for APKs, or pass to allow missing signatures explicitly
-        #[arg(long, conflicts_with_all = ["streaming", "no_streaming"])]
+        #[arg(long, conflicts_with_all = ["streaming", "no_streaming", "no_incremental"])]
         incremental: bool,
+        /// Never use incremental install (AOSP `--no-incremental`)
+        #[arg(long)]
+        no_incremental: bool,
+        /// Block until the incremental server finishes streaming (AOSP `--wait`)
+        #[arg(long)]
+        wait: bool,
         apk: String,
     },
     /// Push multiple APKs to device and install them
@@ -226,6 +232,16 @@ pub enum Commands {
     InstallMultiple {
         #[arg(required = true)]
         apks: Vec<String>,
+        /// Incremental (IncFS) install of the whole set (AOSP
+        /// install_multiple_app, adb_install.cpp:680-717)
+        #[arg(long, conflicts_with = "no_incremental")]
+        incremental: bool,
+        /// Never use incremental install (AOSP `--no-incremental`)
+        #[arg(long)]
+        no_incremental: bool,
+        /// Block until the incremental server finishes streaming (AOSP `--wait`)
+        #[arg(long)]
+        wait: bool,
     },
     /// Atomic batch install of multiple APKs using pm install-create/write/commit
     #[command(name = "install-multi-package")]
@@ -1104,6 +1120,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             streaming,
             no_streaming,
             incremental,
+            wait,
+            ..
         } => {
             let apk_path = Path::new(apk);
             if !apk_path.exists() {
@@ -1134,6 +1152,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
 
             if *incremental {
+                // AOSP calculate_install_mode (adb_install.cpp:371-377):
+                // an explicit --incremental requires the abb_exec feature.
+                if !client::adb_install::abb_exec_supported(&device_info.banner) {
+                    eprintln!("Device doesn't support incremental installations");
+                    std::process::exit(1);
+                }
                 // AOSP install_app_incremental (adb_install.cpp:299-357):
                 // explicit request → AllowMissingSignatures policy, then the
                 // full incremental pipeline. The pump/inc-server pair keeps
@@ -1150,11 +1174,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     false,
                     &executor.to_string_lossy(),
                 ) {
-                    Ok(_processes) => {
+                    Ok((_pump, server)) => {
                         println!(
                             "Install command complete in {} ms",
                             started.elapsed().as_millis()
                         );
+                        if *wait {
+                            client::incremental::wait_for_incremental_server(server);
+                        }
                         return Ok(());
                     }
                     Err(error) => {
@@ -1195,7 +1222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::InstallMultiple { apks } => {
+        Commands::InstallMultiple { apks, incremental, wait, .. } => {
             let apk_paths: Vec<&Path> = apks.iter().map(|apk| Path::new(apk)).collect();
             let missing: Vec<&str> = apks
                 .iter()
@@ -1211,6 +1238,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cnxn_payload = host_cnxn_payload();
             let (device_info, mut transport) =
                 connect_and_handshake_with_tls_upgrade(transport, &cnxn_payload, default_auth())?;
+
+            if *incremental {
+                // AOSP install_multiple_app (adb_install.cpp:680-717): the
+                // same incremental pipeline, with every listed file.
+                if !client::adb_install::abb_exec_supported(&device_info.banner) {
+                    eprintln!("Device doesn't support incremental installations");
+                    std::process::exit(1);
+                }
+                println!("Performing Incremental Install");
+                let started = std::time::Instant::now();
+                let executor = std::env::current_exe()
+                    .map_err(|error| format!("Cannot resolve the adb executable path: {error}"))?;
+                match client::incremental::install(
+                    &mut transport,
+                    &apk_paths,
+                    &[],
+                    false,
+                    &executor.to_string_lossy(),
+                ) {
+                    Ok((_pump, server)) => {
+                        println!(
+                            "Install command complete in {} ms",
+                            started.elapsed().as_millis()
+                        );
+                        if *wait {
+                            client::incremental::wait_for_incremental_server(server);
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        eprintln!("adb: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
             let mut printer = client::line_printer::LinePrinter::new();
             let mode = client::adb_install::select_install_mode(
                 &device_info.banner,
