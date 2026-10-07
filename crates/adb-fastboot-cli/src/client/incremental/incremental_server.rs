@@ -14,11 +14,15 @@
 //!
 //! This module implements the protocol + state machine (sent-block tracking,
 //! prefetch scheduling, LZ4 block compression, priority-block ordering) with
-//! injectable block sources so it is fully testable offline. The fd/fork
-//! plumbing that runs it against a live device is a separate slice.
+//! injectable block sources so it is fully testable offline, plus the fd-level
+//! deployment layer (`serve_fds` + `serve`) that AOSP drives through
+//! `SkipToRequest`'s poll/read loop against the abb connection.
 
 use std::collections::VecDeque;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::io::RawFd;
+
+use crate::server::sysdeps_unix::{adb_poll, adb_read, adb_write};
 
 use super::incremental_utils::{
     verity_tree_blocks_for_file, BLOCK_SIZE, DIGEST_SIZE, IDSIG_EXTENSION,
@@ -36,6 +40,10 @@ pub const COMPRESSION_NONE: i8 = 0;
 pub const COMPRESSION_LZ4: i8 = 1;
 /// AOSP `kChunkFlushSize = 31 * kBlockSize` (:268 area).
 pub const CHUNK_FLUSH_SIZE: usize = 31 * BLOCK_SIZE as usize;
+/// AOSP `kPollTimeoutMillis = 300000` (:57) — 5 minutes.
+pub const POLL_TIMEOUT_MILLIS: i32 = 300_000;
+/// AOSP `kReadBufferSize = 128 * 1024` (:56).
+pub const READ_BUFFER_SIZE: usize = 128 * 1024;
 /// AOSP `INCR` magic, compared after big-endian decode (:69).
 pub const INCR_MAGIC: u32 = 0x494e_4352;
 /// AOSP request types (:71-74).
@@ -55,6 +63,39 @@ pub fn num_bytes_to_num_blocks(bytes: i64) -> i32 {
         return 0;
     }
     ((bytes + BLOCK_SIZE - 1) / BLOCK_SIZE) as i32
+}
+
+/// Outcome of one fd-level `ReadRequest` (AOSP incremental_server.cpp:276-360).
+enum FdReadOutcome {
+    /// A request was decoded.
+    Request(RequestCommand),
+    /// No complete request this round (non-blocking poll timeout, or blocking
+    /// timeout while streaming is still in progress).
+    None,
+    /// Connection closed, poll failed, or a completed session timed out; AOSP
+    /// maps this to a DESTROY request and `Serve()` returns true.
+    Disconnected,
+}
+
+/// AOSP `WriteFdExactly` (adb_io.cpp:103-130): write all of `buf`; returns the
+/// number of bytes written. EAGAIN yields and retries, any other failure
+/// (EPIPE included) stops the write.
+fn write_fd_exactly(fd: RawFd, buf: &[u8]) -> usize {
+    let mut written = 0usize;
+    while written < buf.len() {
+        match adb_write(fd, &buf[written..]) {
+            Ok(0) => break,
+            Ok(length) => written += length,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    std::thread::yield_now();
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    written
 }
 
 /// AOSP `RequestCommand` (incremental_server.cpp:118-127) — decoded from the
@@ -341,54 +382,47 @@ impl IncrementalServer {
         self.incoming.extend_from_slice(data);
     }
 
-    /// AOSP `SkipToRequest` (incremental_server.cpp:278-353), simplified to
-    /// operate on the buffered input: find INCR magic, forward everything
-    /// before it to `forward` (the inc-server output fd), and if a full
-    /// request follows, consume and return it. Returns Ok(None) when more
-    /// data is needed.
-    pub fn take_request(&mut self, forward: &mut Vec<u8>) -> std::io::Result<Option<RequestCommand>> {
-        // Look for INCR magic (AOSP: for bcur; bcur + 4 < bsize).
-        let mut magic_at = None;
-        if self.incoming.len() > 4 {
-            for bcur in 0..self.incoming.len() - 4 {
-                let magic = u32::from_be_bytes([
-                    self.incoming[bcur],
-                    self.incoming[bcur + 1],
-                    self.incoming[bcur + 2],
-                    self.incoming[bcur + 3],
-                ]);
-                if magic == INCR_MAGIC {
-                    magic_at = Some(bcur);
-                    break;
-                }
+    /// AOSP `SkipToRequest` (incremental_server.cpp:276-355), buffer-side:
+    /// find the INCR magic, forward everything before it to `forward` (the
+    /// inc-server output stream), and if a full request follows the magic,
+    /// consume and return it. Returns None when more data is needed.
+    ///
+    /// Scan bounds match AOSP exactly: magic positions `bcur` are checked
+    /// while `bcur + 4 < bsize`, so a magic starting within the last 4 bytes
+    /// is not detected on this round. When no magic is found, everything but
+    /// the last 4 bytes is forwarded — those bytes may hold the start of a
+    /// magic that straddles the next read boundary.
+    pub fn take_request(&mut self, forward: &mut Vec<u8>) -> Option<RequestCommand> {
+        let bsize = self.incoming.len() as i32;
+        let mut bcur: i32 = 0;
+        let mut magic_found = false;
+        while bcur + 4 < bsize {
+            let at = bcur as usize;
+            let magic = u32::from_be_bytes([
+                self.incoming[at],
+                self.incoming[at + 1],
+                self.incoming[at + 2],
+                self.incoming[at + 3],
+            ]);
+            if magic == INCR_MAGIC {
+                magic_found = true;
+                break;
             }
+            bcur += 1;
         }
-        match magic_at {
-            Some(bcur) => {
-                if bcur > 0 {
-                    // Output the rest (pre-magic garbage), then drop it.
-                    forward.extend_from_slice(&self.incoming[..bcur]);
-                    self.incoming.drain(..bcur);
-                }
-                // Need magic + full request in buffer.
-                if self.incoming.len() >= 4 + RequestCommand::WIRE_SIZE {
-                    let payload = self.incoming[4..4 + RequestCommand::WIRE_SIZE].to_vec();
-                    self.incoming.drain(..4 + RequestCommand::WIRE_SIZE);
-                    return Ok(RequestCommand::decode(&payload));
-                }
-                Ok(None)
-            }
-            None => {
-                // No magic yet; forward all but the last 3 bytes (magic
-                // could straddle the boundary on the next read).
-                if self.incoming.len() > 3 {
-                    let keep = self.incoming.len() - 3;
-                    forward.extend_from_slice(&self.incoming[..keep]);
-                    self.incoming.drain(..keep);
-                }
-                Ok(None)
-            }
+
+        if bcur > 0 {
+            // Output the rest (pre-magic garbage), then drop it.
+            forward.extend_from_slice(&self.incoming[..bcur as usize]);
+            self.incoming.drain(..bcur as usize);
         }
+
+        if magic_found && self.incoming.len() >= 4 + RequestCommand::WIRE_SIZE {
+            let payload = self.incoming[4..4 + RequestCommand::WIRE_SIZE].to_vec();
+            self.incoming.drain(..4 + RequestCommand::WIRE_SIZE);
+            return RequestCommand::decode(&payload);
+        }
+        None
     }
 
     /// AOSP `SendDataBlock` (incremental_server.cpp:399-471).
@@ -722,12 +756,140 @@ impl IncrementalServer {
             self.flush();
         }
 
-        if let Ok(Some(request)) = self.take_request(forward) {
+        if let Some(request) = self.take_request(forward) {
             self.handle_request(request);
         }
 
         self.run_prefetching();
         !self.destroyed
+    }
+
+    /// AOSP `Serve()` (incremental_server.cpp:551-658) driving real fds: the
+    /// "OKAY" handshake, done-notification, blocking flush, request loop and
+    /// prefetching. `connection_fd` is the abb connection to the device;
+    /// non-protocol device output is forwarded to `output_fd`.
+    ///
+    /// Returns true when the server should stop (DESTROY request, disconnect,
+    /// or a completed session timing out), false when the handshake failed.
+    pub fn serve_fds(&mut self, connection_fd: RawFd, output_fd: RawFd) -> bool {
+        // AOSP SendOkay (incremental_server.cpp:553-557).
+        if write_fd_exactly(connection_fd, b"OKAY") != 4 {
+            eprintln!("Connection is dead. Abort.");
+            return false;
+        }
+
+        let mut read_buffer = vec![0u8; READ_BUFFER_SIZE];
+        let mut done_sent = false;
+        loop {
+            if !done_sent && self.prefetches.is_empty() && self.all_files_sent() {
+                eprintln!("All files should be loaded. Notifying the device.");
+                self.send_done();
+                done_sent = true;
+                self.ship_output(connection_fd);
+            }
+
+            let blocking = self.prefetches.is_empty();
+            if blocking {
+                // "We've no idea how long the blocking call is, so let's
+                // flush whatever is still unsent." (incremental_server.cpp:586-589)
+                self.flush();
+                self.ship_output(connection_fd);
+            }
+
+            match self.read_request_fd(connection_fd, output_fd, blocking, &mut read_buffer) {
+                FdReadOutcome::Request(request) => {
+                    if request.request_type == DESTROY {
+                        // AOSP: stop everything (Serve returns true).
+                        return true;
+                    }
+                    self.handle_request(request);
+                    self.ship_output(connection_fd);
+                }
+                FdReadOutcome::None => {}
+                FdReadOutcome::Disconnected => return true,
+            }
+
+            self.run_prefetching();
+            self.ship_output(connection_fd);
+        }
+    }
+
+    /// AOSP `ReadRequest` + `SkipToRequest` (incremental_server.cpp:276-360):
+    /// drive the connection fd. While scanning for the INCR magic, all
+    /// non-protocol bytes are forwarded to `output_fd` as they are skipped.
+    fn read_request_fd(
+        &mut self,
+        connection_fd: RawFd,
+        output_fd: RawFd,
+        blocking: bool,
+        read_buffer: &mut [u8],
+    ) -> FdReadOutcome {
+        loop {
+            let mut forward = Vec::new();
+            let request = self.take_request(&mut forward);
+            if !forward.is_empty() {
+                let _ = write_fd_exactly(output_fd, &forward);
+            }
+            if let Some(request) = request {
+                return FdReadOutcome::Request(request);
+            }
+
+            let timeout = if blocking { POLL_TIMEOUT_MILLIS } else { 0 };
+            match adb_poll(connection_fd, libc::POLLIN, timeout) {
+                Ok(1) => {
+                    let pending = self.incoming.len();
+                    let capacity = READ_BUFFER_SIZE.saturating_sub(pending);
+                    match adb_read(connection_fd, &mut read_buffer[..capacity]) {
+                        Ok(length) if length > 0 => {
+                            self.incoming.extend_from_slice(&read_buffer[..length]);
+                        }
+                        Ok(_) => {
+                            // AOSP: r == 0 → disconnected. Flush the tail.
+                            let _ = write_fd_exactly(output_fd, &self.incoming);
+                            return FdReadOutcome::Disconnected;
+                        }
+                        Err(_) => {
+                            // AOSP: failed to read. Flush the tail.
+                            let _ = write_fd_exactly(output_fd, &self.incoming);
+                            return FdReadOutcome::Disconnected;
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // Timeout (AOSP res == 0). The pending bytes go to the
+                    // output without being dropped — the tail may hold the
+                    // start of a split INCR magic (incremental_server.cpp:302-317).
+                    let _ = write_fd_exactly(output_fd, &self.incoming);
+                    if blocking {
+                        eprintln!("Timed out waiting for data from device.");
+                    }
+                    if blocking && self.serving_complete {
+                        // "timeout waiting from client. Serving is complete,
+                        // so quit." (incremental_server.cpp:313-316)
+                        return FdReadOutcome::Disconnected;
+                    }
+                    return FdReadOutcome::None;
+                }
+                Err(_) => {
+                    // AOSP: failed to poll (res < 0). Flush the tail and stop.
+                    let _ = write_fd_exactly(output_fd, &self.incoming);
+                    return FdReadOutcome::Disconnected;
+                }
+            }
+        }
+    }
+
+    /// Ship already-flushed output to the connection fd. AOSP writes to the
+    /// fd inside `Flush`/`Send`; a failed write is reported but not fatal —
+    /// the next poll/read fails instead (incremental_server.cpp:536-539).
+    fn ship_output(&mut self, connection_fd: RawFd) {
+        if self.output.is_empty() {
+            return;
+        }
+        let output = std::mem::take(&mut self.output);
+        if write_fd_exactly(connection_fd, &output) != output.len() {
+            eprintln!("Failed to write {} bytes", output.len());
+        }
     }
 
     /// True after the SendDone marker has been emitted.
@@ -954,6 +1116,38 @@ fn read_i64_le_at<R: Read + Seek>(reader: &mut R, offset: i64) -> Option<i64> {
     Some(i64::from_le_bytes(buffer))
 }
 
+/// AOSP `incremental::serve` (incremental_server.cpp:711-734): the body of the
+/// internal `adb inc-server CONNECTION_FD OUTPUT_FD [FILE1 FILE2 ...]`
+/// command. Each file's argument position is its server file id. Returns true
+/// when serving stopped normally (DESTROY/disconnect), false on setup failure.
+///
+/// Note: AOSP returns this bool straight into `main`'s int exit code, which
+/// inverts it (true → exit 1); this port keeps the sane mapping (CLI exits 0
+/// on success). No AOSP caller checks the exit code.
+pub fn serve(connection_fd: RawFd, output_fd: RawFd, file_paths: &[String]) -> bool {
+    let mut files = Vec::with_capacity(file_paths.len());
+    for path in file_paths {
+        match ServerFile::open_local(path) {
+            Ok(file) => files.push(file),
+            Err(error) => {
+                eprintln!("{error}");
+                return false;
+            }
+        }
+    }
+
+    let mut server = IncrementalServer::new(files);
+    println!("Serving...");
+    let _ = std::io::stdout().flush();
+    // AOSP: fclose(stdin); fclose(stdout) — detach from the terminal this was
+    // started from; stderr stays for diagnostics (incremental_server.cpp:731-733).
+    unsafe {
+        libc::close(libc::STDIN_FILENO);
+        libc::close(libc::STDOUT_FILENO);
+    }
+    server.serve_fds(connection_fd, output_fd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,27 +1276,26 @@ mod tests {
         server.feed(&input);
 
         let mut forwarded = Vec::new();
-        let request = server.take_request(&mut forwarded).unwrap().unwrap();
+        let request = server.take_request(&mut forwarded).unwrap();
         assert_eq!(request.request_type, PREFETCH);
         assert_eq!(forwarded, b"partial line from pm\n");
 
         // Stream is now empty.
-        let request = server.take_request(&mut forwarded).unwrap();
+        let request = server.take_request(&mut forwarded);
         assert!(request.is_none());
     }
 
     #[test]
     fn take_request_waits_for_complete_payload_and_keeps_magic_tail() {
         let mut server = IncrementalServer::new(Vec::new());
-        // Magic + only 4 request bytes → None, magic consumed but request
-        // retained internally via the drain of the partial? AOSP keeps
-        // buffering; our buffered port must not lose bytes: feed in two parts.
+        // Magic + only 4 request bytes → None; the buffered port must not
+        // lose bytes when the request arrives split: feed in two parts.
         let full = encode_request(BLOCK_MISSING, 3, 7);
         server.feed(&full[..8]);
         let mut forwarded = Vec::new();
-        assert!(server.take_request(&mut forwarded).unwrap().is_none());
+        assert!(server.take_request(&mut forwarded).is_none());
         server.feed(&full[8..]);
-        let request = server.take_request(&mut forwarded).unwrap().unwrap();
+        let request = server.take_request(&mut forwarded).unwrap();
         assert_eq!(request.file_id, 3);
         assert_eq!(request.block_idx, 7);
         assert!(forwarded.is_empty());
@@ -1115,13 +1308,34 @@ mod tests {
         // be a magic prefix).
         server.feed(&[0x49, 0x4e, 0x43]);
         let mut forwarded = Vec::new();
-        assert!(server.take_request(&mut forwarded).unwrap().is_none());
+        assert!(server.take_request(&mut forwarded).is_none());
         assert!(forwarded.is_empty());
 
-        // 5 bytes with no magic: forward all but the last 3.
+        // 5 bytes with no magic: forward all but the last 4 (AOSP keeps a
+        // 4-byte tail — a magic may start right at the old buffer end).
         server.feed(&[0x58, 0x58]);
-        assert!(server.take_request(&mut forwarded).unwrap().is_none());
-        assert_eq!(forwarded, [0x49, 0x4e]);
+        assert!(server.take_request(&mut forwarded).is_none());
+        assert_eq!(forwarded, [0x49]);
+    }
+
+    #[test]
+    fn take_request_keeps_magic_starting_at_last_4_bytes() {
+        // Regression guard for AOSP's exact scan bounds (`bcur + 4 < bsize`):
+        // a magic that starts at bsize - 4 is *not* detected this round and
+        // must survive in the buffer (forwarding all-but-last-4 keeps it; a
+        // keep-3 rule would forward the 'I' and corrupt the request stream).
+        let mut server = IncrementalServer::new(Vec::new());
+        server.feed(&[b'A'; 7]);
+        server.feed(b"INCR"); // magic at position 7 of an 11-byte buffer
+        let mut forwarded = Vec::new();
+        assert!(server.take_request(&mut forwarded).is_none());
+        assert_eq!(forwarded, b"AAAAAAA");
+
+        server.feed(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // BLOCK_MISSING 0/0
+        let request = server.take_request(&mut forwarded).unwrap();
+        assert_eq!(request.request_type, BLOCK_MISSING);
+        assert_eq!(request.file_id, 0);
+        assert_eq!(request.block_idx, 0);
     }
 
     #[test]
@@ -1363,5 +1577,164 @@ mod tests {
         let data = vec![0u8; 4096 * 4];
         let mut cursor = std::io::Cursor::new(data);
         assert!(priority_blocks_for_file("plain.txt", &mut cursor, 4096 * 4).is_empty());
+    }
+
+    /// Incompressible (LCG) fixture bytes — forces the uncompressed wire path.
+    fn lcg_bytes(seed: u32, length: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..length)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Read one on-wire chunk ([be32 size][block records...]) with its size
+    /// prefix included, as `parse_blocks` expects framed input.
+    fn read_chunk(stream: &mut impl Read) -> Vec<u8> {
+        let mut size_buf = [0u8; 4];
+        stream.read_exact(&mut size_buf).unwrap();
+        let size = i32::from_be_bytes(size_buf) as usize;
+        let mut framed = size_buf.to_vec();
+        framed.resize(4 + size, 0);
+        stream.read_exact(&mut framed[4..]).unwrap();
+        framed
+    }
+
+    fn fixture_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "inc-server-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn serve_fds_handshakes_serves_blocks_and_stops_on_destroy() {
+        use crate::server::sysdeps_unix::{adb_close, adb_socketpair};
+        use std::io::Write as _;
+        use std::os::unix::io::FromRawFd;
+
+        let data = lcg_bytes(0x1234_5678, BLOCK_SIZE as usize + 100);
+        let dir = fixture_dir("serve");
+        let path = dir.join("base.apk");
+        std::fs::write(&path, &data).unwrap();
+        let file = ServerFile::open_local(path.to_str().unwrap()).unwrap();
+
+        let (conn_server, conn_client) = adb_socketpair().unwrap();
+        let (out_server, out_client) = adb_socketpair().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let mut server = IncrementalServer::new(vec![file]);
+            let result = server.serve_fds(conn_server, out_server);
+            adb_close(conn_server);
+            adb_close(out_server);
+            result
+        });
+
+        let mut conn = unsafe { std::os::unix::net::UnixStream::from_raw_fd(conn_client) };
+        let mut out = unsafe { std::os::unix::net::UnixStream::from_raw_fd(out_client) };
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        out.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+
+        // Handshake.
+        let mut okay = [0u8; 4];
+        conn.read_exact(&mut okay).unwrap();
+        assert_eq!(&okay, b"OKAY");
+
+        // Device text followed by a BLOCK_MISSING for file 0 / block 0.
+        let mut first = b"Performing Streamed Install\n".to_vec();
+        first.extend_from_slice(&encode_request(BLOCK_MISSING, 0, 0));
+        conn.write_all(&first).unwrap();
+
+        // The text is forwarded verbatim to the output stream.
+        let mut text = [0u8; 28];
+        out.read_exact(&mut text).unwrap();
+        assert_eq!(&text, b"Performing Streamed Install\n");
+
+        // Block 0 arrives in its own chunk (BLOCK_MISSING flushes).
+        let chunk = read_chunk(&mut conn);
+        let blocks = parse_blocks(&chunk);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0.file_id, 0);
+        assert_eq!(blocks[0].0.block_idx, 0);
+        assert_eq!(blocks[0].0.compression_type, COMPRESSION_NONE);
+        assert_eq!(blocks[0].1.as_slice(), &data[..BLOCK_SIZE as usize]);
+
+        // The follow-up window prefetch feeds block 1, then the done marker.
+        let chunk = read_chunk(&mut conn);
+        let blocks = parse_blocks(&chunk);
+        let (done, _) = blocks.last().unwrap();
+        assert_eq!(*done, ResponseHeader::done_marker());
+        let data_blocks = &blocks[..blocks.len() - 1];
+        assert_eq!(data_blocks.len(), 1);
+        assert_eq!(data_blocks[0].0.block_idx, 1);
+        // A small final block compresses (LZ4 of 100 incompressible bytes is
+        // 102 bytes, under kCompressedSizeMax); accept either wire form.
+        let tail = match data_blocks[0].0.compression_type {
+            COMPRESSION_NONE => data_blocks[0].1.clone(),
+            COMPRESSION_LZ4 => lz4_flex::block::decompress(&data_blocks[0].1, 100).unwrap(),
+            other => panic!("unexpected compression type {other}"),
+        };
+        assert_eq!(tail.as_slice(), &data[BLOCK_SIZE as usize..]);
+
+        // DESTROY stops the server loop.
+        conn.write_all(&encode_request(DESTROY, 0, 0)).unwrap();
+        assert!(server_thread.join().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_fds_forwards_output_and_returns_on_disconnect() {
+        use crate::server::sysdeps_unix::{adb_close, adb_socketpair};
+        use std::io::Write as _;
+        use std::os::unix::io::FromRawFd;
+
+        let (conn_server, conn_client) = adb_socketpair().unwrap();
+        let (out_server, out_client) = adb_socketpair().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            // No signed files: the server still handshakes and notifies done.
+            let mut server = IncrementalServer::new(Vec::new());
+            let result = server.serve_fds(conn_server, out_server);
+            adb_close(conn_server);
+            adb_close(out_server);
+            result
+        });
+
+        let mut conn = unsafe { std::os::unix::net::UnixStream::from_raw_fd(conn_client) };
+        let mut out = unsafe { std::os::unix::net::UnixStream::from_raw_fd(out_client) };
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        out.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+
+        // OKAY, then the done marker straight away (nothing to stream).
+        let mut okay = [0u8; 4];
+        conn.read_exact(&mut okay).unwrap();
+        assert_eq!(&okay, b"OKAY");
+        let chunk = read_chunk(&mut conn);
+        let blocks = parse_blocks(&chunk);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, ResponseHeader::done_marker());
+
+        // Plain text: the scan forwards all but the last 4 bytes immediately.
+        conn.write_all(b"hello from pm\n").unwrap();
+        let mut head = [0u8; 10];
+        out.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"hello from");
+
+        // Closing the connection flushes the retained tail and stops the server.
+        drop(conn);
+        let mut tail = [0u8; 4];
+        out.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b" pm\n");
+        assert!(server_thread.join().unwrap());
     }
 }

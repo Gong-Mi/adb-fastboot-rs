@@ -331,6 +331,17 @@ pub enum Commands {
         #[arg(long = "reply-fd")]
         reply_fd: i32,
     },
+    /// Internal: incremental streaming server (spawned by adb install with
+    /// inherited fds; AOSP commandline.cpp:2213-2238)
+    #[command(name = "inc-server", hide = true)]
+    IncServer {
+        /// Connection fd to the device (>= 3)
+        connection_fd: i32,
+        /// Output fd; non-protocol device output is forwarded here (>= 3)
+        output_fd: i32,
+        /// Signed files to serve; argument position is the file id
+        files: Vec<String>,
+    },
     /// Connect to a device via TCP/IP
     Connect {
         /// Device address (host:port)
@@ -1372,6 +1383,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let default_spec = format!("tcp:127.0.0.1:{server_port}");
             let spec = cli.transport.as_deref().unwrap_or(&default_spec);
             server::run_server_fork(Some(*reply_fd), spec);
+        }
+
+        Commands::IncServer { connection_fd, output_fd, files } => {
+            // AOSP commandline.cpp:2221-2237. `adb_register_socket` is a
+            // no-op on unix (sysdeps.h:514).
+            let connection_fd = *connection_fd;
+            if !server::sysdeps_unix::is_valid_os_fd(connection_fd) {
+                eprintln!("Invalid connection_fd number given: {connection_fd}");
+                std::process::exit(1);
+            }
+            server::sysdeps_unix::close_on_exec(connection_fd);
+
+            let output_fd = *output_fd;
+            if !server::sysdeps_unix::is_valid_os_fd(output_fd) {
+                eprintln!("Invalid output_fd number given: {output_fd}");
+                std::process::exit(1);
+            }
+            server::sysdeps_unix::close_on_exec(output_fd);
+
+            // AOSP returns the bool straight as an exit code, which inverts
+            // it; keep the sane mapping instead (nobody checks it).
+            let succeeded = client::incremental::serve(connection_fd, output_fd, files);
+            std::process::exit(if succeeded { 0 } else { 1 });
         }
 
         Commands::Connect { target } => {

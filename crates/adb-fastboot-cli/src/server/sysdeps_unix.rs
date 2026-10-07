@@ -162,6 +162,26 @@ fn disable_close_on_exec(fd: RawFd) {
     }
 }
 
+/// AOSP `close_on_exec()` (sysdeps.h): set FD_CLOEXEC on `fd` so it is not
+/// inherited across exec.
+pub fn close_on_exec(fd: RawFd) {
+    let old_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if old_flags >= 0 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, old_flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// AOSP `_is_valid_os_fd()` (commandline.cpp:1506-1518): reject negative
+/// descriptors, stdio, and descriptors that are not open.
+pub fn is_valid_os_fd(fd: RawFd) -> bool {
+    if fd < 3 {
+        return false;
+    }
+    (unsafe { libc::fcntl(fd, libc::F_GETFD) }) != -1
+}
+
 /// AOSP `adb_launch_process()` (sysdeps_unix.cpp:73-97): fork child,
 /// clear FD_CLOEXEC on specified fds to inherit, and execv.
 pub fn adb_launch_process(
@@ -290,5 +310,34 @@ mod tests {
         assert_eq!(waited, pid);
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn test_close_on_exec_sets_fd_cloexec() {
+        let (a, b) = adb_socketpair().unwrap();
+        // Clear the flag first in case the socketpair impl set it.
+        let flags = unsafe { libc::fcntl(a, libc::F_GETFD) };
+        unsafe { libc::fcntl(a, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+        close_on_exec(a);
+        let flags = unsafe { libc::fcntl(a, libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        adb_close(a);
+        adb_close(b);
+    }
+
+    #[test]
+    fn test_is_valid_os_fd_rules() {
+        // stdio is always rejected.
+        assert!(!is_valid_os_fd(0));
+        assert!(!is_valid_os_fd(1));
+        assert!(!is_valid_os_fd(2));
+        assert!(!is_valid_os_fd(-1));
+        // An open descriptor >= 3 is valid.
+        let (a, b) = adb_socketpair().unwrap();
+        assert!(is_valid_os_fd(a));
+        adb_close(a);
+        adb_close(b);
+        // A closed descriptor is invalid.
+        assert!(!is_valid_os_fd(a));
     }
 }

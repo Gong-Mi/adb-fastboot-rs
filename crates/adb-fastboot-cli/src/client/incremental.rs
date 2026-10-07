@@ -19,7 +19,7 @@ mod incremental_utils;
 
 #[allow(unused_imports)]
 pub use incremental_server::{
-    IncrementalServer, RequestCommand, ResponseHeader, SendResult, ServerFile,
+    serve, IncrementalServer, RequestCommand, ResponseHeader, SendResult, ServerFile,
 };
 
 #[allow(unused_imports)]
@@ -399,6 +399,130 @@ pub fn wait_for_installation(
     Err(format!("Failed to parse output: {}", truncated.trim()).into())
 }
 
+/// AOSP `wait_for_installation` fd variant (incremental.cpp:338-386): read the
+/// child inc-server's output. Blocks until `kMaxMessageSize` bytes are read or
+/// the pipe reaches EOF (short read — the child exited), then echoes the text
+/// and parses "Success" / "Failure [...]". Streaming may still be running when
+/// this returns.
+pub fn wait_for_installation_fd(read_fd: std::os::unix::io::RawFd) -> Result<(), String> {
+    const MAX_MESSAGE_SIZE: usize = 256;
+    // AOSP ReadFdExactly: fill the buffer or stop at EOF (EOF is not an
+    // error; other read failures are).
+    let mut child_stdout = vec![0u8; MAX_MESSAGE_SIZE];
+    let mut length = 0usize;
+    while length < MAX_MESSAGE_SIZE {
+        match crate::server::sysdeps_unix::adb_read(read_fd, &mut child_stdout[length..]) {
+            Ok(0) => break,
+            Ok(read) => length += read,
+            Err(error) => return Err(format!("Failed to read output: {error}")),
+        }
+    }
+    // Truncate at the first NUL; bytes past `length` stay zero-initialized
+    // (AOSP relies on std::string::resize's '\0' fill for the same effect).
+    let len = child_stdout
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(MAX_MESSAGE_SIZE);
+    let text = String::from_utf8_lossy(&child_stdout[..len]).into_owned();
+
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
+
+    // Wait till installation either succeeds or fails.
+    if text.contains("Success") {
+        return Ok(());
+    }
+    // On failure, wait for the full message.
+    if let Some(begin) = text.find("Failure [") {
+        if let Some(end) = text.rfind(']') {
+            if end >= begin {
+                return Err("Install failed".to_string());
+            }
+        }
+    }
+    if len == MAX_MESSAGE_SIZE {
+        return Err("Output too long".to_string());
+    }
+    Err("Failed to parse output".to_string())
+}
+
+/// AOSP `start_inc_server_and_stream_signed_files` (incremental.cpp:363-434):
+/// spawn `<inc_server_exe> inc-server <connection_fd> <print_fd> <signed files...>`
+/// with the connection and print fds inherited, then block until `pm` has
+/// received enough blocks to declare Success/Failure. The child keeps
+/// streaming afterwards; on failure it is killed (SIGTERM, matching
+/// `Process::kill()`).
+///
+/// The caller supplies the executable path (AOSP uses `GetExecutablePath()`;
+/// tests point this at a fixture).
+pub fn start_inc_server_and_stream_signed_files(
+    inc_server_exe: &str,
+    connection_fd: std::os::unix::io::RawFd,
+    database: &[IsDatabaseEntry],
+) -> Result<libc::pid_t, String> {
+    use crate::server::sysdeps_unix::{adb_close, adb_launch_process, adb_socketpair, close_on_exec};
+
+    // Pipe for the child process to write output to the parent.
+    let (pipe_read_fd, pipe_write_fd) = adb_socketpair()
+        .map_err(|_| "adb: failed to create socket pair for child to print to parent".to_string())?;
+    // The read end must not leak into the child.
+    close_on_exec(pipe_read_fd);
+
+    // We spawn an incremental server that will be up until all blocks have
+    // been fed to the Package Manager. This could take a long time depending
+    // on the size of the files to stream so we use a process able to outlive
+    // adb. Note that there might not be any signed files in the database, in
+    // which case we still need to spawn the server to process the output from
+    // `pm`.
+    let mut args: Vec<String> = vec![
+        "inc-server".to_string(),
+        connection_fd.to_string(),
+        pipe_write_fd.to_string(),
+    ];
+    for entry in database {
+        let IsDatabaseEntry::Signed { path, file_id, .. } = entry else {
+            continue;
+        };
+        // The incremental server assumes the argument position is the file id.
+        debug_assert_eq!(*file_id as usize, args.len() - 3);
+        args.push(path.to_string_lossy().into_owned());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let child = match adb_launch_process(inc_server_exe, &arg_refs, &[connection_fd, pipe_write_fd]) {
+        Ok(pid) => pid,
+        Err(_) => {
+            adb_close(pipe_read_fd);
+            adb_close(pipe_write_fd);
+            return Err("adb: failed to fork".to_string());
+        }
+    };
+    // Close the write FD, so that reads on the read FD return as soon as the
+    // child process exits (incremental.cpp:420-422).
+    adb_close(pipe_write_fd);
+
+    // Block until the Package Manager has received enough blocks to declare
+    // the installation successful or failed. Meanwhile, the incremental
+    // server is still sending blocks to the device.
+    match wait_for_installation_fd(pipe_read_fd) {
+        Ok(()) => {
+            adb_close(pipe_read_fd);
+            Ok(child)
+        }
+        Err(error) => {
+            // AOSP's `server_killer` scope guard: the child may still be
+            // streaming blocks; kill it (SIGTERM like `Process::kill()`; the
+            // process exits before the caller needs the pid, so no reap).
+            unsafe {
+                libc::kill(child, libc::SIGTERM);
+            }
+            adb_close(pipe_read_fd);
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,5 +899,163 @@ mod tests {
             service,
             "abb_exec:package\0install-incremental\0-r\0a.apk:4096:0:QUJD:1\0b.txt:3:1"
         );
+    }
+
+    #[test]
+    fn wait_for_installation_fd_parses_success_failure_and_garbage() {
+        use crate::server::sysdeps_unix::{adb_close, adb_pipe, adb_write};
+
+        // Success: the child prints and closes the pipe (EOF).
+        let (read_fd, write_fd) = adb_pipe().unwrap();
+        let writer = std::thread::spawn(move || {
+            adb_write(write_fd, b"Performing Streamed Install\nSuccess\n").unwrap();
+            adb_close(write_fd);
+        });
+        assert_eq!(wait_for_installation_fd(read_fd), Ok(()));
+        writer.join().unwrap();
+        adb_close(read_fd);
+
+        // Failure [...] → "Install failed".
+        let (read_fd, write_fd) = adb_pipe().unwrap();
+        let writer = std::thread::spawn(move || {
+            adb_write(write_fd, b"Failure [INSTALL_FAILED_TEST]").unwrap();
+            adb_close(write_fd);
+        });
+        assert_eq!(
+            wait_for_installation_fd(read_fd),
+            Err("Install failed".to_string())
+        );
+        writer.join().unwrap();
+        adb_close(read_fd);
+
+        // Garbage → "Failed to parse output".
+        let (read_fd, write_fd) = adb_pipe().unwrap();
+        let writer = std::thread::spawn(move || {
+            adb_write(write_fd, b"what is this").unwrap();
+            adb_close(write_fd);
+        });
+        assert_eq!(
+            wait_for_installation_fd(read_fd),
+            Err("Failed to parse output".to_string())
+        );
+        writer.join().unwrap();
+        adb_close(read_fd);
+
+        // 256 non-NUL bytes with no verdict → "Output too long".
+        let (read_fd, write_fd) = adb_pipe().unwrap();
+        let writer = std::thread::spawn(move || {
+            adb_write(write_fd, &[b'x'; 256]).unwrap();
+            adb_close(write_fd);
+        });
+        assert_eq!(
+            wait_for_installation_fd(read_fd),
+            Err("Output too long".to_string())
+        );
+        writer.join().unwrap();
+        adb_close(read_fd);
+    }
+
+    /// Read exactly `buf.len()` bytes, failing fast if the peer stalls.
+    fn read_exact_fd(fd: std::os::unix::io::RawFd, buf: &mut [u8]) {
+        use crate::server::sysdeps_unix::{adb_poll, adb_read};
+        let mut filled = 0;
+        while filled < buf.len() {
+            let ready = adb_poll(fd, libc::POLLIN, 5000).unwrap();
+            assert_eq!(ready, 1, "timed out waiting for child data on fd {fd}");
+            let read = adb_read(fd, &mut buf[filled..]).unwrap();
+            assert!(read > 0, "unexpected EOF on fd {fd}");
+            filled += read;
+        }
+    }
+
+    /// Absolute path of the python3 interpreter, for fixture shebangs.
+    fn python3_path() -> Option<String> {
+        let output = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            None
+        } else {
+            Some(path)
+        }
+    }
+
+    #[test]
+    fn start_inc_server_spawns_child_with_inherited_fds_and_waits() {
+        use crate::server::sysdeps_unix::{adb_close, adb_socketpair};
+
+        // The fixture needs an interpreter shebang that resolves on both
+        // Termux (no /usr/bin) and CI hosts; detect python3's absolute path.
+        let Some(python) = python3_path() else {
+            eprintln!("python3 not available; skipping launcher fixture test");
+            return;
+        };
+
+        // Fixture "inc-server": dumps its argv, writes OKAY to the connection
+        // fd and "Success" to the print fd, then exits.
+        let root = std::env::temp_dir().join(format!("inc-launch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("fake-inc-server.py");
+        let mut fixture = String::new();
+        fixture.push_str(&format!("#!{python}\n"));
+        fixture.push_str("import os, sys\n");
+        fixture.push_str("with open(sys.argv[0] + '.args', 'w') as f:\n");
+        fixture.push_str("    f.write('\\0'.join(sys.argv[1:]))\n");
+        fixture.push_str("os.write(int(sys.argv[2]), b'OKAY')\n");
+        fixture.push_str("os.write(int(sys.argv[3]), b'Performing Streamed Install\\nSuccess\\n')\n");
+        std::fs::write(&script, fixture).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let apk = root.join("fake.apk");
+        std::fs::write(&apk, b"payload").unwrap();
+        let database = vec![IsDatabaseEntry::Signed {
+            filename: "fake.apk".into(),
+            size: 7,
+            file_id: 0,
+            signature: "QUJD".into(),
+            path: apk.clone(),
+        }];
+
+        let (conn_child, conn_peer) = adb_socketpair().unwrap();
+        let pid = start_inc_server_and_stream_signed_files(
+            script.to_str().unwrap(),
+            conn_child,
+            &database,
+        )
+        .unwrap();
+
+        // The child really got the inherited connection fd...
+        let mut okay = [0u8; 4];
+        read_exact_fd(conn_peer, &mut okay);
+        assert_eq!(&okay, b"OKAY");
+
+        // ...and the expected argv: inc-server <conn_fd> <print_fd> <apk>.
+        let dump = std::fs::read(format!("{}.args", script.display())).unwrap();
+        let args: Vec<String> = dump
+            .split(|byte| *byte == 0)
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        assert_eq!(args[0], "inc-server");
+        assert_eq!(args[1], conn_child.to_string());
+        assert!(args[2].parse::<i32>().is_ok(), "print fd: {}", args[2]);
+        assert_eq!(args[3], apk.to_string_lossy());
+
+        // Reap the (already exited) child.
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+
+        adb_close(conn_child);
+        adb_close(conn_peer);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
