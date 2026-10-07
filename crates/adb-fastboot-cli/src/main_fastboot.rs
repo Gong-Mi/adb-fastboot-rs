@@ -14,15 +14,9 @@ use zip::ZipArchive;
 ///
 /// Constructed once in `main()` from the CLI flags and threaded through
 /// every command that needs them.  Field names match the AOSP C++ globals
-/// (`g_disable_verity`, `fp->skip_reboot`, etc.) for traceability.
+/// (`g_disable_verity`, etc.) for traceability.
 #[derive(Debug, Clone, Copy, Default)]
 struct GlobalOptions {
-    /// `--skip-reboot`: don't reboot after flashing.
-    skip_reboot: bool,
-    /// `--skip-secondary`: don't flash secondary slots in flashall/update.
-    skip_secondary: bool,
-    /// `--force`: force a flash operation that may be unsafe.
-    force_flash: bool,
     /// `--disable-verity`: set bit 0 in vbmeta flags.
     disable_verity: bool,
     /// `--disable-verification`: set bit 1 in vbmeta flags.
@@ -118,24 +112,24 @@ struct Cli {
     #[arg(long, global = true)]
     usb: bool,
 
-    /// Use SLOT for slot-suffixed partitions (`all` and `other` require
-    /// multi-slot/device discovery and are reserved for orchestration).
-    #[arg(long, global = true, value_parser = parse_slot_value)]
+    /// Use a concrete SLOT for partition commands (`all` and `other` are not supported).
+    #[arg(id = "global_slot", long = "slot", global = true, value_parser = parse_slot_value)]
     slot: Option<String>,
 
-    /// Set the active slot after the selected command (`--set-active[=SLOT]`).
+    /// Not supported: automatic slot activation; rejected before any I/O.
+    /// Use the explicit set_active SLOT command separately.
     #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
     set_active: Option<String>,
 
-    /// Don't reboot device after flashing (AOSP --skip-reboot).
+    /// Not supported: AOSP --skip-reboot (flash/update currently do not auto-reboot).
     #[arg(long, global = true)]
     skip_reboot: bool,
 
-    /// Don't flash secondary slots in flashall/update (AOSP --skip-secondary).
+    /// Not supported: AOSP secondary-slot policy; rejected before any I/O.
     #[arg(long, global = true)]
     skip_secondary: bool,
 
-    /// Force a flash operation that may be unsafe (AOSP --force).
+    /// Not supported: AOSP --force requirement override; rejected before any I/O.
     #[arg(long, global = true)]
     force: bool,
 
@@ -151,7 +145,7 @@ struct Cli {
     #[arg(short = 'v', long, global = true)]
     verbose: bool,
 
-    /// Don't buffer stdout/stderr (AOSP --unbuffered).
+    /// Not supported: AOSP --unbuffered; rejected before any I/O.
     #[arg(long, global = true)]
     unbuffered: bool,
 
@@ -725,10 +719,7 @@ fn download_and_boot_payload<T: FastbootTransport>(
 
     // Step 3: 读取 payload 发送完成后的 OKAY/FAIL
     let post_dl_resp = transport.recv_response()?;
-    if let fastboot_protocol::FastbootResponse::Fail(reason) = &post_dl_resp {
-        eprintln!("[fastboot-rs] payload 发送失败: {}", reason);
-        std::process::exit(1);
-    }
+    require_terminal_okay(&post_dl_resp)?;
     println!("[fastboot-rs] Download 完成: {:?}", post_dl_resp);
 
     // Step 4: 发送 boot 命令
@@ -818,10 +809,7 @@ fn download_and_flash_payload<T: FastbootTransport>(
 
     // Step 3: 读取 payload 发送完成后的 OKAY/FAIL
     let post_dl_resp = transport.recv_response()?;
-    if let fastboot_protocol::FastbootResponse::Fail(reason) = &post_dl_resp {
-        eprintln!("[fastboot-rs] payload 发送失败: {}", reason);
-        std::process::exit(1);
-    }
+    require_terminal_okay(&post_dl_resp)?;
     println!("[fastboot-rs] Download 完成: {:?}", post_dl_resp);
 
     // Step 4: 发送 flash 命令到指定分区
@@ -832,36 +820,17 @@ fn download_and_flash_payload<T: FastbootTransport>(
     Ok(())
 }
 
-/// Boot 命令发送后的响应处理（设备可能立即重启）。
+/// Boot is confirmed only by a terminal OKAY, not DATA or an I/O error.
 fn handle_boot_response(
     mut transport: FastbootConnection,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let boot_resp = transport.recv_response();
-    match &boot_resp {
-        Ok(fastboot_protocol::FastbootResponse::Okay(msg)) => {
-            println!("[fastboot-rs] Boot OK: {}", msg);
-            let disconnected = wait_for_disconnect(transport, Duration::from_secs(5));
-            if disconnected {
-                println!("[fastboot-rs] 设备已断开 — boot 确认");
-            } else {
-                eprintln!(
-                    "[fastboot-rs] 警告: 设备未在 5s 内断开 (boot 可能仍在进行)"
-                );
-            }
-        }
-        Ok(fastboot_protocol::FastbootResponse::Fail(reason)) => {
-            eprintln!("[fastboot-rs] Boot FAIL: {}", reason);
-            std::process::exit(1);
-        }
-        Ok(other) => {
-            println!("[fastboot-rs] Boot 响应: {:?}", other);
-        }
-        Err(e) => {
-            eprintln!(
-                "[fastboot-rs] 信息: 设备已断开 (boot 正在启动): {}",
-                e
-            );
-        }
+    let response = transport.recv_response()?;
+    require_terminal_okay(&response)?;
+    println!("[fastboot-rs] Boot OK: {:?}", response);
+    if wait_for_disconnect(transport, Duration::from_secs(5)) {
+        println!("[fastboot-rs] 设备已断开 — boot 确认");
+    } else {
+        eprintln!("[fastboot-rs] 警告: 设备未在 5s 内断开 (boot 可能仍在进行)");
     }
     Ok(())
 }
@@ -1066,129 +1035,108 @@ fn run_reboot(
     Ok(())
 }
 
-/// 解析 android-info.txt，检查设备兼容性。
-///
-/// 兼容 AOSP CheckRequirements() 逻辑：
-/// - `require board=<board>`  → getvar:product 检查
-/// - `require version-*=<val>` → getvar 检查对应变量
-/// - `require partition-exists=<name>` → getvar:has-slot:<name> 检查
-/// - `require force=<val>` → 始终要求 force_flash
-/// - 行首 `require` 后的 `inverse` 标签反转检查
-/// - 不支持的行打印警告并跳过
+/// Mandatory update queries never turn FAIL, DATA, or I/O errors into a value.
+fn update_getvar<T: FastbootTransport>(
+    transport: &mut T,
+    variable: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    transport.send_cmd(&format!("getvar:{variable}"))?;
+    let response = transport.recv_response()?;
+    require_terminal_okay(&response).map_err(|error| format!("getvar:{variable}: {error}"))?;
+    match response {
+        fastboot_protocol::FastbootResponse::Okay(value) => Ok(value),
+        _ => unreachable!("terminal OKAY was checked"),
+    }
+}
+
+/// Check the supported android-info grammar before planning any writes.
+/// AOSP require/reject, board alias, product guards, alternatives and trailing
+/// wildcard are supported; legacy `require inverse`/`or` remain accepted.
+/// Unsupported/malformed lines fail closed instead of silently removing a gate.
 fn check_android_info<T: FastbootTransport>(
     transport: &mut T,
     data: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for line in data.lines() {
-        let line = line.trim();
+) -> Result<std::collections::HashSet<String>, Box<dyn std::error::Error>> {
+    let mut requirements = Vec::new();
+    for line in data.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-
-        // 格式: require [inverse] <name>=<value> [or <value2>...]
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 || parts[0] != "require" {
-            eprintln!("[fastboot-rs] android-info.txt 语法警告: {line}");
-            continue;
+        let (mut left, right) = line
+            .split_once('=')
+            .ok_or_else(|| format!("unsupported android-info.txt requirement: {line}"))?;
+        left = left.trim();
+        let mut invert = false;
+        let mut product = None;
+        if let Some(rest) = left.strip_prefix("require-for-product:") {
+            let (guard, variable) = rest
+                .trim()
+                .split_once(char::is_whitespace)
+                .ok_or_else(|| format!("malformed product requirement: {line}"))?;
+            product = Some(guard.to_string());
+            left = variable.trim();
+        } else if let Some(rest) = left.strip_prefix("require inverse ") {
+            invert = true;
+            left = rest.trim();
+        } else if let Some(rest) = left.strip_prefix("require ") {
+            left = rest.trim();
+        } else if let Some(rest) = left.strip_prefix("reject ") {
+            invert = true;
+            left = rest.trim();
         }
-
-        let mut idx = 1;
-        let invert = parts.len() > 2 && parts[1] == "inverse";
-        if invert {
-            idx += 1;
+        if left.is_empty() || left.chars().any(char::is_whitespace) || left == "force" {
+            return Err(format!("unsupported android-info.txt requirement: {line}").into());
         }
-
-        if idx >= parts.len() {
-            eprintln!("[fastboot-rs] android-info.txt 语法警告: {line}");
-            continue;
+        let options: Vec<String> = right
+            .replace(" or ", "|")
+            .split('|')
+            .map(|value| value.trim().to_string())
+            .collect();
+        if options.iter().any(String::is_empty) {
+            return Err(format!("empty android-info.txt requirement value: {line}").into());
         }
+        let variable = if left == "board" { "product" } else { left };
+        requirements.push((variable.to_string(), options, invert, product));
+    }
 
-        let kv = parts[idx];
-        if let Some(eq_pos) = kv.find('=') {
-            let var = &kv[..eq_pos];
-            let expected = &kv[eq_pos + 1..];
-
-            // 解析额外的可选值: ["or val2", "or val3", ...]
-            let mut options = vec![expected];
-            let mut i = idx + 1;
-            while i < parts.len() {
-                if parts[i] == "or" && i + 1 < parts.len() {
-                    options.push(parts[i + 1]);
-                    i += 2;
-                } else {
-                    break;
-                }
+    let mut required_images = std::collections::HashSet::new();
+    for (variable, options, invert, product) in requirements {
+        if let Some(product) = product {
+            if update_getvar(transport, "product")? != product {
+                continue; // explicit product guard, not a failed mandatory query
             }
-
-            match var {
-                "partition-exists" => {
-                    // 检查分区是否存在
-                    let query = format!("getvar:has-slot:{}", options[0]);
-                    if transport.send_cmd(&query).is_ok() {
-                        if let Ok(resp) = transport.recv_response() {
-                            match resp {
-                                fastboot_protocol::FastbootResponse::Okay(val) => {
-                                    if val != "yes" && val != "no" {
-                                        eprintln!(
-                                            "[fastboot-rs] 错误: 设备缺少所需分区 '{}'",
-                                            options[0]
-                                        );
-                                        std::process::exit(1);
-                                    }
-                                }
-                                _ => {
-                                    eprintln!(
-                                        "[fastboot-rs] 错误: 设备缺少所需分区 '{}'",
-                                        options[0]
-                                    );
-                                    std::process::exit(1);
-                                }
-                            }
-                        }
-                    }
-                }
-                other => {
-                    // getvar:other 并检查值
-                    let query = format!("getvar:{other}");
-                    if let Err(e) = transport.send_cmd(&query) {
-                        eprintln!("[fastboot-rs] 警告: 无法获取变量 '{other}': {e}");
-                        continue;
-                    }
-                    let actual = match transport.recv_response() {
-                        Ok(fastboot_protocol::FastbootResponse::Okay(val)) => val,
-                        Ok(fastboot_protocol::FastbootResponse::Fail(reason)) => {
-                            eprintln!("[fastboot-rs] getvar:{other} FAILED: {reason}");
-                            String::new()
-                        }
-                        _ => {
-                            eprintln!("[fastboot-rs] 警告: 无法获取变量 '{other}'");
-                            continue;
-                        }
-                    };
-
-                    let met = options.iter().any(|opt| actual.trim() == *opt);
-                    if invert {
-                        if met {
-                            eprintln!(
-                                "[fastboot-rs] 错误: 设备 {other} 是 '{actual}'，但 update 要求不是 {}",
-                                options.join(" 或 ")
-                            );
-                            std::process::exit(1);
-                        }
-                    } else if !met {
-                        eprintln!(
-                            "[fastboot-rs] 错误: 设备 {other} 是 '{actual}'，但 update 要求 {}",
-                            options.join(" 或 ")
-                        );
-                        std::process::exit(1);
-                    }
-                }
+        }
+        if variable == "partition-exists" {
+            if invert
+                || options.len() != 1
+                || !AOSP_IMAGES.iter().any(|entry| entry.0 == options[0])
+            {
+                return Err(
+                    format!("unsupported required partition: {}", options.join("|")).into(),
+                );
             }
+            let has_slot = update_getvar(transport, &format!("has-slot:{}", options[0]))?;
+            if has_slot != "yes" && has_slot != "no" {
+                return Err(format!("device lacks required partition: {}", options[0]).into());
+            }
+            required_images.insert(options[0].clone());
         } else {
-            eprintln!("[fastboot-rs] android-info.txt 语法警告: {line}");
+            let actual = update_getvar(transport, &variable)?;
+            let matches = options.iter().any(|option| {
+                option
+                    .strip_suffix('*')
+                    .map_or(actual.trim() == option, |prefix| {
+                        actual.trim().starts_with(prefix)
+                    })
+            });
+            if matches == invert {
+                return Err(
+                    format!("android-info.txt requirement not met: {variable}={actual}").into(),
+                );
+            }
         }
     }
-    Ok(())
+    Ok(required_images)
 }
 
 /// AOSP 兼容的分区镜像列表及刷写顺序。
@@ -1222,11 +1170,101 @@ const AOSP_IMAGES: &[(&str, &str, bool)] = &[
     ("cache",          "cache.img",          true),
 ];
 
-/// 执行 fastboot update：解析 update.zip，刷写所有分区镜像。
+struct UpdateImage {
+    partition: &'static str,
+    image_name: &'static str,
+    wire_partition: String,
+    size: u64,
+}
+
+/// Freeze required-image presence/readability and every partition/slot decision
+/// before the first download. Only one entry is decompressed at a time.
+fn prepare_update_images<T: FastbootTransport>(
+    transport: &mut T,
+    archive: &mut ZipArchive<File>,
+    required: &std::collections::HashSet<String>,
+    slot: &fastboot_protocol::SlotSelection,
+    max_download_size: Option<usize>,
+) -> Result<Vec<UpdateImage>, Box<dyn std::error::Error>> {
+    let mut names = std::collections::HashSet::new();
+    for name in archive.file_names() {
+        if !names.insert(name.to_string()) {
+            return Err(format!("duplicate update ZIP entry: {name}").into());
+        }
+    }
+    let mut images = Vec::new();
+    for &(partition, image_name, optional) in AOSP_IMAGES {
+        if !names.contains(image_name) {
+            if !optional || required.contains(partition) {
+                return Err(
+                    format!("required image '{image_name}' missing from update ZIP").into(),
+                );
+            }
+            continue;
+        }
+        let mut entry = archive.by_name(image_name)?;
+        let size = entry.size();
+        if size == 0 || size > u32::MAX as u64 || entry.is_dir() {
+            return Err(format!("invalid update image '{image_name}' size: {size}").into());
+        }
+        // Read to EOF now: CRC, sparse parsing, or split-planning errors in a
+        // later image must not be discovered after an earlier partition write.
+        // The temporary buffer is released for each entry, not retained for the ZIP.
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data)?;
+        if data.len() as u64 != size {
+            return Err(format!("truncated update image '{image_name}'").into());
+        }
+        let sparse = if data.starts_with(&fastboot_protocol::SPARSE_HEADER_MAGIC.to_le_bytes()) {
+            Some(fastboot_protocol::SparseFile::from_bytes(&data)?)
+        } else {
+            None
+        };
+        if let Some(limit) = max_download_size.filter(|limit| *limit > 0 && size > *limit as u64) {
+            let sparse =
+                sparse.unwrap_or_else(|| fastboot_protocol::SparseFile::from_raw(&data, 4096));
+            sparse.split(limit)?;
+        }
+        images.push(UpdateImage {
+            partition,
+            image_name,
+            wire_partition: partition.to_string(),
+            size,
+        });
+    }
+    let mut selected_slot = match slot {
+        fastboot_protocol::SlotSelection::Named(name) => Some(name.clone()),
+        fastboot_protocol::SlotSelection::Current => None,
+        _ => return Err("update --slot=all/other is not supported".into()),
+    };
+    for image in &mut images {
+        match update_getvar(transport, &format!("has-slot:{}", image.partition))?.as_str() {
+            "no" => {}
+            "yes" => {
+                if selected_slot.is_none() {
+                    let current = update_getvar(transport, "current-slot")?;
+                    match fastboot_protocol::SlotSelection::parse(Some(&current))? {
+                        fastboot_protocol::SlotSelection::Named(name) => selected_slot = Some(name),
+                        _ => return Err("device returned no concrete current-slot".into()),
+                    }
+                }
+                image.wire_partition =
+                    format!("{}_{}", image.partition, selected_slot.as_ref().unwrap());
+            }
+            value => {
+                return Err(format!("invalid has-slot:{} value: {value}", image.partition).into())
+            }
+        }
+    }
+    Ok(images)
+}
+
+/// Execute the bounded legacy update image-list path (not AOSP's full task planner).
 fn do_update<T: FastbootTransport>(
     transport: &mut T,
     zip_path: &str,
     gopts: &GlobalOptions,
+    slot: &fastboot_protocol::SlotSelection,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // --- Step 1: 打开 update.zip ---
     let zip_file = match File::open(zip_path) {
@@ -1276,7 +1314,7 @@ fn do_update<T: FastbootTransport>(
     println!("[fastboot-rs] --------------------------------------------");
 
     // 检查兼容性
-    check_android_info(transport, &android_info)?;
+    let required = check_android_info(transport, &android_info)?;
     println!("[fastboot-rs] 设备兼容性检查通过");
 
     // 获取 max-download-size
@@ -1295,46 +1333,13 @@ fn do_update<T: FastbootTransport>(
         );
     }
 
-    // 获取当前 slot
-    let current_slot = match transport.send_cmd("getvar:current-slot") {
-        Ok(_) => match transport.recv_response() {
-            Ok(fastboot_protocol::FastbootResponse::Okay(val)) => {
-                let s = val.trim().to_string();
-                if !s.is_empty() { Some(s) } else { None }
-            }
-            _ => None,
-        },
-        _ => None,
-    };
-    if let Some(ref slot) = current_slot {
-        println!("[fastboot-rs] 当前 slot: {slot}");
-    }
-
-    // --- Step 3: 按 AOSP 顺序刷写分区镜像 ---
-    // 收集 zip 中存在的镜像文件名以便快速查找
-    let zip_names: std::collections::HashSet<String> = archive
-        .file_names()
-        .map(|n| n.to_string())
-        .collect();
-
+    let images = prepare_update_images(transport, &mut archive, &required, slot, max_download_size)?;
+    // Every selected image and partition/slot query passed before any download.
     println!("[fastboot-rs] 开始刷写分区镜像...\n");
-
-    for &(partition, img_name, optional) in AOSP_IMAGES {
-        // 检查 zip 中是否存在此镜像
-        if !zip_names.contains(img_name) {
-            if optional {
-                println!(
-                    "[fastboot-rs]   {img_name}: 未找到，跳过（可选）"
-                );
-            } else {
-                eprintln!(
-                    "[fastboot-rs] 错误: 必需的镜像 '{img_name}' 在 zip 中未找到"
-                );
-                std::process::exit(1);
-            }
-            continue;
-        }
-
+    for image in images {
+        let partition = image.partition;
+        let img_name = image.image_name;
+        let partition_with_slot = image.wire_partition;
         println!("[fastboot-rs] >>> 刷写 {img_name} -> 分区 {partition}");
 
         // 从 zip 读取镜像数据
@@ -1367,6 +1372,9 @@ fn do_update<T: FastbootTransport>(
         };
 
         let file_size = image_data.len();
+        if file_size as u64 != image.size {
+            return Err(format!("update image changed after preflight: {img_name}").into());
+        }
         if file_size == 0 {
             eprintln!("[fastboot-rs] 错误: 镜像 '{img_name}' 为空");
             std::process::exit(1);
@@ -1381,16 +1389,6 @@ fn do_update<T: FastbootTransport>(
         println!(
             "[fastboot-rs]   {img_name}: {file_size} 字节"
         );
-
-        let partition_with_slot = if let Some(ref slot) = current_slot {
-            if !partition.ends_with('_') {
-                format!("{partition}_{slot}")
-            } else {
-                partition.to_string()
-            }
-        } else {
-            partition.to_string()
-        };
 
         let need_split = match max_download_size {
             Some(limit) if limit > 0 && file_size > limit => true,
@@ -1480,19 +1478,13 @@ fn do_update<T: FastbootTransport>(
                 transport.flush()?;
 
                 let post_resp = transport.recv_response()?;
-                if let fastboot_protocol::FastbootResponse::Fail(reason) = post_resp {
-                    eprintln!(
-                        "[fastboot-rs] payload 发送失败 (chunk {}/{}): {reason}",
-                        idx + 1,
-                        splits.len()
-                    );
-                    std::process::exit(1);
-                }
+                require_terminal_okay(&post_resp)?;
 
                 // flash
                 let flash_cmd = fastboot_protocol::flash(&partition_with_slot);
                 transport.send_cmd(&flash_cmd)?;
                 let flash_resp = transport.recv_response()?;
+                require_terminal_okay(&flash_resp)?;
                 match &flash_resp {
                     fastboot_protocol::FastbootResponse::Okay(val) => {
                         println!(
@@ -1554,15 +1546,13 @@ fn do_update<T: FastbootTransport>(
             transport.flush()?;
 
             let post_resp = transport.recv_response()?;
-            if let fastboot_protocol::FastbootResponse::Fail(reason) = &post_resp {
-                eprintln!("[fastboot-rs] payload 发送失败 ({img_name}): {reason}");
-                std::process::exit(1);
-            }
+            require_terminal_okay(&post_resp)?;
 
             // 发送 flash 命令
             let flash_cmd = fastboot_protocol::flash(&partition_with_slot);
             transport.send_cmd(&flash_cmd)?;
             let flash_resp = transport.recv_response()?;
+            require_terminal_okay(&flash_resp)?;
             match &flash_resp {
                 fastboot_protocol::FastbootResponse::Okay(val) => {
                     println!("[fastboot-rs]   {img_name} -> {partition_with_slot} OK: {val}");
@@ -1734,10 +1724,7 @@ fn flash_image_file<T: FastbootTransport>(
             transport.flush()?;
 
             let post_dl_resp = transport.recv_response()?;
-            if let fastboot_protocol::FastbootResponse::Fail(reason) = post_dl_resp {
-                eprintln!("Error after payload send for chunk {}: {}", idx + 1, reason);
-                std::process::exit(1);
-            }
+            require_terminal_okay(&post_dl_resp)?;
 
             let flash_cmd = fastboot_protocol::flash(wire_partition);
             transport.send_cmd(&flash_cmd)?;
@@ -1845,10 +1832,7 @@ fn flash_image_file<T: FastbootTransport>(
         transport.flush()?;
 
         let post_dl_resp = transport.recv_response()?;
-        if let fastboot_protocol::FastbootResponse::Fail(reason) = post_dl_resp {
-            eprintln!("Error after payload send: {}", reason);
-            std::process::exit(1);
-        }
+        require_terminal_okay(&post_dl_resp)?;
 
         let flash_cmd = fastboot_protocol::flash(wire_partition);
         transport.send_cmd(&flash_cmd)?;
@@ -1860,8 +1844,53 @@ fn flash_image_file<T: FastbootTransport>(
     Ok(())
 }
 
+/// Parsed compatibility flags must never silently promise missing orchestration.
+/// Keep this gate before target opening, local-file reads, and storage operations.
+fn validate_supported_options(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    for (requested, option) in [
+        (cli.set_active.is_some(), "--set-active"),
+        (cli.skip_secondary, "--skip-secondary"),
+        (cli.force, "--force"),
+        (cli.unbuffered, "--unbuffered"),
+    ] {
+        if requested {
+            return Err(format!("{option} is not supported; refusing before any I/O").into());
+        }
+    }
+    if cli.skip_reboot {
+        return Err("--skip-reboot is not supported; flash/update currently do not automatically reboot; refusing before any I/O".into());
+    }
+    if matches!(cli.slot.as_deref(), Some("all" | "other")) {
+        return Err("--slot=all/other is not supported; refusing before any I/O".into());
+    }
+    if cli.slot.is_some()
+        && !matches!(
+            cli.command,
+            Commands::Flash { .. }
+                | Commands::WipeSuper { .. }
+                | Commands::FlashRaw { .. }
+                | Commands::Erase { .. }
+                | Commands::Format { .. }
+                | Commands::Fetch { .. }
+                | Commands::Update { .. }
+        )
+    {
+        return Err("--slot is not supported for this command; refusing before any I/O".into());
+    }
+    if (cli.disable_verity || cli.disable_verification)
+        && !matches!(
+            cli.command,
+            Commands::Flash { .. } | Commands::WipeSuper { .. } | Commands::Update { .. }
+        )
+    {
+        return Err("--disable-verity/--disable-verification are not supported for this command; refusing before any I/O".into());
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    validate_supported_options(&cli)?;
     let environment_serial = std::env::var("ANDROID_SERIAL").ok();
     let connection_target = match &cli.command {
         // connect has its own explicit positional target; disconnect is a
@@ -1876,9 +1905,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // AOSP-mirror global options, constructed once and threaded through.
     let gopts = GlobalOptions {
-        skip_reboot: cli.skip_reboot,
-        skip_secondary: cli.skip_secondary,
-        force_flash: cli.force,
         disable_verity: cli.disable_verity,
         disable_verification: cli.disable_verification,
         verbose: cli.verbose,
@@ -1886,18 +1912,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if gopts.verbose {
         eprintln!("[fastboot-rs] verbose mode enabled");
         eprintln!("[fastboot-rs] global options: {gopts:?}");
-    }
-
-    // `--set-active[=SLOT]` is parsed and validated here. Applying it around
-    // flashall/update requires orchestration deliberately outside this slice.
-    if let Some(value) = cli.set_active.as_deref() {
-        let requested = if value.is_empty() { None } else { Some(value) };
-        match fastboot_protocol::SlotSelection::parse(requested)? {
-            fastboot_protocol::SlotSelection::Named(_) | fastboot_protocol::SlotSelection::Current => {}
-            fastboot_protocol::SlotSelection::All | fastboot_protocol::SlotSelection::Other => {
-                return Err("--set-active requires a concrete slot (or no value)".into());
-            }
-        }
     }
 
     match cli.command {
@@ -2283,6 +2297,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // 读取 flash 响应
             let flash_resp = transport.recv_response()?;
+            require_terminal_okay(&flash_resp)?;
             match &flash_resp {
                 fastboot_protocol::FastbootResponse::Okay(val) => {
                     println!(
@@ -2610,8 +2625,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             transport.flush()?;
 
-            // Step 4: 读取最终 OKAY/FAIL 响应
+            // Step 4: only OKAY completes the accepted download.
             let final_resp = transport.recv_response()?;
+            require_terminal_okay(&final_resp)?;
             match &final_resp {
                 fastboot_protocol::FastbootResponse::Okay(msg) => {
                     println!("[fastboot-rs] Stage 成功: {}", msg);
@@ -2698,7 +2714,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             println!("[fastboot-rs] 已连接至 fastboot 目标 {addr}");
-            do_update(&mut transport, &zip_file, &gopts)?;
+            do_update(&mut transport, &zip_file, &gopts, &slot_selection)?;
         }
         Commands::Gsi { action } => {
             let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
