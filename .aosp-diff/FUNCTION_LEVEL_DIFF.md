@@ -12,7 +12,7 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 | sockets asocket 状态机 | 15 | smart_socket.rs Local/Remote/Smart enum 已实现核心 | 命名差分（enum 替代 vtable） |
 | transport 注册表 | 12 | server/transport.rs+models.rs TransportRegistry 已实现 | 命名差分 |
 | mdns 后端 | 8 | `crates/adb-mdns` callback 由 runner 启动；Create/Update/Delete 已进 TransportRegistry；报文 fixture 覆盖 PTR→SRV→A/AAAA→TXT→Create、TXT/SRV Update 和 TTL-zero PTR→Delete | 代码接线+离线状态/packet 测试完成；无设备/组播依赖 |
-| incremental/fastdeploy | 48 | `incremental_utils` 纯函数层已移植 @ 2898b1e：verity tree 尺寸 + `.idsig` v2 头解析（4 离线测试）；`incremental.rs` 对显式 incremental 请求仍显式拒绝 | 部分实现：缺 build_database / connect_and_send_database / send_unsigned_files / inc-server（incremental.cpp:209-466）与 fastdeploy agent |
+| incremental/fastdeploy | 48 | 切片1 @ 2898b1e：`incremental_utils` 纯函数（verity tree + `.idsig` v2 头解析）；切片2 @ 4ae77bd：`validate_signature`/`requires_v4_signature`/`read_signature`/`encode_signature`/`should_use_incremental_by_default`（离线测试全覆盖） | 部分实现：缺 build_database / connect_and_send_database / send_unsigned_files / wait_for_installation / inc-server（incremental.cpp:66-208, 317-466）与 fastdeploy agent |
 | adb_install 安装分支 | 21 | CLI `install` 解析设备 CNXN feature banner；`--streaming`/`--no-streaming` 可控；`install-multiple` split session 与 `install-multi-package` parent/child transaction 都有 fake-peer coverage | 0 个同名函数；abb_exec transport 与 APEX streamed 已落地 @ b7ec437；install-multiple 接受 .dm/.sdm/.fsv_sig/.idsig；APEX staged child @ 08c3c4d；`--staged-ready-timeout` commit 透传 @ 09db0d9；功能缺口：incremental/fastdeploy、abb interactive |
 | usb hotplug | 18 | transport_usb.rs+usb_android.rs usbfs 直连+watcher 实现 | 命名差分 |
 | adb_client server 协议 | 20 | AdbServerTransport+server_cmds/host_command 核心 | 命名差分 |
