@@ -54,7 +54,7 @@ pub fn num_bytes_to_num_blocks(bytes: i64) -> i32 {
     if bytes <= 0 {
         return 0;
     }
-    (((bytes + BLOCK_SIZE - 1) / BLOCK_SIZE)) as i32
+    ((bytes + BLOCK_SIZE - 1) / BLOCK_SIZE) as i32
 }
 
 /// AOSP `RequestCommand` (incremental_server.cpp:118-127) — decoded from the
@@ -347,48 +347,46 @@ impl IncrementalServer {
     /// request follows, consume and return it. Returns Ok(None) when more
     /// data is needed.
     pub fn take_request(&mut self, forward: &mut Vec<u8>) -> std::io::Result<Option<RequestCommand>> {
-        loop {
-            // Look for INCR magic (AOSP: for bcur; bcur + 4 < bsize).
-            let mut magic_at = None;
-            if self.incoming.len() > 4 {
-                for bcur in 0..self.incoming.len() - 4 {
-                    let magic = u32::from_be_bytes([
-                        self.incoming[bcur],
-                        self.incoming[bcur + 1],
-                        self.incoming[bcur + 2],
-                        self.incoming[bcur + 3],
-                    ]);
-                    if magic == INCR_MAGIC {
-                        magic_at = Some(bcur);
-                        break;
-                    }
+        // Look for INCR magic (AOSP: for bcur; bcur + 4 < bsize).
+        let mut magic_at = None;
+        if self.incoming.len() > 4 {
+            for bcur in 0..self.incoming.len() - 4 {
+                let magic = u32::from_be_bytes([
+                    self.incoming[bcur],
+                    self.incoming[bcur + 1],
+                    self.incoming[bcur + 2],
+                    self.incoming[bcur + 3],
+                ]);
+                if magic == INCR_MAGIC {
+                    magic_at = Some(bcur);
+                    break;
                 }
             }
-            match magic_at {
-                Some(bcur) => {
-                    if bcur > 0 {
-                        // Output the rest (pre-magic garbage), then drop it.
-                        forward.extend_from_slice(&self.incoming[..bcur]);
-                        self.incoming.drain(..bcur);
-                    }
-                    // Need magic + full request in buffer.
-                    if self.incoming.len() >= 4 + RequestCommand::WIRE_SIZE {
-                        let payload = self.incoming[4..4 + RequestCommand::WIRE_SIZE].to_vec();
-                        self.incoming.drain(..4 + RequestCommand::WIRE_SIZE);
-                        return Ok(RequestCommand::decode(&payload));
-                    }
-                    return Ok(None);
+        }
+        match magic_at {
+            Some(bcur) => {
+                if bcur > 0 {
+                    // Output the rest (pre-magic garbage), then drop it.
+                    forward.extend_from_slice(&self.incoming[..bcur]);
+                    self.incoming.drain(..bcur);
                 }
-                None => {
-                    // No magic yet; forward all but the last 3 bytes (magic
-                    // could straddle the boundary on the next read).
-                    if self.incoming.len() > 3 {
-                        let keep = self.incoming.len() - 3;
-                        forward.extend_from_slice(&self.incoming[..keep]);
-                        self.incoming.drain(..keep);
-                    }
-                    return Ok(None);
+                // Need magic + full request in buffer.
+                if self.incoming.len() >= 4 + RequestCommand::WIRE_SIZE {
+                    let payload = self.incoming[4..4 + RequestCommand::WIRE_SIZE].to_vec();
+                    self.incoming.drain(..4 + RequestCommand::WIRE_SIZE);
+                    return Ok(RequestCommand::decode(&payload));
                 }
+                Ok(None)
+            }
+            None => {
+                // No magic yet; forward all but the last 3 bytes (magic
+                // could straddle the boundary on the next read).
+                if self.incoming.len() > 3 {
+                    let keep = self.incoming.len() - 3;
+                    forward.extend_from_slice(&self.incoming[..keep]);
+                    self.incoming.drain(..keep);
+                }
+                Ok(None)
             }
         }
     }
