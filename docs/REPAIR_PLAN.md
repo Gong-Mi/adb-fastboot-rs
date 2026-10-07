@@ -55,6 +55,15 @@
 方案：每transport唯一reader、stream分派、ACK背压、明确close/cancel/join；不能只补clone留下双reader争抢。真server连fakeadbd，非1 stream并发/双向/EOF/取消收口。安装统一选中target，USBserial/-d/server地址/networkserial不丢；选中server后不再CNXN。
 反例：设备等待stdin、WRTE/OKAY交错、错reader、同serial换地址、missing/多设备、IP:PORT被冒号截断；常规/增量fallback同一target。
 
+第一切片状态：每连接唯一 I/O owner 的 duplex 路径已落地（新增 `server/duplex.rs`，server 侧重复 CNXN/AUTH 握手并入共享路径），已合入累计候选 `b9c43b1` 并通过五 job CI。独立审查（head `24e45ce`）结论：无阻塞新回归；五项核对通过——握手仍用同一 `default_auth()` 持久 key 与等价的 `persist_adb_pubkey`；服务路径取 transport 所有权、无 `try_clone_box`、`SharedTransport` 在 server 已零引用；删掉的旧函数无存活调用点；USB 服务在 OPEN 前显式 FAIL（读毕请求再 FAIL，避免 RST）。
+
+遗留项（已分线）：
+- 关闭阶段 drain 用 `CLOSE_TIMEOUT=1s` 固定硬上限（`duplex.rs`），与 output 侧 `PROGRESS_TIMEOUT=10s` 竞争，慢消费者（<~1MB/s）可能截断尾部 → 独立分支改为进展式有界。
+- 死代码：`bridge_to_device`、`ensure_usb_auth`、`device_service_to_socket`、`services` 模块整体已无 src 引用 — 属结构卫生，需单独清理切片。
+- 测试缺口：慢消费者/大 payload 无真实进程覆盖；USB 拒绝仅单测；握手 5s 绝对预算（等待用户授权对话框可能判败）未测。
+
+USB dispatcher、全局持久 multiplex、delayed ACK、实体设备与 AOSP 互操作未验。
+
 ## P7 shell/exec输入输出与退出码（依赖P6）
 
 文件：client/{shell.rs,exec_out.rs,protocol.rs}和main_adb.rs。
