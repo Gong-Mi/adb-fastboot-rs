@@ -1,8 +1,10 @@
 # adb-fastboot-rs
 
-100% 纯 Rust 实现的 Android Debug Bridge (ADB) 与 Fastboot 协议库及命令行工具套件。
+使用 Rust 实现的 Android Debug Bridge (ADB) / Fastboot 协议库与命令行工作区。
 
-针对 Termux / Android 原生环境与交叉编译场景设计，零 C/C++ FFI 依赖、零 `libusb` / `abseil` / `protobuf` C 库依赖，天然支持 64K 页大小与 Termux / Android 系统。
+项目包含纯 Rust 协议/usbfs 代码，也包含默认启用的 vendored AOSP pairing_auth 与 BoringSSL C/C++ 实现；可选 rusb 后端依赖 libusb。不能将默认构建称为“100% 纯 Rust、零 C/C++ FFI”。GNU CI、Android/Bionic 本机测试、不同页大小和真实 USB/设备验收是独立证据层。
+
+当前仍是施工与验收候选，不是已完整验证的官方工具替代品，尤其不能仅凭 CI 绿就在主力设备刷写。先读 [施工规矩](AGENTS.md)、[修复方案](docs/REPAIR_PLAN.md) 和 [本地/CI Rust 测试流程](docs/TESTING.md)；各能力的实际完成情况以生产调用链、对应测试和 exact-head PR 证据为准。
 
 ## 📦 Workspace 架构设计
 
