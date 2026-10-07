@@ -114,7 +114,7 @@ struct Cli {
     #[arg(short, long, global = true)]
     serial: Option<String>,
 
-    /// Use the opt-in rusb Fastboot USB backend instead of TCP.
+    /// Force USB serial selection (rejects explicit TCP/UDP targets).
     #[arg(long, global = true)]
     usb: bool,
 
@@ -368,12 +368,80 @@ enum Commands {
     },
 }
 
-fn resolve_target_addr(serial: Option<&str>, default_port: u16) -> String {
-    match serial {
-        Some(s) if s.contains(':') => s.to_string(),
-        Some(s) => format!("{}:{}", s, default_port),
-        None => format!("127.0.0.1:{}", default_port),
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FastbootTarget {
+    Usb(Option<String>),
+    Tcp(String),
+    Udp(String),
+}
+
+impl FastbootTarget {
+    fn label(&self) -> String {
+        match self {
+            Self::Usb(Some(serial)) => serial.clone(),
+            Self::Usb(None) => "USB (unique device required)".into(),
+            Self::Tcp(address) => address.clone(),
+            Self::Udp(address) => format!("udp:{address}"),
+        }
     }
+}
+
+// Freeze target identity once, before opening any device. Explicit -s wins
+// over ANDROID_SERIAL; absent selection never invents a loopback endpoint.
+fn resolve_target(
+    usb: bool,
+    serial: Option<&str>,
+    environment_serial: Option<&str>,
+) -> Result<FastbootTarget, String> {
+    let serial = serial.or(environment_serial.filter(|value| !value.is_empty()));
+    let Some(serial) = serial else { return Ok(FastbootTarget::Usb(None)); };
+    if serial.is_empty() { return Err("empty Fastboot serial is not a target".into()); }
+    if serial.starts_with("usb:") || serial.starts_with('/') {
+        return Err(format!("USB path selectors are not supported; use the exact device serial: {serial}"));
+    }
+    if let Some(address) = serial.strip_prefix("tcp:") {
+        if usb { return Err("--usb conflicts with an explicit TCP target".into()); }
+        return Ok(FastbootTarget::Tcp(normalize_network_address(address, true)?));
+    }
+    if let Some(address) = serial.strip_prefix("udp:") {
+        if usb { return Err("--usb conflicts with an explicit UDP target".into()); }
+        return Ok(FastbootTarget::Udp(normalize_network_address(address, true)?));
+    }
+    if usb { return Ok(FastbootTarget::Usb(Some(serial.into()))); }
+    if serial.contains(':') {
+        // Preserve the existing host:port loopback extension, not arbitrary
+        // strings converted to host:5554. --usb keeps literal serial semantics.
+        return Ok(FastbootTarget::Tcp(normalize_network_address(serial, false)?));
+    }
+    Ok(FastbootTarget::Usb(Some(serial.into())))
+}
+
+fn normalize_network_address(address: &str, allow_default_port: bool) -> Result<String, String> {
+    if address.is_empty() || address.chars().any(char::is_whitespace) {
+        return Err(format!("invalid network address '{address}'"));
+    }
+    let (host, port) = if let Some(bracketed) = address.strip_prefix('[') {
+        let (host, suffix) = bracketed.split_once(']')
+            .ok_or_else(|| format!("invalid bracketed network address '{address}'"))?;
+        if host.parse::<std::net::Ipv6Addr>().is_err() { return Err(format!("invalid IPv6 target '{address}'")); }
+        let port = if suffix.is_empty() && allow_default_port { "5554" } else {
+            suffix.strip_prefix(':').ok_or_else(|| format!("invalid network address '{address}'"))?
+        };
+        (format!("[{host}]"), port)
+    } else if allow_default_port && address.parse::<std::net::Ipv6Addr>().is_ok() {
+        (format!("[{address}]"), "5554")
+    } else if let Some((host, port)) = address.rsplit_once(':') {
+        if host.contains(':') { return Err(format!("invalid network address '{address}'")); }
+        (host.to_string(), port)
+    } else if allow_default_port {
+        (address.to_string(), "5554")
+    } else {
+        return Err(format!("network target needs host:port: '{address}'"));
+    };
+    if host.is_empty() || port.parse::<u16>().is_err() {
+        return Err(format!("invalid network address '{address}'"));
+    }
+    Ok(format!("{host}:{port}"))
 }
 
 /// Parse the network serial form accepted by AOSP `fastboot connect`.
@@ -392,24 +460,7 @@ fn parse_network_target(serial: &str) -> Result<(&str, String), String> {
         ));
     };
 
-    if address.is_empty() {
-        return Err(format!("invalid network address '{address}'"));
-    }
-
-    let (host, port) = if let Some(bracketed) = address.strip_prefix('[') {
-        bracketed
-            .split_once("]:")
-            .ok_or_else(|| format!("invalid network address '{address}'"))?
-    } else {
-        address
-            .rsplit_once(':')
-            .ok_or_else(|| format!("invalid network address '{address}'"))?
-    };
-    if host.is_empty() || port.parse::<u16>().is_err() {
-        return Err(format!("invalid network address '{address}'"));
-    }
-
-    Ok((protocol, address.to_string()))
+    Ok((protocol, normalize_network_address(address, true)?))
 }
 
 /// AOSP ConnectedDevicesStorage uses `$HOME/.fastboot/devices` and stores a
@@ -547,35 +598,31 @@ fn require_terminal_okay(
 }
 
 fn open_transport(
-    usb: bool,
-    addr: &str,
+    target: &FastbootTarget,
     timeout: Duration,
 ) -> Result<FastbootConnection, Box<dyn std::error::Error>> {
-    if usb {
-        #[cfg(feature = "usb")]
-        {
-            return fastboot_protocol::usb_android::UsbfsFastbootDevice::open_transport()
-                .map(FastbootConnection::Usb)
-                .map_err(|error| {
-                    format!("failed to open Fastboot USB transport: {error}").into()
-                });
+    match target {
+        FastbootTarget::Usb(serial) => {
+            #[cfg(feature = "usb")]
+            {
+                let device = match serial {
+                    Some(serial) => UsbfsFastbootDevice::open_by_serial(serial),
+                    None => UsbfsFastbootDevice::open_first(),
+                }.map_err(|error| format!("failed to open Fastboot USB target {}: {error}", target.label()))?;
+                fastboot_protocol::FastbootUsbTransport::new(device)
+                    .map(FastbootConnection::Usb).map_err(|error| error.into())
+            }
+            #[cfg(not(feature = "usb"))]
+            {
+                let _ = (serial, timeout);
+                Err("USB support is not enabled; rebuild with `--features usb`".into())
+            }
         }
-        #[cfg(not(feature = "usb"))]
-        {
-            let _ = (addr, timeout);
-            return Err("USB support is not enabled; rebuild with `--features usb`".into());
-        }
+        FastbootTarget::Tcp(address) => FastbootTcpTransport::connect_timeout(address, timeout)
+            .map(FastbootConnection::Tcp).map_err(|error| error.into()),
+        FastbootTarget::Udp(address) => fastboot_protocol::FastbootUdpTransport::connect_timeout(address, timeout)
+            .map(FastbootConnection::Udp).map_err(|error| error.into()),
     }
-
-    if let Some(udp_addr) = addr.strip_prefix("udp:") {
-        return fastboot_protocol::FastbootUdpTransport::connect_timeout(udp_addr, timeout)
-            .map(FastbootConnection::Udp)
-            .map_err(|error| error.into());
-    }
-
-    FastbootTcpTransport::connect_timeout(addr, timeout)
-        .map(FastbootConnection::Tcp)
-        .map_err(|error| error.into())
 }
 
 /// 读取文件全部字节，出错时 exit(1)。
@@ -990,11 +1037,10 @@ fn wait_for_disconnect(transport: FastbootConnection, timeout: Duration) -> bool
 }
 
 fn run_reboot(
-    use_usb: bool,
-    addr: &str,
+    connection_target: &FastbootTarget,
     target: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut transport = open_transport(use_usb, addr, Duration::from_secs(3))?;
+    let mut transport = open_transport(connection_target, Duration::from_secs(3))?;
     let cmd = fastboot_protocol::reboot(target);
     transport.send_cmd(&cmd)?;
 
@@ -1816,8 +1862,16 @@ fn flash_image_file<T: FastbootTransport>(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let addr = resolve_target_addr(cli.serial.as_deref(), 5554);
-    let use_usb = cli.usb;
+    let environment_serial = std::env::var("ANDROID_SERIAL").ok();
+    let connection_target = match &cli.command {
+        // connect has its own explicit positional target; disconnect is a
+        // local storage operation and must not validate/open an unrelated device.
+        Commands::Connect { target } => resolve_target(cli.usb, Some(target), None)?,
+        Commands::Disconnect { .. } => FastbootTarget::Usb(None),
+        _ => resolve_target(cli.usb, cli.serial.as_deref(), environment_serial.as_deref())?,
+    };
+    let addr = connection_target.label();
+    let use_usb = matches!(connection_target, FastbootTarget::Usb(_));
     let slot_selection = fastboot_protocol::SlotSelection::parse(cli.slot.as_deref())?;
 
     // AOSP-mirror global options, constructed once and threaded through.
@@ -1848,13 +1902,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Connect { target } => {
-            let (protocol, address) = parse_network_target(&target)?;
-            let transport_address = if protocol == "udp" {
-                format!("udp:{address}")
-            } else {
-                address
-            };
-            open_transport(false, &transport_address, Duration::from_secs(3))?;
+            parse_network_target(&target)?;
+            open_transport(&connection_target, Duration::from_secs(3))?;
             store_connected_device(&connected_devices_path()?, &target)?;
             println!("connected to {target}");
         }
@@ -1900,7 +1949,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             } else {
-                match open_transport(false, &addr, Duration::from_secs(2)) {
+                match open_transport(&connection_target, Duration::from_secs(2)) {
                     Ok(mut transport) => {
                         let mut details = String::new();
                         if long {
@@ -1928,7 +1977,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Getvar { variable } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -1960,7 +2009,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if slot.is_empty() {
                 return Err("set_active requires a non-empty SLOT".into());
             }
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -1986,7 +2035,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2010,7 +2059,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2024,7 +2073,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Erase { partition } => {
             let wire_partition = slot_selection.partition_name(&partition)?;
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2037,12 +2086,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             require_terminal_okay(&resp)?;
             println!("[fastboot-rs] Erase response: {:?}", resp);
         }
-        Commands::Reboot { target } => run_reboot(use_usb, &addr, target.as_deref())?,
-        Commands::RebootBootloader => run_reboot(use_usb, &addr, Some("bootloader"))?,
-        Commands::RebootRecovery => run_reboot(use_usb, &addr, Some("recovery"))?,
-        Commands::RebootFastboot => run_reboot(use_usb, &addr, Some("fastboot"))?,
+        Commands::Reboot { target } => run_reboot(&connection_target, target.as_deref())?,
+        Commands::RebootBootloader => run_reboot(&connection_target, Some("bootloader"))?,
+        Commands::RebootRecovery => run_reboot(&connection_target, Some("recovery"))?,
+        Commands::RebootFastboot => run_reboot(&connection_target, Some("fastboot"))?,
         Commands::Oem { command } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2055,7 +2104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[fastboot-rs] OEM response: {:?}", resp);
         }
         Commands::CreateLogicalPartition { partition, size } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2069,7 +2118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[fastboot-rs] Create logical partition response: {:?}", resp);
         }
         Commands::DeleteLogicalPartition { partition } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2083,7 +2132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[fastboot-rs] Delete logical partition response: {:?}", resp);
         }
         Commands::ResizeLogicalPartition { partition, size } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2097,7 +2146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[fastboot-rs] Resize logical partition response: {:?}", resp);
         }
         Commands::Boot { kernel, ramdisk, second } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("[fastboot-rs] 错误: {}", e);
@@ -2178,7 +2227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             second,
         } => {
             let wire_partition = slot_selection.partition_name(&partition)?;
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("[fastboot-rs] 错误: {}", e);
@@ -2257,7 +2306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Fetch { partition, out_file, offset, size } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2278,7 +2327,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Commands::Continue => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2309,7 +2358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .into());
             }
-            let mut transport = open_transport(use_usb, &addr, Duration::from_secs(3))?;
+            let mut transport = open_transport(&connection_target, Duration::from_secs(3))?;
             transport.send_cmd(&fastboot_protocol::download(256))?;
             match transport.recv_response()? {
                 fastboot_protocol::FastbootResponse::Data(size) if size == 256 => {}
@@ -2333,7 +2382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::SnapshotUpdate { action } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2352,7 +2401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Format { partition, partition_type } => {
             let wire_partition = slot_selection.partition_name(&partition)?;
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2379,7 +2428,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::GetStaged { out_file } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2472,7 +2521,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("[fastboot-rs] 错误: {}", e);
@@ -2577,7 +2626,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Shutdown => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2617,7 +2666,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Flashing { action } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -2641,7 +2690,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Update { zip_file } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("[fastboot-rs] 错误: {e}");
@@ -2652,7 +2701,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             do_update(&mut transport, &zip_file, &gopts)?;
         }
         Commands::Gsi { action } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+            let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -2677,6 +2726,49 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
+    fn target_explicit_usb_serial_survives_cli_resolution() {
+        assert_eq!(resolve_target(true, Some("B"), None).unwrap(), FastbootTarget::Usb(Some("B".into())));
+        assert_eq!(resolve_target(false, Some("B"), None).unwrap(), FastbootTarget::Usb(Some("B".into())));
+    }
+
+    #[test]
+    fn target_no_serial_is_usb_not_implicit_loopback() {
+        assert_eq!(resolve_target(false, None, None).unwrap(), FastbootTarget::Usb(None));
+    }
+
+    #[test]
+    fn target_environment_serial_and_cli_precedence() {
+        assert_eq!(resolve_target(false, None, Some("B")).unwrap(), FastbootTarget::Usb(Some("B".into())));
+        assert_eq!(resolve_target(false, Some("A"), Some("B")).unwrap(), FastbootTarget::Usb(Some("A".into())));
+    }
+
+    #[test]
+    fn target_standard_network_prefixes_and_legacy_endpoint() {
+        assert_eq!(resolve_target(false, Some("tcp:127.0.0.1:1234"), None).unwrap(), FastbootTarget::Tcp("127.0.0.1:1234".into()));
+        assert_eq!(resolve_target(false, Some("udp:127.0.0.1:1234"), None).unwrap(), FastbootTarget::Udp("127.0.0.1:1234".into()));
+        assert_eq!(resolve_target(false, Some("127.0.0.1:1234"), None).unwrap(), FastbootTarget::Tcp("127.0.0.1:1234".into()));
+    }
+
+    #[test]
+    fn target_network_defaults_ipv6_and_literal_usb_serial_are_preserved() {
+        for (source, expected) in [("tcp:localhost", "localhost:5554"), ("tcp:[::1]", "[::1]:5554"), ("tcp:[::1]:1234", "[::1]:1234"), ("tcp:::1", "[::1]:5554")] {
+            assert_eq!(resolve_target(false, Some(source), None).unwrap(), FastbootTarget::Tcp(expected.into()));
+        }
+        assert_eq!(resolve_target(true, Some("serial:literal"), None).unwrap(), FastbootTarget::Usb(Some("serial:literal".into())));
+        assert_eq!(resolve_target(false, None, Some("")).unwrap(), FastbootTarget::Usb(None));
+    }
+
+    #[test]
+    fn target_conflicts_and_unsupported_usb_paths_fail_before_open() {
+        for serial in ["tcp:127.0.0.1:1234", "udp:127.0.0.1:1234"] {
+            assert!(resolve_target(true, Some(serial), None).is_err());
+        }
+        for serial in ["", "usb:1-2", "/dev/bus/usb/001/002", "tcp:", "tcp:host:bad"] {
+            assert!(resolve_target(false, Some(serial), None).is_err(), "{serial}");
+        }
+    }
+
+    #[test]
     fn help_exposes_global_usb_opt_in() {
         let help = Cli::command().render_help().to_string();
         assert!(help.contains("--usb"));
@@ -2687,7 +2779,7 @@ mod tests {
     #[test]
     #[cfg(not(feature = "usb"))]
     fn usb_mode_reports_feature_requirement_without_touching_tcp() {
-        let error = match open_transport(true, "127.0.0.1:5554", Duration::from_secs(1)) {
+        let error = match open_transport(&FastbootTarget::Usb(None), Duration::from_secs(1)) {
             Ok(_) => panic!("USB mode must fail clearly when the optional feature is disabled"),
             Err(error) => error.to_string(),
         };
