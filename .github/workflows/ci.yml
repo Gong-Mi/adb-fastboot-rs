@@ -10,24 +10,21 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        features: ["", "--all-features", "--no-default-features"]
+        features: [default, all, none]
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
-      - name: Install system deps (pkg-config probes for usb/tls native deps)
+      - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build pkg-config \
-            libusb-1.0-0-dev libudev-dev googletest
-
+          sudo apt-get install -y cmake ninja-build pkg-config libusb-1.0-0-dev libudev-dev googletest
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -37,26 +34,62 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}-${{ matrix.features }}
           restore-keys: ${{ runner.os }}-cargo-
-
       - name: Verify CI failure propagation
-        run: python3 .github/scripts/test_ci_gate.py
-
-      - name: Check (default ${{ matrix.features }})
-        run: cargo check --workspace ${{ matrix.features }}
-
-      - name: Test (default ${{ matrix.features }})
-        run: cargo test --workspace ${{ matrix.features }}
-
+        run: python3 -B .github/scripts/test_ci_gate.py
+      - name: Verify shared Rust execution gate
+        run: python3 -B scripts/test_rust_test_runner.py
+      - name: Check and test exact source (${{ matrix.features }})
+        run: >-
+          python3 scripts/run_rust_tests.py --scope matrix
+          --features ${{ matrix.features }} --online --jobs 2
+          --target-dir "$PWD/target"
+          --output-dir "$RUNNER_TEMP/rust-${{ matrix.features }}"
       - name: Run AOSP integration test_adb.py
-        if: matrix.features == ''
+        if: matrix.features == 'default'
         run: |
-          cargo build --bin adb-rs
+          cargo build --locked --bin adb-rs
           mkdir -p target/testbin
           cp target/debug/adb-rs target/testbin/adb
           PATH="$PWD/target/testbin:$PATH" python3 tests/test_adb.py
+      - name: Preserve raw Rust evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-evidence-${{ matrix.features }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rust-${{ matrix.features }}/
+          if-no-files-found: warn
+          retention-days: 14
+
+  sparse-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install independent AOSP-derived sparse tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y android-sdk-libsparse-utils
+          command -v simg2img
+          dpkg-query -W android-sdk-libsparse-utils
+      - name: Execute external oracle (not an ignored green)
+        run: >-
+          python3 scripts/run_rust_tests.py --scope oracle
+          --package fastboot-protocol --lib --filter test_split_simg2img_oracle
+          --online --jobs 2 --target-dir "$PWD/target"
+          --output-dir "$RUNNER_TEMP/sparse-oracle"
+      - name: Preserve oracle evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sparse-oracle-evidence-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sparse-oracle/
+          if-no-files-found: warn
+          retention-days: 14
 
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,4 +101,4 @@ jobs:
           sudo apt-get install -y cmake ninja-build pkg-config libusb-1.0-0-dev libudev-dev
       # Keep warnings advisory, but propagate compiler/deny-level failures.
       - name: Clippy
-        run: cargo clippy --workspace --all-features
+        run: cargo clippy --workspace --all-features --locked
