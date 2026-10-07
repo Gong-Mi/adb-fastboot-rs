@@ -455,7 +455,13 @@ impl Write for AdbTlsTransport {
 }
 
 #[cfg(feature = "tls")]
-impl Transport for AdbTlsTransport {}
+impl Transport for AdbTlsTransport {
+    // Socket controls only; TLS must not expose a raw fd for plaintext handover
+    // or allow competing transport clones.
+    fn inner_tcp_mut(&mut self) -> Option<&mut TcpStream> {
+        self.stream.sock.inner_tcp_mut()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SharedTransport — Arc<Mutex<Box<dyn Transport>>> wrapper
