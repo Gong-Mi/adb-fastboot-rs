@@ -416,6 +416,61 @@ fn update_independent_standalone_and_footer_vectors_preserve_all_other_bytes() {
     }
 }
 #[test]
+fn flash_split_path_rejects_corrupt_vbmeta_before_download() {
+    let files = Files::new("vbmeta-bad-split");
+    let mut bytes = standalone();
+    bytes[12..20].copy_from_slice(&u64::MAX.to_be_bytes());
+    bytes.resize(65537, 0); // exceeds the peer's 65536-byte maximum
+    let path = files.write("bad-large-vbmeta.img", &bytes);
+    let (output, transcript) = run(
+        &["--disable-verity", "flash", "vbmeta", &path],
+        Script::default(),
+    );
+    assert_no_write(&output, &transcript);
+}
+
+#[test]
+fn update_accepts_block_ranges_at_the_boundary_and_footer_version_compatibility() {
+    let files = Files::new("vbmeta-valid-ranges");
+    let mut bytes = standalone();
+    bytes[12..20].copy_from_slice(&64u64.to_be_bytes());
+    bytes[20..28].copy_from_slice(&64u64.to_be_bytes());
+    // Nonempty auth/aux blocks with each relative range ending exactly at 64.
+    for field in [32, 48, 64, 80, 96] {
+        bytes[field..field + 8].copy_from_slice(&48u64.to_be_bytes());
+        bytes[field + 8..field + 16].copy_from_slice(&16u64.to_be_bytes());
+    }
+    bytes.extend([0x35; 64]);
+    bytes.extend([0x79; 64]);
+    let path = update_zip(&files, "valid-ranges.zip", &bytes);
+    let (output, transcript) = run(
+        &[
+            "--disable-verity",
+            "--disable-verification",
+            "update",
+            &path,
+        ],
+        Script::default(),
+    );
+    assert!(output.status.success(), "{output:?}; {transcript:?}");
+    bytes[123] |= 3;
+    assert_eq!(transcript.payloads.last(), Some(&bytes));
+    // Match avb_footer_validate_and_byteswap: reject major > 1, not a
+    // future minor or legacy major 0. Do not silently narrow valid input.
+    for major in [0u32, 1] {
+        let mut bytes = footer_image();
+        let start = bytes.len() - 64;
+        bytes[start + 4..start + 8].copy_from_slice(&major.to_be_bytes());
+        bytes[start + 8..start + 12].copy_from_slice(&u32::MAX.to_be_bytes());
+        let path = update_zip(&files, &format!("footer-version-{major}.zip"), &bytes);
+        let (output, transcript) = run(&["--disable-verity", "update", &path], Script::default());
+        assert!(output.status.success(), "{output:?}; {transcript:?}");
+        bytes[315] |= 1;
+        assert_eq!(transcript.payloads.last(), Some(&bytes));
+    }
+}
+
+#[test]
 fn update_preserves_unrecognized_data_and_no_flag_behavior() {
     let files = Files::new("vbmeta-noop");
     // Existing Rust behavior: no AVB magic (including short data) stays byte-exact.
