@@ -1299,7 +1299,7 @@ mod update_zip_identity {
             }
             let locator_at = eocd_at - 20;
             // Bounded search handles ZIP64 SFX with relative locator offsets and
-            // variable-sized extensible sectors. No scan through image payloads.
+            // variable-sized extensible sectors; never an unbounded payload scan.
             let search_at = locator_at.saturating_sub(56 + 1024 * 1024);
             let search = read_at(reader, search_at, (locator_at - search_at) as usize)?;
             let mut candidates = (0..search.len().saturating_sub(55)).filter(|&p| {
@@ -1317,6 +1317,20 @@ mod update_zip_identity {
                 return Err(invalid("ambiguous ZIP64 end record"));
             }
             let end64 = &search[p..p + 56];
+            // APPNOTE 4.3.14.3-4: extensible-sector blocks have a two-byte
+            // header ID and four-byte data size, not ordinary extra-field TLVs.
+            let mut extension = p + 56;
+            while extension < search.len() {
+                if search.len() - extension < 6 {
+                    return Err(invalid("truncated ZIP64 extensible-sector header"));
+                }
+                let length = u32_at(&search, extension + 2) as u64;
+                let end = add((extension + 6) as u64, length)?;
+                if end > search.len() as u64 {
+                    return Err(invalid("ZIP64 extensible-sector exceeds record boundary"));
+                }
+                extension = end as usize;
+            }
             let end64_at = search_at + p as u64;
             if u32_at(end64, 16) != 0
                 || u32_at(end64, 20) != 0

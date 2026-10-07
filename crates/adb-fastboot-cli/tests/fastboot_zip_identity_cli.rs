@@ -31,6 +31,8 @@ struct Entry {
     data: Vec<u8>,
     extra: Vec<u8>,
     flags: u16,
+    method: u16,
+    packed: Vec<u8>,
 }
 impl Entry {
     fn new(name: &str, data: &[u8]) -> Self {
@@ -39,7 +41,22 @@ impl Entry {
             data: data.to_vec(),
             extra: vec![],
             flags: 0,
+            method: 0,
+            packed: data.to_vec(),
         }
+    }
+    fn deflated(mut self, descriptor: bool) -> Self {
+        // RFC 1951 stored DEFLATE block, constructed without a compression crate.
+        self.method = 8;
+        self.packed = vec![1]; // final block, BTYPE=00, zero padding
+        let length = self.data.len() as u16;
+        u16le(&mut self.packed, length);
+        u16le(&mut self.packed, !length);
+        self.packed.extend(&self.data);
+        if descriptor {
+            self.flags |= 1 << 3;
+        }
+        self
     }
 }
 fn entries() -> Vec<Entry> {
@@ -64,17 +81,38 @@ fn zip(entries: &[Entry], zip64: bool, prefix: &[u8], comment: &[u8]) -> Fixture
         u32le(&mut bytes, 0x04034b50);
         u16le(&mut bytes, 20);
         u16le(&mut bytes, entry.flags);
-        u16le(&mut bytes, 0);
+        u16le(&mut bytes, entry.method);
         u16le(&mut bytes, 0);
         u16le(&mut bytes, 0x21);
-        u32le(&mut bytes, crc32(&entry.data));
-        u32le(&mut bytes, entry.data.len() as u32);
-        u32le(&mut bytes, entry.data.len() as u32);
+        let descriptor = entry.flags & (1 << 3) != 0;
+        u32le(&mut bytes, if descriptor { 0 } else { crc32(&entry.data) });
+        u32le(
+            &mut bytes,
+            if descriptor {
+                0
+            } else {
+                entry.packed.len() as u32
+            },
+        );
+        u32le(
+            &mut bytes,
+            if descriptor {
+                0
+            } else {
+                entry.data.len() as u32
+            },
+        );
         u16le(&mut bytes, entry.name.len() as u16);
         u16le(&mut bytes, entry.extra.len() as u16);
         bytes.extend(&entry.name);
         bytes.extend(&entry.extra);
-        bytes.extend(&entry.data);
+        bytes.extend(&entry.packed);
+        if descriptor {
+            u32le(&mut bytes, 0x08074b50);
+            u32le(&mut bytes, crc32(&entry.data));
+            u32le(&mut bytes, entry.packed.len() as u32);
+            u32le(&mut bytes, entry.data.len() as u32);
+        }
     }
     let cd = bytes.len();
     let mut headers = Vec::new();
@@ -85,7 +123,7 @@ fn zip(entries: &[Entry], zip64: bool, prefix: &[u8], comment: &[u8]) -> Fixture
             u16le(&mut extra, 1);
             u16le(&mut extra, 24);
             u64le(&mut extra, entry.data.len() as u64);
-            u64le(&mut extra, entry.data.len() as u64);
+            u64le(&mut extra, entry.packed.len() as u64);
             u64le(&mut extra, offset);
         }
         extra.extend(&entry.extra);
@@ -93,7 +131,7 @@ fn zip(entries: &[Entry], zip64: bool, prefix: &[u8], comment: &[u8]) -> Fixture
         u16le(&mut bytes, if zip64 { 45 } else { 20 });
         u16le(&mut bytes, if zip64 { 45 } else { 20 });
         u16le(&mut bytes, entry.flags);
-        u16le(&mut bytes, 0);
+        u16le(&mut bytes, entry.method);
         u16le(&mut bytes, 0);
         u16le(&mut bytes, 0x21);
         u32le(&mut bytes, crc32(&entry.data));
@@ -102,7 +140,14 @@ fn zip(entries: &[Entry], zip64: bool, prefix: &[u8], comment: &[u8]) -> Fixture
         } else {
             entry.data.len() as u32
         };
-        u32le(&mut bytes, size);
+        u32le(
+            &mut bytes,
+            if zip64 {
+                u32::MAX
+            } else {
+                entry.packed.len() as u32
+            },
+        );
         u32le(&mut bytes, size);
         u16le(&mut bytes, entry.name.len() as u16);
         u16le(&mut bytes, extra.len() as u16);
@@ -313,6 +358,70 @@ fn distinct_raw_names_with_same_unicode_effective_identity_are_rejected() {
     );
 }
 #[test]
+fn cross_encoding_identity_and_non_image_duplicates_are_rejected() {
+    let mut encoded = entries();
+    let mut cp437 = Entry::new("placeholder", b"one");
+    cp437.name = b"\x82.bin".to_vec();
+    let mut utf8 = Entry::new("é.bin", b"two");
+    utf8.flags = 1 << 11;
+    encoded.extend([cp437, utf8]);
+    reject(
+        "cross-encoding",
+        zip(&encoded, false, b"", b""),
+        "duplicate effective update ZIP entry",
+    );
+    for name in ["android-info.txt", "boot.img", "unselected.txt"] {
+        let mut duplicate = entries();
+        duplicate.extend([Entry::new(name, b"one"), Entry::new(name, b"two")]);
+        reject(
+            &format!("duplicate-{name}"),
+            zip(&duplicate, false, b"", b""),
+            "duplicate effective update ZIP entry",
+        );
+    }
+}
+#[test]
+fn valid_zip64_extensible_sector_and_maximum_comment_are_accepted() {
+    let mut f = zip(
+        &entries(),
+        true,
+        b"MZ prefix",
+        &vec![b'x'; u16::MAX as usize],
+    );
+    let start = f.zip64.unwrap();
+    let sector = [0x99, 0, 3, 0, 0, 0, 1, 2, 3];
+    f.bytes.splice(start + 56..start + 56, sector);
+    f.bytes[start + 4..start + 12].copy_from_slice(&(44u64 + sector.len() as u64).to_le_bytes());
+    let (output, transcript) = run("zip64-extensible", f);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(transcript.payloads, [b"BOOT".to_vec(), b"FIRST".to_vec()]);
+}
+#[test]
+fn valid_deflate_and_data_descriptor_still_use_library_decompression() {
+    for zip64 in [false, true] {
+        for descriptor in [false, true] {
+            let es = entries()
+                .into_iter()
+                .map(|e| e.deflated(descriptor))
+                .collect::<Vec<_>>();
+            let (output, transcript) = run(
+                &format!("deflate-{zip64}-{descriptor}"),
+                zip(&es, zip64, b"MZ prefix", b""),
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(transcript.payloads, [b"BOOT".to_vec(), b"FIRST".to_vec()]);
+        }
+    }
+}
+#[test]
 fn valid_standard_zip64_and_self_extracting_prefix_preserve_payloads() {
     for zip64 in [false, true] {
         for prefix in [b"".as_slice(), b"MZ self-extracting prefix".as_slice()] {
@@ -351,6 +460,11 @@ fn corrupt_cd_boundaries_counts_and_extra_fields_fail_closed() {
         "zip64-count",
         "zip64-locator",
         "zip64-contradiction",
+        "zip64-record-size",
+        "zip64-extension-tlv",
+        "count-high",
+        "local-name",
+        "invalid-utf8",
     ] {
         let is64 = case.starts_with("zip64");
         let mut f = zip(&entries(), is64, b"", b"");
@@ -395,6 +509,34 @@ fn corrupt_cd_boundaries_counts_and_extra_fields_fail_closed() {
             }
             "zip64-contradiction" => {
                 f.bytes[f.eocd + 10..f.eocd + 12].copy_from_slice(&2u16.to_le_bytes());
+            }
+            "zip64-record-size" => {
+                let h = f.zip64.unwrap();
+                f.bytes[h + 4..h + 12].copy_from_slice(&45u64.to_le_bytes());
+            }
+            "zip64-extension-tlv" => {
+                let h = f.zip64.unwrap();
+                // APPNOTE extensible-sector TLV claims three bytes, contains one.
+                f.bytes.splice(h + 56..h + 56, [0x99, 0, 3, 0, 0, 0, 1]);
+                f.bytes[h + 4..h + 12].copy_from_slice(&51u64.to_le_bytes());
+            }
+            "count-high" => {
+                f.bytes[f.eocd + 8..f.eocd + 12].copy_from_slice(&[4, 0, 4, 0]);
+            }
+            "local-name" => {
+                let h = f.headers[2];
+                let local =
+                    u32::from_le_bytes(f.bytes[h + 42..h + 46].try_into().unwrap()) as usize;
+                f.bytes[local + 30] = b'X';
+            }
+            "invalid-utf8" => {
+                let h = f.headers[2];
+                let local =
+                    u32::from_le_bytes(f.bytes[h + 42..h + 46].try_into().unwrap()) as usize;
+                f.bytes[h + 8..h + 10].copy_from_slice(&(1u16 << 11).to_le_bytes());
+                f.bytes[local + 6..local + 8].copy_from_slice(&(1u16 << 11).to_le_bytes());
+                f.bytes[h + 46] = 0xff;
+                f.bytes[local + 30] = 0xff;
             }
             _ => unreachable!(),
         }
