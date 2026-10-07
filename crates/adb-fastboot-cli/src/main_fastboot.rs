@@ -1226,6 +1226,323 @@ const AOSP_IMAGES: &[(&str, &str, bool)] = &[
     ("cache",          "cache.img",          true),
 ];
 
+/// Raw metadata only, not a ZIP decompressor. APPNOTE 4.3.12, 4.3.14-16.
+/// zip 2.4.2 read.rs SharedBuilder::build overwrites equal effective names;
+/// therefore file_names()/by_index() cannot prove uniqueness. Count every raw
+/// CD record first, then require the decoded library map to retain that count.
+mod update_zip_identity {
+    use std::io::{Read, Seek, SeekFrom};
+
+    #[derive(Debug)]
+    pub(super) struct Directory {
+        pub(super) entries: u64,
+        pub(super) start: u64,
+        pub(super) offset: u64,
+    }
+    fn invalid(message: &str) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+    }
+    fn u16_at(bytes: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap())
+    }
+    fn u32_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+    fn u64_at(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+    fn read_at<R: Read + Seek>(reader: &mut R, at: u64, length: usize) -> std::io::Result<Vec<u8>> {
+        reader.seek(SeekFrom::Start(at))?;
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+    fn add(a: u64, b: u64) -> std::io::Result<u64> {
+        a.checked_add(b)
+            .ok_or_else(|| invalid("metadata offset overflow"))
+    }
+    fn sub(a: u64, b: u64) -> std::io::Result<u64> {
+        a.checked_sub(b)
+            .ok_or_else(|| invalid("invalid metadata boundary/offset"))
+    }
+    // Also reject malformed TLVs which zip 2.4.2 can silently ignore on Io errors.
+    fn extra_fields(extra: &[u8]) -> std::io::Result<Option<&[u8]>> {
+        let mut at = 0;
+        let mut zip64 = None;
+        let mut unicode = false;
+        while at < extra.len() {
+            if extra.len() - at < 4 {
+                return Err(invalid("truncated extra-field header"));
+            }
+            let tag = u16_at(extra, at);
+            let end = at + 4 + u16_at(extra, at + 2) as usize;
+            if end > extra.len() {
+                return Err(invalid("extra-field exceeds entry boundary"));
+            }
+            if tag == 1 {
+                if zip64.is_some() {
+                    return Err(invalid("ambiguous ZIP64 extra field"));
+                }
+                zip64 = Some(&extra[at + 4..end]);
+            } else if tag == 0x7075 {
+                if unicode || end - at < 9 {
+                    return Err(invalid("ambiguous/truncated Unicode Path field"));
+                }
+                unicode = true;
+            }
+            at = end;
+        }
+        Ok(zip64)
+    }
+    fn zip64_value(extra: Option<&[u8]>, at: &mut usize, width: usize) -> std::io::Result<u64> {
+        let extra = extra.ok_or_else(|| invalid("missing ZIP64 entry metadata"))?;
+        if extra.len().saturating_sub(*at) < width {
+            return Err(invalid("truncated ZIP64 entry metadata"));
+        }
+        let value = if width == 8 {
+            u64_at(extra, *at)
+        } else {
+            u32_at(extra, *at) as u64
+        };
+        *at += width;
+        Ok(value)
+    }
+
+    /// Supported update containers: single-disk ZIP/ZIP64 with a plain central
+    /// directory ending immediately at the footer; comments and SFX prefixes.
+    /// Fail closed on trailing junk, ambiguous EOCD, split/encrypted directories,
+    /// digital-signature/archive-extra records, >100000 entries/>64MiB CD, or
+    /// >1MiB ZIP64 extensible sector. These are explicit update safety limits.
+    pub(super) fn scan<R: Read + Seek>(reader: &mut R) -> std::io::Result<Directory> {
+        let file_len = reader.seek(SeekFrom::End(0))?;
+        let tail_start = file_len.saturating_sub(22 + u16::MAX as u64);
+        let tail = read_at(reader, tail_start, (file_len - tail_start) as usize)?;
+        let mut ends = (0..tail.len().saturating_sub(21)).filter(|&at| {
+            u32_at(&tail, at) == 0x06054b50
+                && at + 22 + u16_at(&tail, at + 20) as usize == tail.len()
+        });
+        let at = ends
+            .next()
+            .ok_or_else(|| invalid("missing terminal EOCD (trailing/truncated data)"))?;
+        if ends.next().is_some() {
+            return Err(invalid("ambiguous terminal EOCD"));
+        }
+        let eocd_at = tail_start + at as u64;
+        let eocd = &tail[at..at + 22];
+        if u16_at(eocd, 4) != 0 || u16_at(eocd, 6) != 0 {
+            return Err(invalid("multi-disk ZIP is unsupported"));
+        }
+        let count_disk = u16_at(eocd, 8);
+        let count = u16_at(eocd, 10);
+        let size32 = u32_at(eocd, 12);
+        let offset32 = u32_at(eocd, 16);
+        let locator = if eocd_at >= 20 {
+            read_at(reader, eocd_at - 20, 20)?
+        } else {
+            vec![]
+        };
+        let has64 = locator.len() == 20 && u32_at(&locator, 0) == 0x07064b50;
+        let needs64 = count_disk == u16::MAX
+            || count == u16::MAX
+            || size32 == u32::MAX
+            || offset32 == u32::MAX;
+        if needs64 && !has64 {
+            return Err(invalid("missing ZIP64 locator"));
+        }
+        let (entries, size, relative, footer_at, offset) = if has64 {
+            if u32_at(&locator, 4) != 0 || u32_at(&locator, 16) != 1 {
+                return Err(invalid("invalid ZIP64 locator disk metadata"));
+            }
+            let locator_at = eocd_at - 20;
+            // Bounded search handles ZIP64 SFX with relative locator offsets and
+            // variable-sized extensible sectors; never an unbounded payload scan.
+            let search_at = locator_at.saturating_sub(56 + 1024 * 1024);
+            let search = read_at(reader, search_at, (locator_at - search_at) as usize)?;
+            let mut candidates = (0..search.len().saturating_sub(55)).filter(|&p| {
+                u32_at(&search, p) == 0x06064b50
+                    && u64_at(&search, p + 4) >= 44
+                    && (p as u64)
+                        .checked_add(12)
+                        .and_then(|n| n.checked_add(u64_at(&search, p + 4)))
+                        == Some(search.len() as u64)
+            });
+            let p = candidates
+                .next()
+                .ok_or_else(|| invalid("invalid/oversized ZIP64 end record"))?;
+            if candidates.next().is_some() {
+                return Err(invalid("ambiguous ZIP64 end record"));
+            }
+            let end64 = &search[p..p + 56];
+            // APPNOTE 4.3.14.3-4: extensible-sector blocks have a two-byte
+            // header ID and four-byte data size, not ordinary extra-field TLVs.
+            let mut extension = p + 56;
+            while extension < search.len() {
+                if search.len() - extension < 6 {
+                    return Err(invalid("truncated ZIP64 extensible-sector header"));
+                }
+                let length = u32_at(&search, extension + 2) as u64;
+                let end = add((extension + 6) as u64, length)?;
+                if end > search.len() as u64 {
+                    return Err(invalid("ZIP64 extensible-sector exceeds record boundary"));
+                }
+                extension = end as usize;
+            }
+            let end64_at = search_at + p as u64;
+            if u32_at(end64, 16) != 0
+                || u32_at(end64, 20) != 0
+                || u64_at(end64, 24) != u64_at(end64, 32)
+            {
+                return Err(invalid("invalid ZIP64 disk/count metadata"));
+            }
+            let entries = u64_at(end64, 32);
+            let size = u64_at(end64, 40);
+            let relative = u64_at(end64, 48);
+            for (small, sentinel, large) in [
+                (count_disk as u64, u16::MAX as u64, entries),
+                (count as u64, u16::MAX as u64, entries),
+                (size32 as u64, u32::MAX as u64, size),
+                (offset32 as u64, u32::MAX as u64, relative),
+            ] {
+                if small != sentinel && small != large {
+                    return Err(invalid("contradictory ZIP32/ZIP64 metadata"));
+                }
+            }
+            let offset = sub(end64_at, u64_at(&locator, 8))?;
+            (entries, size, relative, end64_at, offset)
+        } else {
+            if count != count_disk {
+                return Err(invalid("inconsistent EOCD entry counts"));
+            }
+            let offset = sub(sub(eocd_at, size32 as u64)?, offset32 as u64)?;
+            (
+                count as u64,
+                size32 as u64,
+                offset32 as u64,
+                eocd_at,
+                offset,
+            )
+        };
+        if entries > 100_000 || size > 64 * 1024 * 1024 || entries > size / 46 {
+            return Err(invalid(
+                "oversized/inconsistent central directory count/size",
+            ));
+        }
+        let start = add(offset, relative)?;
+        if add(start, size)? != footer_at {
+            return Err(invalid("central directory boundary disagrees with footer"));
+        }
+        let mut position = start;
+        let mut actual = 0u64;
+        while position < footer_at {
+            if footer_at - position < 46 {
+                return Err(invalid("truncated central-directory header"));
+            }
+            let header = read_at(reader, position, 46)?;
+            if u32_at(&header, 0) != 0x02014b50 {
+                return Err(invalid("invalid/unsupported central-directory record"));
+            }
+            let name_len = u16_at(&header, 28) as usize;
+            let extra_len = u16_at(&header, 30) as usize;
+            let comment_len = u16_at(&header, 32) as usize;
+            let end = add(position, (46 + name_len + extra_len + comment_len) as u64)?;
+            if end > footer_at {
+                return Err(invalid("entry exceeds central-directory boundary"));
+            }
+            let fields = read_at(reader, position + 46, name_len + extra_len)?;
+            let name = &fields[..name_len];
+            if name.is_empty() || name.contains(&0) {
+                return Err(invalid("invalid entry name"));
+            }
+            let flags = u16_at(&header, 8);
+            if flags & (1 << 11) != 0 && std::str::from_utf8(name).is_err() {
+                return Err(invalid("invalid UTF-8 entry name"));
+            }
+            let extra = extra_fields(&fields[name_len..])?;
+            let mut extra_at = 0;
+            let unpacked = u32_at(&header, 24);
+            if unpacked == u32::MAX {
+                zip64_value(extra, &mut extra_at, 8)?;
+            }
+            let packed = u32_at(&header, 20);
+            let packed = if packed == u32::MAX {
+                zip64_value(extra, &mut extra_at, 8)?
+            } else {
+                packed as u64
+            };
+            let local = u32_at(&header, 42);
+            let local = if local == u32::MAX {
+                zip64_value(extra, &mut extra_at, 8)?
+            } else {
+                local as u64
+            };
+            let disk = u16_at(&header, 34);
+            let disk = if disk == u16::MAX {
+                zip64_value(extra, &mut extra_at, 4)?
+            } else {
+                disk as u64
+            };
+            if disk != 0 {
+                return Err(invalid("multi-disk entry is unsupported"));
+            }
+            let local_at = add(offset, local)?;
+            if add(local_at, 30)? > start {
+                return Err(invalid("local header overlaps central directory"));
+            }
+            let local_header = read_at(reader, local_at, 30)?;
+            if u32_at(&local_header, 0) != 0x04034b50
+                || u16_at(&local_header, 6) != flags
+                || u16_at(&local_header, 8) != u16_at(&header, 10)
+            {
+                return Err(invalid("local/central header identity mismatch"));
+            }
+            let local_name_len = u16_at(&local_header, 26) as usize;
+            let local_extra_len = u16_at(&local_header, 28) as usize;
+            let data_at = add(local_at, (30 + local_name_len + local_extra_len) as u64)?;
+            if add(data_at, packed)? > start {
+                return Err(invalid("entry payload overlaps central directory"));
+            }
+            let local_fields = read_at(reader, local_at + 30, local_name_len + local_extra_len)?;
+            if &local_fields[..local_name_len] != name {
+                return Err(invalid("local/central entry name mismatch"));
+            }
+            extra_fields(&local_fields[local_name_len..])?;
+            position = end;
+            actual += 1;
+        }
+        if actual != entries {
+            return Err(invalid("raw central-directory count disagrees with footer"));
+        }
+        Ok(Directory {
+            entries: actual,
+            start,
+            offset,
+        })
+    }
+}
+
+fn open_update_zip(mut file: File) -> Result<ZipArchive<File>, Box<dyn std::error::Error>> {
+    let directory = update_zip_identity::scan(&mut file)
+        .map_err(|error| format!("update ZIP identity: {error}"))?;
+    let archive = ZipArchive::with_config(
+        zip::read::Config {
+            archive_offset: zip::read::ArchiveOffset::Known(directory.offset),
+        },
+        file,
+    )
+    .map_err(|error| format!("update ZIP identity: {error}"))?;
+    if archive.offset() != directory.offset || archive.central_directory_start() != directory.start
+    {
+        return Err("update ZIP identity: library/raw directory disagreement".into());
+    }
+    // This is not len() alone as a uniqueness oracle: raw records were scanned
+    // BEFORE the library's effective-name IndexMap was constructed. Any decoded
+    // collision (CP437/UTF-8/Unicode Path included) necessarily shrinks the map.
+    if archive.len() as u64 != directory.entries {
+        return Err("update ZIP identity: duplicate effective update ZIP entry".into());
+    }
+    Ok(archive)
+}
+
 struct UpdateImage {
     partition: &'static str,
     image_name: &'static str,
@@ -1246,12 +1563,10 @@ fn prepare_update_images<T: FastbootTransport>(
     max_download_size: Option<usize>,
     gopts: &GlobalOptions,
 ) -> Result<Vec<UpdateImage>, Box<dyn std::error::Error>> {
-    let mut names = std::collections::HashSet::new();
-    for name in archive.file_names() {
-        if !names.insert(name.to_string()) {
-            return Err(format!("duplicate update ZIP entry: {name}").into());
-        }
-    }
+    // open_update_zip checked raw CD records before constructing the name map.
+    // This set is only an image-presence index, never the uniqueness oracle.
+    let names: std::collections::HashSet<_> =
+        archive.file_names().map(str::to_string).collect();
     let mut images = Vec::new();
     for &(partition, image_name, optional) in AOSP_IMAGES {
         if !names.contains(image_name) {
@@ -1344,13 +1659,9 @@ fn do_update<T: FastbootTransport>(
         }
     };
 
-    let mut archive = match ZipArchive::new(zip_file) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("[fastboot-rs] 错误: 无法解析 zip 文件 '{zip_path}': {e}");
-            std::process::exit(1);
-        }
-    };
+    // Validate raw metadata and effective identity before reading android-info
+    // or issuing any update query/download/flash to the target.
+    let mut archive = open_update_zip(zip_file)?;
 
     println!("[fastboot-rs] 已打开 update.zip ({} 个条目)", archive.len());
 
