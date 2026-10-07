@@ -257,14 +257,118 @@ fn rejects_before_any_write(name: &str, bytes: Vec<u8>) {
             .all(|command| command.starts_with("getvar:")),
         "write/reboot after preflight failure: {effects:?}"
     );
+    assert_eq!(
+        effects.commands,
+        vec![
+            "getvar:version-bootloader",
+            "getvar:version-baseband",
+            "getvar:serialno",
+            "getvar:max-download-size",
+        ],
+        "must reach sparse image preflight, then stop before partition selection or writes"
+    );
     assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("Error"),
-        "{output:?}"
+        [
+            "BlockCountMismatch",
+            "InvalidChunkSize",
+            "InvalidBlockSize",
+            "ChunkPayloadTooShort",
+            "SizeOverflow"
+        ]
+        .iter()
+        .any(|reason| stderr.contains(reason)),
+        "expected sparse validation error, not an unrelated failure: {output:?}"
     );
 }
 
 #[test]
 fn wrong_sparse_span_is_rejected_before_the_first_update_download() {
     rejects_before_any_write("wrong-span", sparse(4096, 2, &[(0xcac3, 1, &[])]));
+}
+
+#[test]
+fn crc_cannot_inflate_the_declared_update_span() {
+    rejects_before_any_write("crc-blocks", sparse(4096, 1, &[(0xcac4, 1, b"CRC!")]));
+}
+
+#[test]
+fn small_sparse_invalid_blocks_payloads_and_arithmetic_are_preflighted() {
+    for (name, bytes) in [
+        ("block-zero", sparse(0, 0, &[])),
+        ("block-alignment", sparse(6, 1, &[(0xcac3, 1, &[])])),
+        ("zero-chunk", sparse(4096, 0, &[(0xcac3, 0, &[])])),
+        ("raw-size", sparse(4096, 1, &[(0xcac1, 1, b"SHORT")])),
+        ("fill-size", sparse(4096, 1, &[(0xcac2, 1, b"BAD")])),
+        ("skip-size", sparse(4096, 1, &[(0xcac3, 1, b"BAD")])),
+        (
+            "crc-size",
+            sparse(4096, 1, &[(0xcac3, 1, &[]), (0xcac4, 0, b"BAD")]),
+        ),
+        (
+            "sum-overflow",
+            sparse(4096, 0, &[(0xcac3, u32::MAX, &[]), (0xcac3, 1, &[])]),
+        ),
+        (
+            "raw-multiply",
+            sparse(0xffff_fffc, u32::MAX, &[(0xcac1, u32::MAX, &[])]),
+        ),
+    ] {
+        rejects_before_any_write(name, bytes);
+    }
+}
+
+#[test]
+fn valid_small_sparse_empty_fill_holes_crc_and_extended_headers_still_update() {
+    let mut extended = sparse(4096, 1, &[]);
+    extended[6..8].copy_from_slice(&7u16.to_le_bytes());
+    extended[8..10].copy_from_slice(&36u16.to_le_bytes());
+    extended[10..12].copy_from_slice(&16u16.to_le_bytes());
+    extended[20..24].copy_from_slice(&2u32.to_le_bytes());
+    extended[24..28].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
+    extended.extend([0xa5; 8]);
+    for (kind, blocks, payload) in [(0xcac3u16, 1u32, &[][..]), (0xcac4, 0, &b"CRC!"[..])] {
+        extended.extend(kind.to_le_bytes());
+        extended.extend(0x1234u16.to_le_bytes());
+        extended.extend(blocks.to_le_bytes());
+        extended.extend((16 + payload.len() as u32).to_le_bytes());
+        extended.extend([0xa5; 4]);
+        extended.extend(payload);
+    }
+    for (name, bytes) in [
+        ("empty", sparse(4096, 0, &[])),
+        ("fill", sparse(4096, 1, &[(0xcac2, 1, b"FILL")])),
+        ("holes", sparse(4096, 1, &[(0xcac3, 1, &[])])),
+        (
+            "crc",
+            sparse(4096, 1, &[(0xcac3, 1, &[]), (0xcac4, 0, b"CRC!")]),
+        ),
+        ("extended", extended),
+    ] {
+        assert!(
+            valid_sparse(&bytes),
+            "independent peer rejected valid {name}"
+        );
+        let (output, effects) = run_update(name, &bytes);
+        assert!(output.status.success(), "{name}: {output:?}, {effects:?}");
+        assert_eq!(effects.boot, b"BOOT");
+        assert_eq!(effects.system, bytes);
+        assert_eq!(effects.downloads, 2);
+        let writes: Vec<_> = effects
+            .commands
+            .iter()
+            .filter(|command| !command.starts_with("getvar:"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            writes,
+            vec![
+                "download:00000004",
+                "flash:boot",
+                &format!("download:{:08x}", bytes.len()),
+                "flash:system",
+            ]
+        );
+    }
 }
