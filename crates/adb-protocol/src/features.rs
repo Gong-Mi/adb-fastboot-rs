@@ -74,7 +74,7 @@ pub fn can_use_feature(device_features: &[String], feature: &str) -> bool {
 ///                              (file_sync_client.cpp SendSmallFile parity).
 ///
 /// NOT advertised (unimplemented here, so we must not let a peer rely on
-/// them): apex, abb, abb_exec, remount_shell, track_app, devraw, app_info,
+/// them): remount_shell, track_app, devraw, app_info,
 /// server_status, openscreen_mdns, devicetracker_proto_format, track_mdns,
 /// fixed_push_mkdir (no recursive push yet), libusb (no libusb backend),
 /// push_sync (server-service extra AOSP appends unconditionally; we only
@@ -91,6 +91,15 @@ pub fn host_supported_features() -> &'static [&'static str] {
         "sendrecv_v2_zstd",
         "sendrecv_v2_dry_run_send",
         "fixed_push_symlink_timestamp",
+        // apex / abb_exec: implemented by the install domain —
+        // - `apex`: streamed install appends `--apex` for .apex inputs
+        //   (client/adb_install.cpp:68-70, 227-229)
+        // - `abb_exec`: install commands prefer the device `abb_exec:`
+        //   service with NUL-joined args over `exec:cmd package`
+        //   (client/adb_install.cpp:73-76, 152-158, 208-210;
+        //    client/commandline.h:212-222, ABB_ARG_DELIMITER = '\0')
+        "apex",
+        "abb_exec",
     ]
 }
 
@@ -134,11 +143,13 @@ mod tests {
     #[test]
     fn test_can_use_feature_requires_both_sides() {
         // Device supports it, host advertises it → usable.
-        let device = vec!["shell_v2".to_string(), "apex".to_string()];
+        let device = vec!["shell_v2".to_string(), "apex".to_string(), "abb_exec".to_string()];
         assert!(can_use_feature(&device, "shell_v2"));
+        assert!(can_use_feature(&device, "apex"));
+        assert!(can_use_feature(&device, "abb_exec"));
         // Device supports something we don't implement → unusable
         // (this is why advertising abb/host-features falsely is a bug).
-        assert!(!can_use_feature(&device, "apex"));
+        assert!(!can_use_feature(&device, "abb"));
         // Host implements it but device doesn't → unusable.
         assert!(!can_use_feature(&[], "shell_v2"));
     }
@@ -162,7 +173,8 @@ mod tests {
             assert!(f.contains(&name), "missing {name}");
         }
         // Capabilities we do NOT implement must never appear.
-        for bad in ["abb", "abb_exec", "apex", "remount_shell", "libusb", "push_sync"] {
+        // (`abb` remains unimplemented; `apex`/`abb_exec` are now advertised.)
+        for bad in ["abb", "remount_shell", "libusb", "push_sync"] {
             assert!(!f.contains(&bad), "must not advertise {bad}");
         }
     }
@@ -173,6 +185,8 @@ mod tests {
         let s = String::from_utf8(payload).unwrap();
         assert!(s.starts_with("host::features="), "got {s}");
         assert!(s.contains("shell_v2"));
-        assert!(!s.contains("abb"));
+        assert!(s.contains("apex"));
+        assert!(s.contains("abb_exec"));
+        assert!(!s.contains("abb,") && !s.ends_with("abb"));
     }
 }

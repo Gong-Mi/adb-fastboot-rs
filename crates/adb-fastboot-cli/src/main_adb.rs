@@ -1106,10 +1106,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match mode {
                 client::adb_install::InstallMode::Streamed => {
+                    let cmd_transport = client::adb_install::CommandTransport::from_banner(&device_info.banner);
                     let output = client::adb_install::install_apk_streamed(
                         &mut transport,
                         apk_path,
                         &options,
+                        cmd_transport,
+                        &device_info.banner,
                     )?;
                     println!("[adb-rs] Streamed install succeeded: {}", output.trim());
                 }
@@ -1157,6 +1160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &apk_paths,
                 &options,
                 &mut printer,
+                &device_info.banner,
             )?;
             println!("[adb-rs] Install-multiple succeeded");
         }

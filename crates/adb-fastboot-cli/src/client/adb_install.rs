@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use adb_protocol::{
     AdbMessageHeader, Transport,
     build_sync_send_req, build_sync_data_chunk, build_sync_done,
+    escape_arg,
     A_CLSE, A_OKAY, A_WRTE,
 };
 
@@ -85,6 +86,80 @@ pub enum InstallModeRequest {
 pub enum InstallMode {
     Push,
     Streamed,
+}
+
+/// AOSP `send_command` (adb_install.cpp:152-158) transport selection:
+/// when the device advertises `abb_exec` (adb_install.cpp:73-76) install
+/// commands go to the in-process binder bridge service `abb_exec:` with
+/// NUL-joined args (client/commandline.h:212-222,
+/// `ABB_ARG_DELIMITER = '\0'`, adb.h:205); otherwise they go to
+/// `exec:cmd package ...` (or `exec:pm ...` for the legacy pm path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandTransport {
+    /// `abb_exec:arg\0arg...` — raw args, no shell escaping (adb_install.cpp:215-217).
+    AbbExec,
+    /// `exec:cmd package ...` with `escape_arg`-escaped args (adb_install.cpp:210-223).
+    ExecCmd,
+    /// `exec:pm ...` with escaped args — legacy push-mode path (adb_install.cpp:610-613).
+    ExecPm,
+}
+
+impl CommandTransport {
+    /// Pick the transport from the device banner (AOSP `is_abb_exec_supported()`).
+    pub fn from_banner(device_banner: &str) -> Self {
+        let device_features = adb_protocol::features::parse_banner_features(device_banner);
+        if adb_protocol::features::can_use_feature(&device_features, "abb_exec") {
+            CommandTransport::AbbExec
+        } else {
+            CommandTransport::ExecCmd
+        }
+    }
+
+    /// Whether `.apex` inputs are accepted (AOSP `is_apex_supported()`,
+    /// adb_install.cpp:68-70).
+    pub fn apex_supported(device_banner: &str) -> bool {
+        let device_features = adb_protocol::features::parse_banner_features(device_banner);
+        adb_protocol::features::can_use_feature(&device_features, "apex")
+    }
+
+    /// Build the service destination string. `args` are final wire tokens:
+    /// AOSP escapes only user-provided passthrough options with
+    /// `escape_arg` (adb_install.cpp:213-223); programmatic tokens (`-S`,
+    /// size, session id, `-`, basenames) are pushed raw upstream, so they
+    /// arrive here raw too.
+    ///
+    /// - AbbExec: `abb_exec:package\0<arg>\0...` — raw, NUL-joined.
+    /// - ExecCmd: `exec:cmd package <args...>`.
+    /// - ExecPm:  `exec:pm <args...>`.
+    pub fn service_string(&self, args: &[String]) -> String {
+        match self {
+            CommandTransport::AbbExec => {
+                // ABB_ARG_DELIMITER = '\0' (adb.h:205): NUL-joined raw args.
+                let mut service = String::from("abb_exec:package");
+                for arg in args {
+                    service.push('\0');
+                    service.push_str(arg);
+                }
+                service
+            }
+            CommandTransport::ExecCmd => {
+                let mut service = String::from("exec:cmd package");
+                for arg in args {
+                    service.push(' ');
+                    service.push_str(arg);
+                }
+                service
+            }
+            CommandTransport::ExecPm => {
+                let mut service = String::from("exec:pm");
+                for arg in args {
+                    service.push(' ');
+                    service.push_str(arg);
+                }
+                service
+            }
+        }
+    }
 }
 
 /// Select a safe mode from the device's A_CNXN feature banner.
@@ -248,9 +323,27 @@ fn run_exec_command(
     read_exec_output(transport, local_id, remote_id, Vec::new())
 }
 
-fn stream_file_to_exec(
+/// Execute a package-manager command over the AOSP `send_command` transport
+/// (adb_install.cpp:152-158): `abb_exec:` when the device supports it,
+/// `exec:` otherwise. `args` exclude the program prefix.
+fn run_install_command(
     transport: &mut dyn Transport,
-    command: &str,
+    cmd_transport: CommandTransport,
+    args: &[String],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let destination = cmd_transport.service_string(args);
+    let (local_id, remote_id) = open_service(transport, &destination, 1)?;
+    read_exec_output(transport, local_id, remote_id, Vec::new())
+}
+
+/// Stream a local file into a package-manager write command over the AOSP
+/// `send_command` transport (adb_install.cpp:666-690): the command is
+/// `abb_exec:...` or `exec:cmd package install-write -S <size> <session>
+/// <name> -`, and the file bytes flow as raw A_WRTE payloads.
+fn stream_file_to_install_command(
+    transport: &mut dyn Transport,
+    cmd_transport: CommandTransport,
+    args: &[String],
     local_file: &Path,
     expected_file_size: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -262,7 +355,7 @@ fn stream_file_to_exec(
         .into());
     }
     let mut file = fs::File::open(local_file)?;
-    let destination = format!("exec:{command}");
+    let destination = cmd_transport.service_string(args);
     let (local_id, remote_id) = open_service(transport, &destination, 1)?;
 
     let mut pending_output = Vec::new();
@@ -282,25 +375,41 @@ fn stream_file_to_exec(
     read_exec_output(transport, local_id, remote_id, pending_output)
 }
 
-/// Stream a single APK to `cmd package install` using the size-delimited exec service.
-/// The APK bytes are raw A_WRTE payloads; `-S` tells package manager when input is complete.
+/// Stream a single package to `cmd package install` using the size-delimited
+/// command transport (AOSP install_app_streamed, adb_install.cpp:160-253):
+/// `.apk` always accepted; `.apex` requires the device `apex` feature and
+/// appends `--apex`. The payload bytes are raw A_WRTE frames; `-S` tells
+/// package manager when input is complete.
 pub fn install_apk_streamed(
     transport: &mut dyn Transport,
     local_apk: &Path,
     options: &InstallOptions,
+    cmd_transport: CommandTransport,
+    device_banner: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let extension = local_apk.extension().and_then(|value| value.to_str()).unwrap_or_default();
-    if !extension.eq_ignore_ascii_case("apk") {
-        return Err("streamed install currently supports .apk files only".into());
+    let is_apex = extension.eq_ignore_ascii_case("apex");
+    if !extension.eq_ignore_ascii_case("apk") && !is_apex {
+        return Err(format!("filename doesn't end .apk or .apex: {}", local_apk.display()).into());
+    }
+    if is_apex && !CommandTransport::apex_supported(device_banner) {
+        return Err(".apex is not supported on the target device".into());
     }
     let file_size = fs::metadata(local_apk)?.len();
-    let flags = options.to_pm_flags().join(" ");
-    let command = if flags.is_empty() {
-        format!("cmd package install -S {file_size}")
-    } else {
-        format!("cmd package install {flags} -S {file_size}")
-    };
-    let output = stream_file_to_exec(transport, &command, local_apk, file_size)?;
+    let mut args: Vec<String> = vec!["install".to_string()];
+    args.extend(options.to_pm_flags());
+    args.push("-S".to_string());
+    args.push(file_size.to_string());
+    if is_apex {
+        args.push("--apex".to_string());
+    }
+    let output = stream_file_to_install_command(
+        transport,
+        cmd_transport,
+        &args,
+        local_apk,
+        file_size,
+    )?;
     if output.lines().any(|line| line.starts_with("Success")) {
         Ok(output)
     } else {
@@ -411,6 +520,7 @@ pub fn install_multiple(
     apks: &[&Path],
     options: &InstallOptions,
     printer: &mut LinePrinter,
+    device_banner: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if apks.is_empty() {
         return Err("No APK files provided".into());
@@ -422,18 +532,31 @@ pub fn install_multiple(
     let mut total_size = 0u64;
 
     // Validate every local input before making any remote changes.
+    // Accepted extensions mirror AOSP install_multiple_app_streamed
+    // (adb_install.cpp:541-546): .apk, .dm, .sdm, .fsv_sig, .idsig;
+    // .apex is rejected (adb_install.cpp:539-540).
     for apk in apks {
         let file_name = apk
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or("Invalid APK filename")?
             .to_string();
-        if Path::new(&file_name)
+        let extension = Path::new(&file_name)
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("apex"))
-        {
-            return Err("APEX packages are not compatible with install-multiple".into());
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        match extension.as_str() {
+            "apex" => {
+                return Err("APEX packages are not compatible with install-multiple".into());
+            }
+            "apk" | "dm" | "sdm" | "fsv_sig" | "idsig" => {}
+            _ => {
+                return Err(format!(
+                    "install-multiple accepts .apk/.dm/.sdm/.fsv_sig/.idsig files only, got: {file_name}"
+                )
+                .into());
+            }
         }
         if !names.insert(file_name.clone()) {
             return Err(format!("Duplicate APK filename: {file_name}").into());
@@ -450,7 +573,13 @@ pub fn install_multiple(
     }
 
     if options.streaming == Some(true) {
-        return install_multiple_streamed(transport, apks, total_size, options);
+        return install_multiple_streamed(
+            transport,
+            apks,
+            total_size,
+            options,
+            CommandTransport::from_banner(device_banner),
+        );
     }
 
     // If any push fails, remove all planned paths, including a partially written file.
@@ -475,14 +604,11 @@ fn install_multiple_streamed(
     apks: &[&Path],
     total_size: u64,
     options: &InstallOptions,
+    cmd_transport: CommandTransport,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let flags = options.to_pm_flags().join(" ");
-    let create_command = if flags.is_empty() {
-        format!("cmd package install-create -S {total_size}")
-    } else {
-        format!("cmd package install-create -S {total_size} {flags}")
-    };
-    let create_output = run_exec_command(transport, &create_command)?;
+    let mut create_args: Vec<String> = vec!["install-create".to_string(), "-S".to_string(), total_size.to_string()];
+    create_args.extend(options.to_pm_flags());
+    let create_output = run_install_command(transport, cmd_transport, &create_args)?;
     let session_id = parse_install_session_id(&create_output)
         .ok_or_else(|| format!("Failed to create streamed install session: {}", create_output.trim()))?;
 
@@ -493,13 +619,15 @@ fn install_multiple_streamed(
                 .and_then(|name| name.to_str())
                 .ok_or("Invalid APK filename")?;
             let size = fs::metadata(apk)?.len();
-            let write_command = format!(
-                "cmd package install-write -S {} {} {} -",
-                size,
-                session_id,
-                shell_quote(file_name),
-            );
-            let output = stream_file_to_exec(transport, &write_command, apk, size)?;
+            let write_args = vec![
+                "install-write".to_string(),
+                "-S".to_string(),
+                size.to_string(),
+                session_id.clone(),
+                file_name.to_string(),
+                "-".to_string(),
+            ];
+            let output = stream_file_to_install_command(transport, cmd_transport, &write_args, apk, size)?;
             if !output.lines().any(|line| line.starts_with("Success")) {
                 return Err(format!(
                     "install-write failed for {file_name}: {}",
@@ -509,8 +637,8 @@ fn install_multiple_streamed(
             }
         }
 
-        let commit_command = format!("cmd package install-commit {session_id}");
-        let commit_output = run_exec_command(transport, &commit_command)?;
+        let commit_args = vec!["install-commit".to_string(), session_id.clone()];
+        let commit_output = run_install_command(transport, cmd_transport, &commit_args)?;
         if !commit_output.lines().any(|line| line.starts_with("Success")) {
             return Err(format!(
                 "install-commit failed for session {session_id}: {}",
@@ -522,8 +650,8 @@ fn install_multiple_streamed(
     })();
 
     if result.is_err() {
-        let abandon_command = format!("cmd package install-abandon {session_id}");
-        let _ = run_exec_command(transport, &abandon_command);
+        let abandon_args = vec!["install-abandon".to_string(), session_id.clone()];
+        let _ = run_install_command(transport, cmd_transport, &abandon_args);
     }
     result
 }
@@ -622,11 +750,8 @@ pub fn install_multi_package(
                 .and_then(|name| name.to_str())
                 .ok_or("Invalid APK filename")?;
             let extension = local_path.extension().and_then(|value| value.to_str()).unwrap_or_default();
-            if extension.eq_ignore_ascii_case("apex") {
-                return Err("APEX multi-package install requires unsupported staged/Apex flags".into());
-            }
-            if !extension.eq_ignore_ascii_case("apk") {
-                return Err(format!("Expected an .apk input, got {split}").into());
+            if !extension.eq_ignore_ascii_case("apk") && !extension.eq_ignore_ascii_case("apex") {
+                return Err(format!("Expected an .apk or .apex input, got {split}").into());
             }
             if !basenames.insert(file_name.to_string()) {
                 return Err(format!("Duplicate split basename in package {argument}: {file_name}").into());
@@ -641,21 +766,23 @@ pub fn install_multi_package(
         packages.push(package);
     }
 
-    install_multi_package_sessions(transport, &packages, options)
+    install_multi_package_sessions(
+        transport,
+        &packages,
+        options,
+        CommandTransport::from_banner(device_banner),
+    )
 }
 
 fn install_multi_package_sessions(
     transport: &mut dyn Transport,
     packages: &[Vec<MultiPackageApk>],
     options: &InstallOptions,
+    cmd_transport: CommandTransport,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let flags = options.to_pm_flags().join(" ");
-    let parent_command = if flags.is_empty() {
-        "cmd package install-create --multi-package".to_string()
-    } else {
-        format!("cmd package install-create --multi-package {flags}")
-    };
-    let parent_output = run_exec_command(transport, &parent_command)?;
+    let mut parent_args: Vec<String> = vec!["install-create".to_string(), "--multi-package".to_string()];
+    parent_args.extend(options.to_pm_flags());
+    let parent_output = run_install_command(transport, cmd_transport, &parent_args)?;
     let parent_id = parse_install_session_id(&parent_output).ok_or_else(|| {
         format!("Failed to create multi-package parent session: {}", parent_output.trim())
     })?;
@@ -663,24 +790,29 @@ fn install_multi_package_sessions(
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         for package in packages {
-            let child_command = if flags.is_empty() {
-                "cmd package install-create".to_string()
-            } else {
-                format!("cmd package install-create {flags}")
-            };
-            let child_output = run_exec_command(transport, &child_command)?;
+            let mut child_args: Vec<String> = vec!["install-create".to_string()];
+            child_args.extend(options.to_pm_flags());
+            let child_output = run_install_command(transport, cmd_transport, &child_args)?;
             let child_id = parse_install_session_id(&child_output)
                 .ok_or_else(|| format!("Failed to create child session: {}", child_output.trim()))?;
             child_ids.push(child_id.clone());
 
             for apk in package {
-                let write_command = format!(
-                    "cmd package install-write -S {} {} {} -",
+                let write_args = vec![
+                    "install-write".to_string(),
+                    "-S".to_string(),
+                    apk.size.to_string(),
+                    child_id.clone(),
+                    apk.split_name.clone(),
+                    "-".to_string(),
+                ];
+                let output = stream_file_to_install_command(
+                    transport,
+                    cmd_transport,
+                    &write_args,
+                    &apk.local_path,
                     apk.size,
-                    child_id,
-                    shell_quote(&apk.split_name),
-                );
-                let output = stream_file_to_exec(transport, &write_command, &apk.local_path, apk.size)?;
+                )?;
                 if !output.lines().any(|line| line.starts_with("Success")) {
                     return Err(format!(
                         "install-write failed for child session {child_id}, split {}: {}",
@@ -692,18 +824,15 @@ fn install_multi_package_sessions(
             }
         }
 
-        let add_sessions = format!(
-            "cmd package install-add-session {} {}",
-            parent_id,
-            child_ids.join(" ")
-        );
-        let add_output = run_exec_command(transport, &add_sessions)?;
+        let mut add_args = vec!["install-add-session".to_string(), parent_id.clone()];
+        add_args.extend(child_ids.iter().cloned());
+        let add_output = run_install_command(transport, cmd_transport, &add_args)?;
         if !add_output.lines().any(|line| line.starts_with("Success")) {
             return Err(format!("install-add-session failed: {}", add_output.trim()).into());
         }
 
-        let commit = format!("cmd package install-commit {parent_id}");
-        let commit_output = run_exec_command(transport, &commit)?;
+        let commit_args = vec!["install-commit".to_string(), parent_id.clone()];
+        let commit_output = run_install_command(transport, cmd_transport, &commit_args)?;
         if !commit_output.lines().any(|line| line.starts_with("Success")) {
             return Err(format!("parent install-commit failed: {}", commit_output.trim()).into());
         }
@@ -711,9 +840,11 @@ fn install_multi_package_sessions(
     })();
 
     if result.is_err() {
-        let _ = run_exec_command(transport, &format!("cmd package install-abandon {parent_id}"));
+        let abandon_args = vec!["install-abandon".to_string(), parent_id.clone()];
+        let _ = run_install_command(transport, cmd_transport, &abandon_args);
         for child_id in &child_ids {
-            let _ = run_exec_command(transport, &format!("cmd package install-abandon {child_id}"));
+            let abandon_args = vec!["install-abandon".to_string(), child_id.clone()];
+            let _ = run_install_command(transport, cmd_transport, &abandon_args);
         }
     }
     result
@@ -1064,7 +1195,7 @@ mod tests {
             ..Default::default()
         };
 
-        install_multiple(&mut peer, &references, &options, &mut printer).unwrap();
+        install_multiple(&mut peer, &references, &options, &mut printer, "device::features=cmd,shell_v2").unwrap();
 
         let commands = shell_commands(&peer);
         let transaction: Vec<&str> = commands
@@ -1103,6 +1234,7 @@ mod tests {
             &references,
             &InstallOptions::default(),
             &mut printer,
+            "device::features=cmd,shell_v2",
         );
 
         assert!(result.is_err());
@@ -1124,15 +1256,15 @@ mod tests {
             ..Default::default()
         };
 
-        install_multiple(&mut peer, &references, &options, &mut printer).unwrap();
+        install_multiple(&mut peer, &references, &options, &mut printer, "device::features=cmd,shell_v2").unwrap();
 
         let commands = exec_commands(&peer);
         assert_eq!(
             commands,
             vec![
                 "cmd package install-create -S 10 -r".to_string(),
-                "cmd package install-write -S 4 42 'base.apk' -".to_string(),
-                "cmd package install-write -S 6 42 'split'\\''cfg.apk' -".to_string(),
+                "cmd package install-write -S 4 42 base.apk -".to_string(),
+                "cmd package install-write -S 6 42 split'cfg.apk -".to_string(),
                 "cmd package install-commit 42".to_string(),
             ]
         );
@@ -1153,7 +1285,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = install_multiple(&mut peer, &references, &options, &mut printer);
+        let result = install_multiple(&mut peer, &references, &options, &mut printer, "device::features=cmd,shell_v2");
         assert!(result.is_err());
         let commands = exec_commands(&peer);
         assert!(commands.iter().any(|cmd| cmd == "cmd package install-abandon 42"));
@@ -1174,6 +1306,7 @@ mod tests {
             &[apex.as_path()],
             &InstallOptions::default(),
             &mut printer,
+            "device::features=cmd,shell_v2",
         );
 
         assert!(result.unwrap_err().to_string().contains("APEX"));
@@ -1236,11 +1369,25 @@ mod tests {
             match header.command {
                 adb_protocol::A_OPEN => {
                     let destination = String::from_utf8_lossy(payload).into_owned();
-                    let (_, size) = destination
+                    // Flatten abb_exec's NUL-joined args to spaces so the
+                    // trailing "-S <size>" parse works for both transports;
+                    // a "--apex" suffix after the size is cut by the
+                    // take-while(digit) below.
+                    let flattened = if let Some(rest) = destination.strip_prefix("abb_exec:") {
+                        rest.split('\0').collect::<Vec<_>>().join(" ")
+                    } else {
+                        destination.clone()
+                    };
+                    let (_, size) = flattened
                         .rsplit_once(" -S ")
                         .ok_or_else(|| TransportError::Protocol("stream command lacks -S".into()))?;
+                    let size_token: String = size
+                        .chars()
+                        .take_while(|character| character.is_ascii_digit())
+                        .collect();
                     self.expected_size = Some(
-                        size.parse::<usize>()
+                        size_token
+                            .parse::<usize>()
                             .map_err(|error| TransportError::Protocol(error.to_string()))?,
                     );
                     self.opened_services.push(destination);
@@ -1321,6 +1468,8 @@ mod tests {
             &mut peer,
             &paths[0],
             &InstallOptions { reinstall: true, ..Default::default() },
+            CommandTransport::ExecCmd,
+            "device::features=cmd,shell_v2",
         )
         .unwrap();
 
@@ -1335,11 +1484,147 @@ mod tests {
     fn streamed_install_returns_device_failure_output() {
         let (root, paths) = fixture_apks();
         let mut peer = FakeExecTransport::new(false);
-        let error = install_apk_streamed(&mut peer, &paths[0], &InstallOptions::default())
-            .unwrap_err()
-            .to_string();
+        let error = install_apk_streamed(
+            &mut peer,
+            &paths[0],
+            &InstallOptions::default(),
+            CommandTransport::ExecCmd,
+            "device::features=cmd,shell_v2",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("package rejected"));
         assert_eq!(peer.streamed_bytes, b"base");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn streamed_install_uses_abb_exec_service_with_nul_joined_args() {
+        let (root, paths) = fixture_apks();
+        let mut peer = FakeExecTransport::new(true);
+        let output = install_apk_streamed(
+            &mut peer,
+            &paths[0],
+            &InstallOptions { reinstall: true, ..Default::default() },
+            CommandTransport::AbbExec,
+            "device::features=cmd,shell_v2,abb_exec",
+        )
+        .unwrap();
+
+        assert!(output.starts_with("Success"));
+        assert_eq!(
+            peer.opened_services,
+            ["abb_exec:package\0install\0-r\0-S\04"]
+        );
+        assert_eq!(peer.streamed_bytes, b"base");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn streamed_apex_requires_device_apex_feature_and_appends_apex_flag() {
+        let (root, _) = fixture_apks();
+        let apex = root.join("bundle.apex");
+        fs::write(&apex, b"apex").unwrap();
+
+        // No `apex` feature → reject before any service opens.
+        let mut peer = FakeExecTransport::new(true);
+        let error = install_apk_streamed(
+            &mut peer,
+            &apex,
+            &InstallOptions::default(),
+            CommandTransport::ExecCmd,
+            "device::features=cmd,shell_v2",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not supported on the target device"), "{error}");
+        assert!(peer.opened_services.is_empty());
+
+        // With `apex` feature → `--apex` appended after -S (AOSP order).
+        let mut peer = FakeExecTransport::new(true);
+        install_apk_streamed(
+            &mut peer,
+            &apex,
+            &InstallOptions::default(),
+            CommandTransport::ExecCmd,
+            "device::features=cmd,shell_v2,apex",
+        )
+        .unwrap();
+        assert_eq!(
+            peer.opened_services,
+            ["exec:cmd package install -S 4 --apex"]
+        );
+        assert_eq!(peer.streamed_bytes, b"apex");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn command_transport_from_banner_selects_abb_exec_and_apex_gates() {
+        assert_eq!(
+            CommandTransport::from_banner("device::features=cmd,shell_v2,abb_exec"),
+            CommandTransport::AbbExec
+        );
+        assert_eq!(
+            CommandTransport::from_banner("device::features=cmd,shell_v2"),
+            CommandTransport::ExecCmd
+        );
+        assert!(CommandTransport::apex_supported("device::features=cmd,apex"));
+        assert!(!CommandTransport::apex_supported("device::features=cmd"));
+        // Host must not let a bare device claim unlock abb_exec without host support.
+        assert_eq!(
+            CommandTransport::from_banner("device::features=abb_exec_only_nonsense"),
+            CommandTransport::ExecCmd
+        );
+    }
+
+    #[test]
+    fn install_multiple_accepts_dm_sdm_fsv_sig_idsig_inputs() {
+        let (root, _) = fixture_apks();
+        let mut inputs = Vec::new();
+        for name in ["base.apk", "meta.dm", "cloud.sdm", "sig.fsv_sig", "v4.idsig"] {
+            let path = root.join(name);
+            fs::write(&path, b"x").unwrap();
+            inputs.push(path);
+        }
+        let references: Vec<&Path> = inputs.iter().map(PathBuf::as_path).collect();
+        let mut peer = FakeTransport::new(false);
+        peer.expect_pushes(&inputs);
+        let mut printer = LinePrinter::new();
+
+        install_multiple(
+            &mut peer,
+            &references,
+            &InstallOptions::default(),
+            &mut printer,
+            "device::features=cmd,shell_v2",
+        )
+        .unwrap();
+
+        let commands = shell_commands(&peer);
+        assert!(commands.iter().any(|command| command.contains("pm install-write -S 1 42 'meta.dm'")));
+        assert!(commands.iter().any(|command| command.contains("pm install-write -S 1 42 'v4.idsig'")));
+        assert!(commands.iter().any(|command| command == "pm install-commit 42"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_multiple_rejects_unknown_extension_before_opening_services() {
+        let (root, _) = fixture_apks();
+        let zip = root.join("bundle.zip");
+        fs::write(&zip, b"zip").unwrap();
+        let mut peer = FakeTransport::new(false);
+        let mut printer = LinePrinter::new();
+
+        let result = install_multiple(
+            &mut peer,
+            &[zip.as_path()],
+            &InstallOptions::default(),
+            &mut printer,
+            "device::features=cmd,shell_v2",
+        );
+
+        assert!(result.unwrap_err().to_string().contains(".apk/.dm/.sdm/.fsv_sig/.idsig"));
+        assert!(peer.opened_services.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1385,7 +1670,7 @@ mod tests {
             peer.expect_pushes(&paths);
             peer.sync_outcome = outcome;
             let references: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-            assert!(install_multiple(&mut peer, &references, &InstallOptions::default(), &mut printer).is_err());
+            assert!(install_multiple(&mut peer, &references, &InstallOptions::default(), &mut printer, "device::features=cmd,shell_v2").is_err());
             let commands = shell_commands(&peer);
             // Staging happens before session creation: preserve cleanup of all
             // planned paths, but never create/write/commit/abandon a session.
@@ -1429,10 +1714,10 @@ mod tests {
             [
                 "cmd package install-create --multi-package",
                 "cmd package install-create",
-                "cmd package install-write -S 4 43 '1_base.apk' -",
-                "cmd package install-write -S 7 43 '1_feature.apk' -",
+                "cmd package install-write -S 4 43 1_base.apk -",
+                "cmd package install-write -S 7 43 1_feature.apk -",
                 "cmd package install-create",
-                "cmd package install-write -S 6 44 '2_split'\\''cfg.apk' -",
+                "cmd package install-write -S 6 44 2_split'cfg.apk -",
                 "cmd package install-add-session 42 43 44",
                 "cmd package install-commit 42",
             ]

@@ -106,11 +106,12 @@ pub fn install_multiple_incremental(
     apks: &[&Path],
     options: &IncrementalOptions,
     printer: &mut LinePrinter,
+    device_banner: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if options.incremental {
         return Err("Incremental ADB multi-package install is not implemented: refusing to install packages individually or pass a superficial `--incremental` flag".into());
     }
-    install_multiple(transport, apks, &options.install_opts, printer)
+    install_multiple(transport, apks, &options.install_opts, printer, device_banner)
 }
 
 #[cfg(test)]
@@ -184,6 +185,7 @@ mod tests {
             &paths,
             &options,
             &mut printer,
+            "device::features=cmd,shell_v2",
         )
         .unwrap_err()
         .to_string();
