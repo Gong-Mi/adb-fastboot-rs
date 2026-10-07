@@ -116,6 +116,66 @@ pub fn read_id_sig_headers(reader: &mut dyn std::io::Read) -> Result<IdSigHeader
     })
 }
 
+/// AOSP `validate_signature` (incremental.cpp:141-157): signature length
+/// bound plus verity tree size agreement with the file size.
+pub fn validate_signature(
+    signature: &[u8],
+    tree_size: i32,
+    file_size: i64,
+) -> Result<(), String> {
+    if signature.len() > MAX_SIGNATURE_SIZE {
+        return Err(format!(
+            "Signature is too long: {}. Max allowed is {}",
+            signature.len(),
+            MAX_SIGNATURE_SIZE
+        ));
+    }
+    let expected = verity_tree_size_for_file(file_size);
+    if tree_size != expected as i32 {
+        return Err(format!(
+            "Verity tree size mismatch [was {tree_size}, expected {expected}]"
+        ));
+    }
+    Ok(())
+}
+
+/// AOSP `requires_v4_signature` (incremental.cpp:120-124): APKs and .sdm
+/// files must carry a v4 signature.
+pub fn requires_v4_signature(file: &str) -> bool {
+    file.to_ascii_lowercase().ends_with(".apk")
+        || file.to_ascii_lowercase().ends_with("sdm")
+}
+
+/// AOSP `read_signature` (incremental.cpp:126-139): open `<file>.idsig`;
+/// ENOENT means "no signature" (empty signature, tree size 0), other
+/// errors are fatal.
+pub fn read_signature(signature_file: &Path) -> Result<IdSigHeaders, String> {
+    if !signature_file.exists() {
+        // ENOENT → empty signature, matching AOSP read_signature.
+        return Ok(IdSigHeaders {
+            signature: Vec::new(),
+            tree_size: 0,
+        });
+    }
+    let mut reader = std::fs::File::open(signature_file).map_err(|error| {
+        format!(
+            "Failed to open signature file '{}': {}",
+            signature_file.display(),
+            error
+        )
+    })?;
+    read_id_sig_headers(&mut reader)
+}
+
+/// Base64-encode signature bytes (AOSP `encode_signature`,
+/// incremental.cpp:160-174).
+pub fn encode_signature(signature: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(signature)
+}
+
+use std::path::Path;
+
 #[cfg(test)]
 mod tests {
     use super::*;

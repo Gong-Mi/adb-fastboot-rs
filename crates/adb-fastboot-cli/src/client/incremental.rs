@@ -16,7 +16,10 @@
 
 mod incremental_utils;
 
-pub use incremental_utils::{read_id_sig_headers, verity_tree_blocks_for_file, verity_tree_size_for_file};
+pub use incremental_utils::{
+    encode_signature, read_id_sig_headers, read_signature, requires_v4_signature,
+    validate_signature, verity_tree_blocks_for_file, verity_tree_size_for_file,
+};
 
 use std::path::Path;
 
@@ -118,6 +121,37 @@ pub fn install_multiple_incremental(
     install_multiple(transport, apks, &options.install_opts, printer, device_banner)
 }
 
+/// AOSP `should_use_incremental_by_default` (incremental.cpp:295-315):
+/// every file must exist, and v4-signature-requiring files (.apk/.sdm) must
+/// carry a valid `.idsig` whose tree size matches the file size.
+pub fn should_use_incremental_by_default(files: &[&Path]) -> bool {
+    for file in files {
+        let metadata = match std::fs::metadata(file) {
+            Ok(metadata) => metadata,
+            Err(_) => return false,
+        };
+        let path_string = file.to_string_lossy();
+        if requires_v4_signature(&path_string) {
+            let Ok(signature) = read_signature(&idsig_path_for(file)) else {
+                return false;
+            };
+            if validate_signature(&signature.signature, signature.tree_size, metadata.len() as i64)
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// AOSP signature path convention (incremental.cpp:129): `<file>` + ".idsig".
+fn idsig_path_for(file: &Path) -> std::path::PathBuf {
+    let mut path = file.as_os_str().to_os_string();
+    path.push(incremental_utils::IDSIG_EXTENSION);
+    std::path::PathBuf::from(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +230,56 @@ mod tests {
 
         assert!(error.contains("not implemented"));
         assert_eq!(transport.sent_messages, 0);
+    }
+
+    fn write_idsig(path: &Path, file_size: i64) {
+        // Minimal valid .idsig v2 header whose treeSize matches `file_size`:
+        // version=2, hashingInfo=[4]abcd, signingInfo=[3]xyz,
+        // treeSize=verity_tree_size_for_file(file_size).
+        let mut input = Vec::new();
+        input.extend_from_slice(&2i32.to_le_bytes());
+        input.extend_from_slice(&4i32.to_le_bytes());
+        input.extend_from_slice(b"abcd");
+        input.extend_from_slice(&3i32.to_le_bytes());
+        input.extend_from_slice(b"xyz");
+        input.extend_from_slice(&(verity_tree_size_for_file(file_size) as i32).to_le_bytes());
+        std::fs::write(path, input).unwrap();
+    }
+
+    #[test]
+    fn should_use_incremental_requires_valid_idsig_for_apks() {
+        use incremental_utils::verity_tree_size_for_file;
+        let root = std::env::temp_dir().join(format!("incr-default-{}", std::process::id()));
+
+        // Missing file → false.
+        assert!(!should_use_incremental_by_default(&[&root.join("gone.apk")]));
+
+        // .apk without .idsig → signature empty → validate passes?? No:
+        // read_signature returns empty for ENOENT and validate_signature
+        // passes only when tree size expectation is 0 — a real APK is bigger.
+        let apk = root.join("app.apk");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&apk, vec![0u8; 8192]).unwrap();
+        assert!(!should_use_incremental_by_default(&[apk.as_path()]));
+
+        // With a matching .idsig → true.
+        write_idsig(&root.join("app.apk.idsig"), 8192);
+        assert!(should_use_incremental_by_default(&[apk.as_path()]));
+
+        // Wrong tree size → false.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&2i32.to_le_bytes());
+        bad.extend_from_slice(&0i32.to_le_bytes());
+        bad.extend_from_slice(&0i32.to_le_bytes());
+        bad.extend_from_slice(&999i32.to_le_bytes());
+        std::fs::write(root.join("app.apk.idsig"), bad).unwrap();
+        assert!(!should_use_incremental_by_default(&[apk.as_path()]));
+
+        // Non-apk file without idsig → still true (no v4 requirement).
+        let txt = root.join("notes.txt");
+        std::fs::write(&txt, b"hello").unwrap();
+        assert!(should_use_incremental_by_default(&[txt.as_path()]));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
