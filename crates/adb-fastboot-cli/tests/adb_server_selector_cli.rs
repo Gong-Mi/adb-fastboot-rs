@@ -66,9 +66,12 @@ fn peer(
                     sync_request(&mut socket, b"STAT");
                     // Independent AOSP v1 structure, deliberately no length.
                     let data = b"server-B";
+                    // 0600 is deliberately NOT the umask-0027 default for a new
+                    // file (0666 & ~0027 = 0640); a missing chmod must fail the
+                    // mode assertion instead of coincidentally matching.
                     let stat = [
                         b"STAT".as_slice(),
-                        &0o100640u32.to_le_bytes(),
+                        &0o100600u32.to_le_bytes(),
                         &(data.len() as u32).to_le_bytes(),
                         &1_720_000_001u32.to_le_bytes(),
                     ]
@@ -177,7 +180,7 @@ fn run_selector(option: &str) {
     assert_eq!(fs::read(&destination).unwrap(), b"server-B");
     let metadata = fs::metadata(&destination).unwrap();
     assert_eq!(metadata.mtime(), 1_720_000_001);
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
 }
 
 #[test]
