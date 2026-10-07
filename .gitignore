@@ -1,5 +1,5 @@
 /target
-Cargo.lock
+# Workspace contains CLI binaries: keep the dependency lockfile in git.
 *.swp
 *.tmp
 # boringssl cmake output inside vendored tree (if built in-tree)
