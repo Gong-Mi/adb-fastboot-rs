@@ -81,7 +81,9 @@ impl SyncMessageHeader {
     }
 }
 
-/// ADB STAT response struct (12 bytes payload after STAT header)
+/// ADB V1 STAT fields (12 bytes after the 4-byte `STAT` id).
+/// The complete AOSP `sync_stat_v1` is 16 bytes and has NO length word.
+/// `decode`/`encode` handle only these fields; `decode_v1_message` validates wire framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncStatResponse {
     pub mode: u32,
@@ -91,6 +93,23 @@ pub struct SyncStatResponse {
 
 impl SyncStatResponse {
     pub const SIZE: usize = 12;
+    pub const WIRE_SIZE: usize = 4 + Self::SIZE;
+
+    /// Decode exactly one AOSP V1 STAT message, including its four-byte id.
+    pub fn decode_v1_message(buf: &[u8]) -> Result<Self, SyncProtocolError> {
+        if buf.len() < Self::WIRE_SIZE {
+            return Err(SyncProtocolError::HeaderTooShort {
+                expected: Self::WIRE_SIZE,
+                got: buf.len(),
+            });
+        }
+        if buf.len() != Self::WIRE_SIZE || &buf[..4] != b"STAT" {
+            return Err(SyncProtocolError::InvalidMessage(
+                "V1 STAT must be exactly [STAT, mode, size, mtime] (16 bytes)".into(),
+            ));
+        }
+        Self::decode(&buf[4..])
+    }
 
     pub fn exists(&self) -> bool {
         self.mode != 0 || self.size != 0 || self.mtime != 0
@@ -599,6 +618,32 @@ mod tests {
         assert_eq!(stat.size, 2048);
         assert_eq!(stat.mtime, 1720000000);
         assert!(stat.exists());
+    }
+
+    #[test]
+    fn v1_stat_matches_independent_aosp_vector_and_rejects_fake_length_header() {
+        // AOSP @9084198a file_sync_protocol.h:48-53: four little-endian u32s.
+        let wire = [
+            b"STAT".as_slice(),
+            &0o100600u32.to_le_bytes(),
+            &6u32.to_le_bytes(),
+            &1_720_000_000u32.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(wire.len(), 16);
+        let stat = SyncStatResponse::decode_v1_message(&wire).unwrap();
+        assert_eq!(
+            (stat.mode, stat.size, stat.mtime),
+            (0o100600, 6, 1_720_000_000)
+        );
+        for length in 0..16 {
+            assert!(SyncStatResponse::decode_v1_message(&wire[..length]).is_err());
+        }
+        let fake = [b"STAT".as_slice(), &12u32.to_le_bytes(), &wire[4..]].concat();
+        assert!(SyncStatResponse::decode_v1_message(&fake).is_err());
+        let mut wrong_id = wire.clone();
+        wrong_id[..4].copy_from_slice(b"DATA");
+        assert!(SyncStatResponse::decode_v1_message(&wrong_id).is_err());
     }
 
     #[test]
