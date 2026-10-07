@@ -14,6 +14,10 @@
 //! `pm install --incremental` plus a `/proc/fs/incfs` probe implements AOSP's
 //! signature/database/inc-server/`abb_exec` protocol.
 
+mod incremental_utils;
+
+pub use incremental_utils::{read_id_sig_headers, verity_tree_blocks_for_file, verity_tree_size_for_file};
+
 use std::path::Path;
 
 use adb_protocol::Transport;
