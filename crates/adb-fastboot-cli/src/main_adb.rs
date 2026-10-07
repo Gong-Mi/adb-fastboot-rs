@@ -931,7 +931,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Pull { remote, local, preserve, algorithm, no_compress } => {
             let serial = cli.serial.as_deref();
             let _compression = sync_compression_option(algorithm.as_deref(), *no_compress)?;
-            match file_sync::pull(serial, remote, local, *preserve) {
+            match file_sync::pull_at(server_port, serial, remote, local, *preserve) {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("Error: pull failed: {e}");
