@@ -85,6 +85,15 @@ pub trait Transport: Read + Write + Send {
     fn inner_tcp_mut(&mut self) -> Option<&mut TcpStream> {
         None
     }
+
+    /// Raw fd of the underlying socket, when the transport is a plain
+    /// byte-oriented fd. Needed for fd-level handover (the `inc-pump`
+    /// process). Returns `None` for transports that buffer or encrypt in
+    /// userspace (TLS) or are not fd-backed.
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        None
+    }
 }
 
 /// Connect trait abstraction for establishing transport connections
@@ -187,6 +196,12 @@ impl Transport for TcpTransport {
     fn inner_tcp_mut(&mut self) -> Option<&mut TcpStream> {
         Some(&mut self.stream)
     }
+
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        Some(self.stream.as_raw_fd())
+    }
 }
 
 impl Transport for Box<dyn Transport + '_> {
@@ -201,6 +216,10 @@ impl Transport for Box<dyn Transport + '_> {
     }
     fn inner_tcp_mut(&mut self) -> Option<&mut TcpStream> {
         (**self).inner_tcp_mut()
+    }
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        (**self).as_raw_fd()
     }
 }
 

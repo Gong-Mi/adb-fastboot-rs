@@ -16,11 +16,15 @@
 
 mod incremental_server;
 mod incremental_utils;
+mod pump;
 
 #[allow(unused_imports)]
 pub use incremental_server::{
     serve, IncrementalServer, RequestCommand, ResponseHeader, SendResult, ServerFile,
 };
+
+#[allow(unused_imports)]
+pub use pump::run as run_pump;
 
 #[allow(unused_imports)]
 pub use incremental_utils::{
@@ -32,9 +36,6 @@ use std::io::Read;
 use std::path::Path;
 
 use adb_protocol::Transport;
-
-use super::adb_install::{InstallOptions, install_apk, install_multiple};
-use super::line_printer::LinePrinter;
 
 /// Advisory kernel-state probe only: a visible `/proc/fs/incfs` entry does not
 /// establish that AOSP incremental installation is usable. AOSP additionally
@@ -79,54 +80,103 @@ pub fn incfs_mountpoint_visible(transport: &mut dyn Transport) -> Result<bool, B
     Ok(stdout.contains("incfs") || stdout.contains("incremental"))
 }
 
-/// Install options for incremental installation.
-#[derive(Debug, Clone)]
-pub struct IncrementalOptions {
-    /// Base install options.
-    pub install_opts: InstallOptions,
-    /// Enable incremental install (IncFS).
-    pub incremental: bool,
-    /// Timeout in seconds for the incremental installation.
-    pub timeout_secs: u64,
+/// AOSP `install` (incremental.cpp:436-467): the full incremental install
+/// pipeline — build the database, open the `abb_exec` service with it, send
+/// unsigned files, then spawn the pump + inc-server pair and wait for `pm`'s
+/// verdict. On success the pair keeps running (and may outlive this
+/// process); their pids are returned.
+///
+/// `silent` selects the signature policy exactly like AOSP: a silent
+/// (fastdeploy) run uses `Normal`, an explicit `--incremental` request uses
+/// `AllowMissingSignatures` (incremental.cpp:452-457).
+pub fn install(
+    transport: &mut dyn Transport,
+    files: &[&Path],
+    passthrough_args: &[String],
+    silent: bool,
+    executor: &str,
+) -> Result<(libc::pid_t, libc::pid_t), String> {
+    let check_policy = if silent {
+        CheckPolicy::Normal
+    } else {
+        CheckPolicy::AllowMissingSignatures
+    };
+    let database = build_database(files, check_policy)?;
+    let (local_id, remote_id) =
+        connect_incremental(transport, &database, passthrough_args).map_err(|e| e.to_string())?;
+    send_unsigned_files(transport, local_id, remote_id, &database).map_err(|e| e.to_string())?;
+    start_inc_server(executor, transport, local_id, remote_id, &database)
 }
 
-impl Default for IncrementalOptions {
-    fn default() -> Self {
-        Self {
-            install_opts: InstallOptions::default(),
-            incremental: false,
-            timeout_secs: 300,
+/// Spawn the `inc-pump` bridge (which inherits the transport socket) and hand
+/// its channel end to the AOSP-shaped inc-server launcher, then block until
+/// `pm` reports Success/Failure.
+///
+/// AOSP (`start_inc_server_and_stream_signed_files`, incremental.cpp:363-434)
+/// has one process because its connection fd is a plain byte channel already;
+/// this port's transports frame A_WRTE in userspace, so a pump process
+/// translates between the framed socket and the plain channel the inc-server
+/// serves on.
+fn start_inc_server(
+    executor: &str,
+    transport: &dyn Transport,
+    local_id: u32,
+    remote_id: u32,
+    database: &[IsDatabaseEntry],
+) -> Result<(libc::pid_t, libc::pid_t), String> {
+    use crate::server::sysdeps_unix::{adb_close, adb_launch_process, adb_socketpair, close_on_exec};
+
+    let transport_fd = transport.as_raw_fd().ok_or_else(|| {
+        "incremental install: this transport cannot hand its socket to a separate process \
+         (TLS transports are not supported yet)"
+            .to_string()
+    })?;
+
+    // Plain-byte channel between the pump and the inc-server. CLOEXEC keeps
+    // each end out of the other child (the spawn helper only clears it for
+    // the fds it is told to inherit).
+    let (channel_server_fd, channel_pump_fd) =
+        adb_socketpair().map_err(|_| "adb: failed to create socket pair for inc-pump".to_string())?;
+    close_on_exec(channel_server_fd);
+    close_on_exec(channel_pump_fd);
+
+    // The pump inherits the transport socket and outlives this process; it
+    // translates A_WRTE frames ↔ plain channel bytes.
+    let transport_fd_str = transport_fd.to_string();
+    let channel_pump_fd_str = channel_pump_fd.to_string();
+    let local_id_str = local_id.to_string();
+    let remote_id_str = remote_id.to_string();
+    let pump_args: [&str; 5] = [
+        "inc-pump",
+        &transport_fd_str,
+        &channel_pump_fd_str,
+        &local_id_str,
+        &remote_id_str,
+    ];
+    let pump = match adb_launch_process(executor, &pump_args, &[transport_fd, channel_pump_fd]) {
+        Ok(pid) => pid,
+        Err(_) => {
+            adb_close(channel_server_fd);
+            adb_close(channel_pump_fd);
+            return Err("adb: failed to fork".to_string());
+        }
+    };
+    adb_close(channel_pump_fd);
+
+    // The inc-server spawn + wait is the AOSP launcher. On failure both
+    // children are killed; on success the caller owns the (channel, print)
+    // handoff and the pair may keep streaming.
+    let result = start_inc_server_and_stream_signed_files(executor, channel_server_fd, database);
+    adb_close(channel_server_fd);
+    match result {
+        Ok(server) => Ok((pump, server)),
+        Err(error) => {
+            unsafe {
+                libc::kill(pump, libc::SIGTERM);
+            }
+            Err(error)
         }
     }
-}
-
-/// Install an APK incrementally if IncFS is available.
-///
-/// Falls back to regular install if IncFS is not supported.
-pub fn install_apk_incremental(
-    transport: &mut dyn Transport,
-    local_apk: &Path,
-    options: &IncrementalOptions,
-    printer: &mut LinePrinter,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if options.incremental {
-        return Err("Incremental ADB install is not implemented: refusing to substitute `pm install --incremental` for AOSP's signature/database/inc-server pipeline".into());
-    }
-    install_apk(transport, local_apk, &options.install_opts, printer)
-}
-
-/// Install multiple APKs incrementally.
-pub fn install_multiple_incremental(
-    transport: &mut dyn Transport,
-    apks: &[&Path],
-    options: &IncrementalOptions,
-    printer: &mut LinePrinter,
-    device_banner: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if options.incremental {
-        return Err("Incremental ADB multi-package install is not implemented: refusing to install packages individually or pass a superficial `--incremental` flag".into());
-    }
-    install_multiple(transport, apks, &options.install_opts, printer, device_banner)
 }
 
 /// AOSP `should_use_incremental_by_default` (incremental.cpp:295-315):
@@ -528,80 +578,6 @@ mod tests {
     use super::*;
     use adb_protocol::{AdbMessageHeader, TransportError, A_CLSE, A_OKAY, A_WRTE};
     use std::io::{Read, Write};
-
-    #[derive(Default)]
-    struct NoWireTransport {
-        sent_messages: usize,
-    }
-
-    impl Read for NoWireTransport {
-        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
-            Ok(0)
-        }
-    }
-
-    impl Write for NoWireTransport {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Transport for NoWireTransport {
-        fn send_message(
-            &mut self,
-            _header: &AdbMessageHeader,
-            _payload: &[u8],
-        ) -> Result<(), TransportError> {
-            self.sent_messages += 1;
-            Ok(())
-        }
-
-        fn recv_message(&mut self) -> Result<(AdbMessageHeader, Vec<u8>), TransportError> {
-            Err(TransportError::Protocol("unexpected wire read".to_string()))
-        }
-    }
-
-    #[test]
-    fn explicit_incremental_request_is_rejected_before_opening_a_service() {
-        let mut transport = NoWireTransport::default();
-        let options = IncrementalOptions { incremental: true, ..Default::default() };
-        let mut printer = LinePrinter::new();
-        let error = install_apk_incremental(
-            &mut transport,
-            Path::new("not-read.apk"),
-            &options,
-            &mut printer,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("not implemented"));
-        assert_eq!(transport.sent_messages, 0);
-    }
-
-    #[test]
-    fn explicit_incremental_multi_request_is_rejected_before_opening_a_service() {
-        let mut transport = NoWireTransport::default();
-        let options = IncrementalOptions { incremental: true, ..Default::default() };
-        let mut printer = LinePrinter::new();
-        let paths = [Path::new("one.apk"), Path::new("two.apk")];
-        let error = install_multiple_incremental(
-            &mut transport,
-            &paths,
-            &options,
-            &mut printer,
-            "device::features=cmd,shell_v2",
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("not implemented"));
-        assert_eq!(transport.sent_messages, 0);
-    }
 
     fn write_idsig(path: &Path, file_size: i64) {
         // Minimal valid .idsig v2 header whose treeSize matches `file_size`:

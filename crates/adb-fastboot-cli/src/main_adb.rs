@@ -215,6 +215,10 @@ pub enum Commands {
         /// Force legacy sync-push install even when streamed install is supported
         #[arg(long, conflicts_with = "streaming")]
         no_streaming: bool,
+        /// Incremental (IncFS) install: requires a v4-signed file (with
+        /// .idsig) for APKs, or pass to allow missing signatures explicitly
+        #[arg(long, conflicts_with_all = ["streaming", "no_streaming"])]
+        incremental: bool,
         apk: String,
     },
     /// Push multiple APKs to device and install them
@@ -341,6 +345,19 @@ pub enum Commands {
         output_fd: i32,
         /// Signed files to serve; argument position is the file id
         files: Vec<String>,
+    },
+    /// Internal: A_WRTE ↔ plain-byte channel bridge for incremental installs
+    /// (spawned by adb install; see client/incremental/pump.rs)
+    #[command(name = "inc-pump", hide = true)]
+    IncPump {
+        /// Transport socket fd (>= 3); speaks raw A_WRTE frames to adbd
+        transport_fd: i32,
+        /// Channel fd (>= 3) carrying the plain pm byte stream
+        channel_fd: i32,
+        /// Local id of the open abb_exec service
+        local_id: u32,
+        /// Remote id of the open abb_exec service
+        remote_id: u32,
     },
     /// Connect to a device via TCP/IP
     Connect {
@@ -1086,6 +1103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             apk,
             streaming,
             no_streaming,
+            incremental,
         } => {
             let apk_path = Path::new(apk);
             if !apk_path.exists() {
@@ -1114,6 +1132,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &cnxn_payload,
                 default_auth(),
             )?;
+
+            if *incremental {
+                // AOSP install_app_incremental (adb_install.cpp:299-357):
+                // explicit request → AllowMissingSignatures policy, then the
+                // full incremental pipeline. The pump/inc-server pair keeps
+                // streaming after this process exits.
+                println!("Performing Incremental Install");
+                let started = std::time::Instant::now();
+                let executor = std::env::current_exe()
+                    .map_err(|error| format!("Cannot resolve the adb executable path: {error}"))?;
+                let files: [&Path; 1] = [apk_path];
+                match client::incremental::install(
+                    &mut transport,
+                    &files,
+                    &[],
+                    false,
+                    &executor.to_string_lossy(),
+                ) {
+                    Ok(_processes) => {
+                        println!(
+                            "Install command complete in {} ms",
+                            started.elapsed().as_millis()
+                        );
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        eprintln!("adb: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
             let mode = client::adb_install::select_install_mode(&device_info.banner, request)?;
             let options = client::adb_install::InstallOptions {
                 reinstall: true,
@@ -1406,6 +1456,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // it; keep the sane mapping instead (nobody checks it).
             let succeeded = client::incremental::serve(connection_fd, output_fd, files);
             std::process::exit(if succeeded { 0 } else { 1 });
+        }
+
+        Commands::IncPump { transport_fd, channel_fd, local_id, remote_id } => {
+            let transport_fd = *transport_fd;
+            if !server::sysdeps_unix::is_valid_os_fd(transport_fd) {
+                eprintln!("Invalid transport_fd number given: {transport_fd}");
+                std::process::exit(1);
+            }
+            server::sysdeps_unix::close_on_exec(transport_fd);
+
+            let channel_fd = *channel_fd;
+            if !server::sysdeps_unix::is_valid_os_fd(channel_fd) {
+                eprintln!("Invalid channel_fd number given: {channel_fd}");
+                std::process::exit(1);
+            }
+            server::sysdeps_unix::close_on_exec(channel_fd);
+
+            match client::incremental::run_pump(transport_fd, channel_fd, *local_id, *remote_id) {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Connect { target } => {
