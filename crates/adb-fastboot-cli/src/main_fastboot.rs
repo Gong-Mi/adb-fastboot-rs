@@ -36,55 +36,111 @@ impl GlobalOptions {
 const AVB_MAGIC: &[u8; 4] = b"AVB0";
 /// AOSP `AVB_FOOTER_MAGIC` = "AVBf" (4 bytes).
 const AVB_FOOTER_MAGIC: &[u8; 4] = b"AVBf";
-/// Size of the AVB footer struct (AOSP `AVB_FOOTER_SIZE`).
 const AVB_FOOTER_SIZE: usize = 64;
-/// Offset of the big-endian `flags` field inside the VBMeta header.
-/// The flags field is 32-bit BE at byte offset 120; the LSB is at 123.
+const VBMETA_HEADER_SIZE: usize = 256;
+/// AvbVBMetaImageHeader.flags is BE u32 at 120; bits 0/1 are in byte 123.
 const VBMETA_FLAGS_LSB_OFFSET: usize = 123;
 
-/// Patch vbmeta flags in an image buffer, mirroring AOSP
-/// `fastboot.cpp:SetVbmetaFlags()`.
-///
-/// Returns a new buffer with the flags patched, or `None` if the image
-/// does not contain a recognisable AVB structure (in which case the
-/// caller should flash the original data unchanged).
-fn patch_vbmeta_flags(data: &[u8], opts: &GlobalOptions) -> Option<Vec<u8>> {
-    if !opts.needs_vbmeta_patch() || data.len() < 256 {
-        return None;
+/// Rewrite flags using Android 17's packed AvbFooter/AvbVBMetaImageHeader
+/// layouts (external/avb ba2dec4b, core fastboot.cpp:rewrite_vbmeta_buffer).
+/// No flags or no recognized AVB structure preserves the existing raw-image
+/// behavior. Recognized but truncated/inconsistent structures return an error.
+/// This checks structural bounds, NOT signatures, algorithms or key trust.
+fn patch_vbmeta_flags(data: &[u8], opts: &GlobalOptions) -> Result<Option<Vec<u8>>, String> {
+    if !opts.needs_vbmeta_patch() {
+        return Ok(None);
     }
-
-    // Determine vbmeta offset: either 0 (standalone vbmeta.img) or
-    // read from the AVB footer appended to a boot image.
-    let vbmeta_offset: usize = if data.len() >= AVB_FOOTER_SIZE
-        && &data[data.len() - AVB_FOOTER_SIZE..data.len() - AVB_FOOTER_SIZE + 4] == AVB_FOOTER_MAGIC
-    {
-        // Footer present — read vbmeta_offset (BE u64 at footer + 8).
-        let footer = &data[data.len() - AVB_FOOTER_SIZE..];
-        let off = u64::from_be_bytes(footer[8..16].try_into().ok()?) as usize;
-        off
-    } else {
-        0
+    let error = || "invalid AVB/vbmeta structure: truncated or overflowing field/range".to_string();
+    let read_u32 = |bytes: &[u8], offset: usize| -> Result<u32, String> {
+        let end = offset.checked_add(4).ok_or_else(error)?;
+        let field = bytes.get(offset..end).ok_or_else(error)?;
+        Ok(u32::from_be_bytes(field.try_into().map_err(|_| error())?))
     };
+    let read_u64 = |bytes: &[u8], offset: usize| -> Result<u64, String> {
+        let end = offset.checked_add(8).ok_or_else(error)?;
+        let field = bytes.get(offset..end).ok_or_else(error)?;
+        Ok(u64::from_be_bytes(field.try_into().map_err(|_| error())?))
+    };
+    let native = |value: u64| usize::try_from(value).map_err(|_| error());
 
-    // Verify AVB_MAGIC at the computed offset.
-    if data.len() < vbmeta_offset + 4 || &data[vbmeta_offset..vbmeta_offset + 4] != AVB_MAGIC {
-        return None;
+    let footer_start = data.len().checked_sub(AVB_FOOTER_SIZE);
+    let footer = footer_start.and_then(|start| data.get(start..));
+    let (vbmeta_offset, vbmeta_end) = match footer {
+        Some(footer) if footer.starts_with(AVB_FOOTER_MAGIC) => {
+            // Packed footer: major=4, minor=8, original_size=12,
+            // vbmeta_offset=20, vbmeta_size=28, reserved=36. In particular,
+            // [8..16] is NOT the offset. libavb accepts major <= 1 and any minor.
+            if read_u32(footer, 4)? > 1 {
+                return Err("unsupported AVB footer major version".to_string());
+            }
+            let original_size = native(read_u64(footer, 12)?)?;
+            let offset = native(read_u64(footer, 20)?)?;
+            let size = native(read_u64(footer, 28)?)?;
+            let end = offset.checked_add(size).ok_or_else(error)?;
+            let start = footer_start.ok_or_else(error)?;
+            if original_size > offset || size < VBMETA_HEADER_SIZE || end > start {
+                return Err(error());
+            }
+            data.get(offset..end).ok_or_else(error)?;
+            (offset, end)
+        }
+        _ if data.starts_with(AVB_MAGIC) => (0, data.len()),
+        _ => return Ok(None),
+    };
+    let header_end = vbmeta_offset
+        .checked_add(VBMETA_HEADER_SIZE)
+        .ok_or_else(error)?;
+    if header_end > vbmeta_end {
+        return Err(error());
+    }
+    let header = data.get(vbmeta_offset..header_end).ok_or_else(error)?;
+    if !header.starts_with(AVB_MAGIC) {
+        return Err("invalid AVB/vbmeta structure: footer does not point to AVB0".to_string());
     }
 
-    let flags_byte = vbmeta_offset + VBMETA_FLAGS_LSB_OFFSET;
-    if flags_byte >= data.len() {
-        return None;
+    // Header + auth + aux must be present; all relative ranges must fit their
+    // own block. Reject corrupt sizes without authenticating/re-signing data.
+    let auth_size = native(read_u64(header, 12)?)?;
+    let aux_size = native(read_u64(header, 20)?)?;
+    if auth_size % 64 != 0 || aux_size % 64 != 0 {
+        return Err("invalid AVB/vbmeta structure: unaligned auth/aux block".to_string());
+    }
+    let end = header_end
+        .checked_add(auth_size)
+        .and_then(|end| end.checked_add(aux_size))
+        .ok_or_else(error)?;
+    if end > vbmeta_end {
+        return Err(error());
+    }
+    data.get(vbmeta_offset..end).ok_or_else(error)?;
+    for (offset_field, size_field, block_size) in [
+        (32, 40, auth_size), // hash
+        (48, 56, auth_size), // signature
+        (64, 72, aux_size),  // public key
+        (80, 88, aux_size),  // public key metadata
+        (96, 104, aux_size), // descriptors
+    ] {
+        let offset = native(read_u64(header, offset_field)?)?;
+        let size = native(read_u64(header, size_field)?)?;
+        if offset.checked_add(size).ok_or_else(error)? > block_size {
+            return Err(error());
+        }
     }
 
+    let flags_byte = vbmeta_offset
+        .checked_add(VBMETA_FLAGS_LSB_OFFSET)
+        .ok_or_else(error)?;
     let mut patched = data.to_vec();
+    let flags = patched.get_mut(flags_byte).ok_or_else(error)?;
     if opts.disable_verity {
-        patched[flags_byte] |= 0x01;
+        *flags |= 0x01;
     }
     if opts.disable_verification {
-        patched[flags_byte] |= 0x02;
+        *flags |= 0x02;
     }
-    Some(patched)
+    Ok(Some(patched))
 }
+
 
 /// Returns true when `partition` is a vbmeta partition (AOSP
 /// `is_vbmeta_partition()`).
@@ -1175,6 +1231,9 @@ struct UpdateImage {
     image_name: &'static str,
     wire_partition: String,
     size: u64,
+    // Freeze the exact converted bytes; never repeat a fallible vbmeta transform
+    // after an earlier image has been flashed. Only selected transforms are kept.
+    prepared_data: Option<Vec<u8>>,
 }
 
 /// Freeze required-image presence/readability and every partition/slot decision
@@ -1185,6 +1244,7 @@ fn prepare_update_images<T: FastbootTransport>(
     required: &std::collections::HashSet<String>,
     slot: &fastboot_protocol::SlotSelection,
     max_download_size: Option<usize>,
+    gopts: &GlobalOptions,
 ) -> Result<Vec<UpdateImage>, Box<dyn std::error::Error>> {
     let mut names = std::collections::HashSet::new();
     for name in archive.file_names() {
@@ -1215,6 +1275,14 @@ fn prepare_update_images<T: FastbootTransport>(
         if data.len() as u64 != size {
             return Err(format!("truncated update image '{image_name}'").into());
         }
+        let freeze_data = is_vbmeta_partition(partition) && gopts.needs_vbmeta_patch();
+        if freeze_data {
+            if let Some(patched) = patch_vbmeta_flags(&data, gopts)
+                .map_err(|error| format!("update image '{image_name}': {error}"))?
+            {
+                data = patched;
+            }
+        }
         let sparse = if data.starts_with(&fastboot_protocol::SPARSE_HEADER_MAGIC.to_le_bytes()) {
             Some(fastboot_protocol::SparseFile::from_bytes(&data)?)
         } else {
@@ -1230,6 +1298,7 @@ fn prepare_update_images<T: FastbootTransport>(
             image_name,
             wire_partition: partition.to_string(),
             size,
+            prepared_data: if freeze_data { Some(data) } else { None },
         });
     }
     let mut selected_slot = match slot {
@@ -1333,7 +1402,7 @@ fn do_update<T: FastbootTransport>(
         );
     }
 
-    let images = prepare_update_images(transport, &mut archive, &required, slot, max_download_size)?;
+    let images = prepare_update_images(transport, &mut archive, &required, slot, max_download_size, gopts)?;
     // Every selected image and partition/slot query passed before any download.
     println!("[fastboot-rs] 开始刷写分区镜像...\n");
     for image in images {
@@ -1342,33 +1411,14 @@ fn do_update<T: FastbootTransport>(
         let partition_with_slot = image.wire_partition;
         println!("[fastboot-rs] >>> 刷写 {img_name} -> 分区 {partition}");
 
-        // 从 zip 读取镜像数据
-        let image_data = match archive.by_name(img_name) {
-            Ok(mut entry) => {
-                let mut data = Vec::new();
-                entry.read_to_end(&mut data)?;
-                data
-            }
-            Err(e) => {
-                eprintln!(
-                    "[fastboot-rs] 错误: 无法从 zip 读取 '{img_name}': {e}"
-                );
-                std::process::exit(1);
-            }
-        };
-
-        // AOSP SetVbmetaFlags: patch disable-verity/verification bits
-        // before flashing vbmeta partitions.
-        let image_data = if is_vbmeta_partition(partition) {
-            match patch_vbmeta_flags(&image_data, gopts) {
-                Some(patched) => {
-                    vlog!(gopts, "[fastboot-rs] vbmeta flags patched for {img_name} ({} bytes)", patched.len());
-                    patched
-                }
-                None => image_data,
-            }
+        // Selected vbmeta transforms were executed and frozen during preflight.
+        let image_data = if let Some(data) = image.prepared_data {
+            data
         } else {
-            image_data
+            let mut entry = archive.by_name(img_name)?;
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data)?;
+            data
         };
 
         let file_size = image_data.len();
@@ -1644,7 +1694,7 @@ fn flash_image_file<T: FastbootTransport>(
         // AOSP SetVbmetaFlags: patch disable-verity/verification bits
         // before flashing vbmeta partitions.
         let image_data = if is_vbmeta_partition(partition_label) {
-            match patch_vbmeta_flags(&image_data, gopts) {
+            match patch_vbmeta_flags(&image_data, gopts)? {
                 Some(patched) => {
                     vlog!(gopts, "[fastboot-rs] vbmeta flags patched ({} bytes)", patched.len());
                     patched
@@ -1750,7 +1800,7 @@ fn flash_image_file<T: FastbootTransport>(
                     std::process::exit(1);
                 }
             };
-            match patch_vbmeta_flags(&data, gopts) {
+            match patch_vbmeta_flags(&data, gopts)? {
                 Some(patched) => {
                     vlog!(gopts, "[fastboot-rs] vbmeta flags patched ({} bytes)", patched.len());
                     Some(patched)
@@ -3077,7 +3127,7 @@ mod tests {
     fn patch_vbmeta_sets_verity_bit() {
         let data = fake_vbmeta();
         let opts = GlobalOptions { disable_verity: true, ..Default::default() };
-        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch");
+        let patched = patch_vbmeta_flags(&data, &opts).expect("valid structure").expect("should patch");
         assert_eq!(patched[123] & 0x01, 0x01, "bit 0 = disable-verity");
         assert_eq!(patched[123] & 0x02, 0x00, "bit 1 unchanged");
     }
@@ -3086,7 +3136,7 @@ mod tests {
     fn patch_vbmeta_sets_verification_bit() {
         let data = fake_vbmeta();
         let opts = GlobalOptions { disable_verification: true, ..Default::default() };
-        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch");
+        let patched = patch_vbmeta_flags(&data, &opts).expect("valid structure").expect("should patch");
         assert_eq!(patched[123] & 0x02, 0x02, "bit 1 = disable-verification");
         assert_eq!(patched[123] & 0x01, 0x00, "bit 0 unchanged");
     }
@@ -3095,7 +3145,7 @@ mod tests {
     fn patch_vbmeta_sets_both_bits() {
         let data = fake_vbmeta();
         let opts = GlobalOptions { disable_verity: true, disable_verification: true, ..Default::default() };
-        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch");
+        let patched = patch_vbmeta_flags(&data, &opts).expect("valid structure").expect("should patch");
         assert_eq!(patched[123] & 0x03, 0x03, "both bits set");
     }
 
@@ -3103,14 +3153,14 @@ mod tests {
     fn patch_vbmeta_noop_without_flags() {
         let data = fake_vbmeta();
         let opts = GlobalOptions::default();
-        assert!(patch_vbmeta_flags(&data, &opts).is_none(), "no flags → None");
+        assert!(patch_vbmeta_flags(&data, &opts).expect("unrecognized or unchanged").is_none(), "no flags → None");
     }
 
     #[test]
     fn patch_vbmeta_rejects_short_buffer() {
         let data = vec![0u8; 100];
         let opts = GlobalOptions { disable_verity: true, ..Default::default() };
-        assert!(patch_vbmeta_flags(&data, &opts).is_none(), "too short → None");
+        assert!(patch_vbmeta_flags(&data, &opts).expect("unrecognized or unchanged").is_none(), "too short → None");
     }
 
     #[test]
@@ -3118,7 +3168,7 @@ mod tests {
         let mut data = vec![0u8; 256];
         data[0..4].copy_from_slice(b"XXXX"); // wrong magic
         let opts = GlobalOptions { disable_verity: true, ..Default::default() };
-        assert!(patch_vbmeta_flags(&data, &opts).is_none(), "no AVB0 → None");
+        assert!(patch_vbmeta_flags(&data, &opts).expect("unrecognized or unchanged").is_none(), "no AVB0 → None");
     }
 
     #[test]
@@ -3131,11 +3181,14 @@ mod tests {
         // Build footer at the end
         let footer_start = data.len() - AVB_FOOTER_SIZE;
         data[footer_start..footer_start + 4].copy_from_slice(b"AVBf");
-        // vbmeta_offset as BE u64 at footer+8
-        data[footer_start + 8..footer_start + 16].copy_from_slice(&256u64.to_be_bytes());
+        // Packed AvbFooter: major=4, original_size=12, offset=20, size=28.
+        data[footer_start + 4..footer_start + 8].copy_from_slice(&1u32.to_be_bytes());
+        data[footer_start + 12..footer_start + 20].copy_from_slice(&128u64.to_be_bytes());
+        data[footer_start + 20..footer_start + 28].copy_from_slice(&256u64.to_be_bytes());
+        data[footer_start + 28..footer_start + 36].copy_from_slice(&256u64.to_be_bytes());
 
         let opts = GlobalOptions { disable_verity: true, disable_verification: true, ..Default::default() };
-        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch via footer");
+        let patched = patch_vbmeta_flags(&data, &opts).expect("valid structure").expect("should patch via footer");
         // flags LSB at 256 + 123 = 379
         assert_eq!(patched[379] & 0x03, 0x03, "both bits set via footer path");
     }
