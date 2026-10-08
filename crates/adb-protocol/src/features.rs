@@ -62,45 +62,39 @@ pub fn can_use_feature(device_features: &[String], feature: &str) -> bool {
         && host_supported_features().iter().any(|f| *f == feature)
 }
 
-/// Feature names this Rust host actually implements and may advertise on
-/// CNXN / report via `host-features`. Deliberately a subset of AOSP's list:
+/// Feature names this Rust host actually implements end-to-end and may
+/// advertise on CNXN / report via `host:host-features`. A strict subset of
+/// AOSP's `supported_features()` (transport.cpp:1202-1243); every entry has a
+/// CLI-reachable production path (audited against AOSP ~9084198a):
 ///
-/// - shell_v2 / cmd           — shell v2 framing + legacy `cmd:` service.
-/// - stat_v2 / ls_v2          — SYNC STAT_V2/LSTAT_V2/DENT_V2 codecs.
-/// - sendrecv_v2(+bro/ls4/zstd/dry_run)
-///                            — SYNC_SEND_V2/RECV_V2 + compressed DATA.
-/// - fixed_push_symlink_timestamp
-///                            — symlink push sends the target as DATA
-///                              (file_sync_client.cpp SendSmallFile parity).
+/// - `shell_v2` — `client/shell.rs` always opens `shell,v2,raw:` and decodes
+///   the ShellV2 framing (adb-protocol `shell_v2.rs`). Removing it would make
+///   our own banner misdescribe the unconditional v2 usage.
+/// - `cmd` — `client/adb_install.rs:184` uses `can_use_feature(dev, "cmd")` to
+///   select `exec:cmd package` over `exec:pm` (AOSP adb_install.cpp:62).
+/// - `apex` — streamed install appends `--apex` for `.apex` inputs
+///   (client/adb_install.cpp:68-70, 227-229).
+/// - `abb_exec` — install + incremental open the `abb_exec:` service with
+///   NUL-joined raw args (client/adb_install.cpp:73-76, 152-158, 208-210;
+///   client/commandline.h:212-222, ABB_ARG_DELIMITER = '\0').
 ///
-/// NOT advertised (unimplemented here, so we must not let a peer rely on
-/// them): remount_shell, track_app, devraw, app_info,
-/// server_status, openscreen_mdns, devicetracker_proto_format, track_mdns,
-/// fixed_push_mkdir (no recursive push yet), libusb (no libusb backend),
-/// push_sync (server-service extra AOSP appends unconditionally; we only
-/// have V1), delayed_ack (no batched-ack path yet).
+/// NOT advertised — no CLI-reachable implementation here, so a peer must not
+/// be allowed to rely on them:
+/// - `stat_v2` / `ls_v2` / `sendrecv_v2(+ _brotli/_lz4/_zstd/_dry_run_send)`:
+///   the V2 SYNC codecs exist in adb-protocol `sync.rs`, but
+///   `client/file_sync.rs` speaks only V1 STAT/LIST/SEND/RECV and `-z`
+///   compression is explicitly refused (`main_adb.rs` `sync_compression_option`).
+///   Advertising a codec without the wire path is a false capability claim.
+/// - `fixed_push_symlink_timestamp`: push does not transfer symlinks at all
+///   (`file_sync.rs` walks regular files/dirs only).
+/// - remount_shell, track_app, devraw, app_info, server_status,
+///   openscreen_mdns, devicetracker_proto_format, track_mdns, abb,
+///   fixed_push_mkdir (AOSP mkdir semantics not verified), libusb (not selected
+///   by the production usbfs backend),
+///   push_sync (server-service extra AOSP appends unconditionally; we only
+///   have V1), delayed_ack (no batched-ack path yet).
 pub fn host_supported_features() -> &'static [&'static str] {
-    &[
-        "shell_v2",
-        "cmd",
-        "stat_v2",
-        "ls_v2",
-        "sendrecv_v2",
-        "sendrecv_v2_brotli",
-        "sendrecv_v2_lz4",
-        "sendrecv_v2_zstd",
-        "sendrecv_v2_dry_run_send",
-        "fixed_push_symlink_timestamp",
-        // apex / abb_exec: implemented by the install domain —
-        // - `apex`: streamed install appends `--apex` for .apex inputs
-        //   (client/adb_install.cpp:68-70, 227-229)
-        // - `abb_exec`: install commands prefer the device `abb_exec:`
-        //   service with NUL-joined args over `exec:cmd package`
-        //   (client/adb_install.cpp:73-76, 152-158, 208-210;
-        //    client/commandline.h:212-222, ABB_ARG_DELIMITER = '\0')
-        "apex",
-        "abb_exec",
-    ]
+    &["shell_v2", "cmd", "apex", "abb_exec"]
 }
 
 /// AOSP `FeatureSetToString` (transport.cpp:1249-1251): comma-joined.
@@ -157,10 +151,13 @@ mod tests {
     #[test]
     fn test_host_supported_features_are_only_implemented_ones() {
         let f = host_supported_features();
-        // AOSP-canonical names, exact spellings (transport.cpp:81-100).
-        for name in [
-            "shell_v2",
-            "cmd",
+        // AOSP-canonical names with a CLI-reachable production path
+        // (exact spellings, transport.cpp:81-100).
+        for name in ["shell_v2", "cmd", "apex", "abb_exec"] {
+            assert!(f.contains(&name), "missing {name}");
+        }
+        // Capabilities we do NOT implement must never appear.
+        for bad in [
             "stat_v2",
             "ls_v2",
             "sendrecv_v2",
@@ -169,12 +166,20 @@ mod tests {
             "sendrecv_v2_zstd",
             "sendrecv_v2_dry_run_send",
             "fixed_push_symlink_timestamp",
+            "fixed_push_mkdir",
+            "abb",
+            "remount_shell",
+            "track_app",
+            "devraw",
+            "app_info",
+            "server_status",
+            "openscreen_mdns",
+            "devicetracker_proto_format",
+            "track_mdns",
+            "libusb",
+            "push_sync",
+            "delayed_ack",
         ] {
-            assert!(f.contains(&name), "missing {name}");
-        }
-        // Capabilities we do NOT implement must never appear.
-        // (`abb` remains unimplemented; `apex`/`abb_exec` are now advertised.)
-        for bad in ["abb", "remount_shell", "libusb", "push_sync"] {
             assert!(!f.contains(&bad), "must not advertise {bad}");
         }
     }
@@ -188,5 +193,94 @@ mod tests {
         assert!(s.contains("apex"));
         assert!(s.contains("abb_exec"));
         assert!(!s.contains("abb,") && !s.ends_with("abb"));
+    }
+
+    /// The advertised set must be exactly the set with a production
+    /// (CLI-reachable) implementation — no more, no less.
+    ///
+    /// Per-item audit (AOSP `supported_features()`, transport.cpp:1202-1243):
+    ///   shell_v2  — client/shell.rs always opens `shell,v2,raw:`; a device
+    ///               without shell_v2 was never a supported fallback here, so
+    ///               the host must keep advertising it.
+    ///   cmd       — client/adb_install.rs:184 `can_use_feature(dev, "cmd")`
+    ///               selects `exec:cmd package` over `exec:pm`
+    ///               (AOSP adb_install.cpp:62).
+    ///   apex      — client/adb_install.rs appends `--apex` for `.apex`.
+    ///   abb_exec  — client/adb_install.rs + incremental.rs speak `abb_exec:`.
+    ///
+    /// stat_v2 / ls_v2 / sendrecv_v2* / fixed_push_symlink_timestamp have no
+    /// production path (see the negative tests below), so they must not appear.
+    #[test]
+    fn advertised_features_are_exactly_the_audited_implemented_set() {
+        let mut got: Vec<&str> = host_supported_features().to_vec();
+        got.sort_unstable();
+        let mut expected = ["abb_exec", "apex", "cmd", "shell_v2"];
+        expected.sort_unstable();
+        assert_eq!(
+            got, expected,
+            "host_supported_features() must equal the audited implemented set"
+        );
+    }
+
+    /// Negative control: capabilities whose codecs exist in adb-protocol but
+    /// which no CLI path exercises must not be advertised.
+    #[test]
+    fn unimplemented_sync_and_symlink_features_are_not_advertised() {
+        let f = host_supported_features();
+        for bad in [
+            "stat_v2",
+            "ls_v2",
+            "sendrecv_v2",
+            "sendrecv_v2_brotli",
+            "sendrecv_v2_lz4",
+            "sendrecv_v2_zstd",
+            "sendrecv_v2_dry_run_send",
+            "fixed_push_symlink_timestamp",
+        ] {
+            assert!(!f.contains(&bad), "must not advertise unimplemented {bad:?}: {f:?}");
+        }
+    }
+
+    /// Negative control: a device that advertises an unimplemented capability
+    /// must not be able to unlock it, because the host half of
+    /// `CanUseFeature` (transport.cpp:1265-1268) is false.
+    #[test]
+    fn unimplemented_features_cannot_be_unlocked_by_a_device_banner() {
+        let device = [
+            "sendrecv_v2_zstd".to_string(),
+            "sendrecv_v2".to_string(),
+            "stat_v2".to_string(),
+            "ls_v2".to_string(),
+            "fixed_push_symlink_timestamp".to_string(),
+        ];
+        for bad in [
+            "sendrecv_v2_zstd",
+            "sendrecv_v2",
+            "stat_v2",
+            "ls_v2",
+            "fixed_push_symlink_timestamp",
+        ] {
+            assert!(
+                !can_use_feature(&device, bad),
+                "device banner must not unlock unimplemented {bad:?}"
+            );
+        }
+        // Positive control: features with a production path still negotiate.
+        assert!(can_use_feature(&["cmd".to_string()], "cmd"));
+        assert!(can_use_feature(&["abb_exec".to_string()], "abb_exec"));
+    }
+
+    /// The wire banner a device sees must not carry unimplemented claims.
+    #[test]
+    fn host_cnxn_payload_does_not_advertise_unimplemented_sync_v2() {
+        let s = String::from_utf8(host_cnxn_payload()).unwrap();
+        for bad in [
+            "stat_v2",
+            "ls_v2",
+            "sendrecv_v2",
+            "fixed_push_symlink_timestamp",
+        ] {
+            assert!(!s.contains(bad), "CNXN banner must not advertise {bad}: {s}");
+        }
     }
 }
