@@ -9,6 +9,8 @@
 //!
 //! Serial numbers are read from `/sys/bus/usb/devices/<name>/serial`.
 
+pub mod urb;
+
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read as _};
 use std::os::unix::io::AsRawFd;
@@ -146,6 +148,13 @@ impl std::fmt::Debug for UsbfsAdbDevice {
 }
 
 impl UsbfsAdbDevice {
+    /// Move the already claimed exclusive file description into the async URB
+    /// owner. No reopen/clone, and no concurrent synchronous bulk calls remain.
+    /// The server dispatcher is not enabled by this conversion alone.
+    pub fn into_urb_owner(self) -> urb::UsbfsUrbOwner {
+        urb::UsbfsUrbOwner::new(self.fd, self.endpoints)
+    }
+
     /// Try to open the first ADB USB device found.
     pub fn open_first() -> Result<Self, UsbAndroidError> {
         let candidates = Self::enumerate()?;
