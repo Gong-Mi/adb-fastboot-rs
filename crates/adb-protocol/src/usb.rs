@@ -62,7 +62,27 @@ pub enum UsbTransportError {
 /// Android `UsbManager` fd handoff are deployment-specific operations.  A
 /// backend can expose bulk transfers through this trait and separately adapt
 /// them to the protocol-level [`crate::Transport`] framing.
+/// Sync BULK cannot report partial progress on timeout. Such errors are terminal,
+/// not a no-data poll result; cancellation is checked between ioctl calls only.
+#[derive(Clone, Debug)]
+pub struct UsbBoundedIo {
+    pub timeout: std::time::Duration,
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsbIoCapability {
+    Unsupported,
+    /// One finite-timeout ioctl, no retry; timeout may have consumed bytes.
+    SynchronousBulk,
+}
+
 pub trait UsbTransport: Send {
+    fn bounded_io_capability(&self) -> UsbIoCapability { UsbIoCapability::Unsupported }
+    fn configure_bounded_io(&mut self, _policy: UsbBoundedIo) -> Result<(), UsbTransportError> {
+        Err(UsbTransportError::Io("bounded USB I/O is unsupported".into()))
+    }
+
     fn endpoint_info(&self) -> UsbEndpointInfo;
     fn bulk_read(&mut self, endpoint: u8, buffer: &mut [u8]) -> Result<usize, UsbTransportError>;
     fn bulk_write(&mut self, endpoint: u8, buffer: &[u8]) -> Result<usize, UsbTransportError>;
@@ -86,6 +106,12 @@ impl<T: UsbTransport> UsbTransportAdapter<T> {
     }
 
     pub fn endpoint_info(&self) -> UsbEndpointInfo { self.endpoints }
+
+    pub fn bounded_io_capability(&self) -> UsbIoCapability { self.backend.bounded_io_capability() }
+
+    pub fn configure_bounded_io(&mut self, policy: UsbBoundedIo) -> Result<(), UsbTransportError> {
+        self.backend.configure_bounded_io(policy)
+    }
 
     pub fn into_inner(self) -> T { self.backend }
 }
