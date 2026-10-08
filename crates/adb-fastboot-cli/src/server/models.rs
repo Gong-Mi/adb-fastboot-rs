@@ -5,9 +5,8 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use adb_protocol::{AdbMessageHeader, ADB_VERSION, A_AUTH, A_AUTH_TOKEN, A_CNXN, MAX_PAYLOAD_V2};
 use adb_protocol::mdns::AdbMdnsService;
 #[cfg(feature = "usb")]
 use adb_protocol::Transport;
@@ -123,19 +122,14 @@ pub(crate) struct ReverseRule {
 // Authenticated USB Transport — persisted AUTH/CNXN state
 // ---------------------------------------------------------------------------
 
-/// Holds a USB transport that has completed the AUTH/CNXN handshake.
-/// The write half (send transport) is shared behind `Arc<Mutex<>>` so
-/// multiple clients can send through the same authenticated connection.
-///
-/// The receive direction opens a separate USB fd per client bridge (usbfs
-/// allows multiple opens of the same device node), avoiding the lock
-/// contention that would arise from sharing a single fd for both directions.
+/// Sole authenticated owner. None reserves an active session/pre-auth claim.
+/// No fd clones or competing readers. A completed session invalidates the
+/// connection; watcher re-authentication happens only after exclusive close.
 #[cfg(feature = "usb")]
 pub(crate) struct AuthenticatedUsbTransport {
     pub _serial: String,
-    /// Authenticated write-side transport. Shared via Arc<Mutex<>> so
-    /// concurrent client threads serialise their send_message calls.
-    pub send_transport: Arc<Mutex<Box<dyn Transport>>>,
+    /// Taken once by a client; the busy reservation remains in the registry.
+    pub transport: Option<Box<dyn Transport>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +181,7 @@ impl TransportRegistry {
                     .into_iter()
                     .map(|c| c.serial.unwrap_or_else(|| format!("{:03}{:03}", c.bus_number, c.address)))
                     .collect();
+                self.usb_auth.retain(|serial, entry| entry.transport.is_none() || known.contains(serial));
                 self.devices.retain(|d| {
                     if matches!(d.origin, DeviceOrigin::Usb) {
                         known.contains(&d.serial)
@@ -282,112 +277,7 @@ impl TransportRegistry {
         self.devices.retain(|d| matches!(d.origin, DeviceOrigin::Usb));
     }
 
-    // -- Authenticated USB transport ---------------------------------------
 
-    /// Ensure an authenticated USB transport exists for `serial`.
-    /// Returns a clone of the `Arc` so callers can lock and send.
-    ///
-    /// On first call for a given serial this opens the USB device, runs the
-    /// full AUTH/CNXN handshake (RSA SIGNATURE + RSAKEY), then stores the
-    /// authenticated transport in `usb_auth`.
-    #[cfg(feature = "usb")]
-    pub(crate) fn ensure_usb_auth(
-        &mut self,
-        serial: &str,
-    ) -> Result<Arc<Mutex<Box<dyn Transport>>>, String> {
-        // Already authenticated — return the existing Arc clone
-        if let Some(existing) = self.usb_auth.get(serial) {
-            return Ok(Arc::clone(&existing.send_transport));
-        }
-
-        eprintln!("[adb-server] Authenticating USB transport for '{serial}'...");
-
-        use adb_protocol::usb::UsbTransportAdapter;
-        use adb_protocol::usb_android::UsbfsAdbDevice;
-
-        // 1. Open USB device
-        let usb_dev = UsbfsAdbDevice::open_by_serial(serial)
-            .map_err(|e| format!("Cannot open USB device '{serial}': {e}"))?;
-        let transport = UsbTransportAdapter::new(usb_dev);
-
-        // 2. Load ADB host auth key
-        let auth = crate::client::auth::default_auth();
-
-        // 3. Perform AUTH/CNXN handshake
-        let cnxn_payload = b"host::";
-        let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-
-        let mut t: Box<dyn Transport> = Box::new(transport);
-
-        t.send_message(&cnxn_hdr, cnxn_payload)
-            .map_err(|e| format!("CNXN send failed: {e}"))?;
-
-        let (mut resp_hdr, mut payload) = t
-            .recv_message()
-            .map_err(|e| format!("CNXN recv failed: {e}"))?;
-
-        let mut sent_signature = false;
-        let mut sent_public_key = false;
-        while resp_hdr.command == A_AUTH {
-            if resp_hdr.arg0 != A_AUTH_TOKEN {
-                return Err(format!("Unsupported AUTH request type: {}", resp_hdr.arg0));
-            }
-            if payload.len() != 20 {
-                return Err(format!(
-                    "Invalid ADB AUTH token length: {}",
-                    payload.len()
-                ));
-            }
-
-            let (auth_hdr, auth_payload) = if !sent_signature {
-                sent_signature = true;
-                auth.make_signature_message(&payload)
-                    .map_err(|e| format!("signature failed: {e}"))?
-            } else if !sent_public_key {
-                sent_public_key = true;
-                auth.make_rsakey_message()
-                    .map_err(|e| format!("rsakey failed: {e}"))?
-            } else {
-                return Err("adbd rejected the ADB RSA key after signature and public-key exchange"
-                    .to_string());
-            };
-            t.send_message(&auth_hdr, &auth_payload)
-                .map_err(|e| format!("AUTH send failed: {e}"))?;
-            (resp_hdr, payload) = t
-                .recv_message()
-                .map_err(|e| format!("AUTH recv failed: {e}"))?;
-        }
-
-        if resp_hdr.command != A_CNXN {
-            return Err(format!(
-                "Expected A_CNXN after AUTH, got cmd={:#x}",
-                resp_hdr.command
-            ));
-        }
-
-        // Persist public key on Android so subsequent SIGNATURE-only auth works
-        #[cfg(target_os = "android")]
-        {
-            if sent_public_key {
-                let _ = crate::client::auth::persist_adb_pubkey(auth);
-            }
-        }
-
-        let arc_t = Arc::new(Mutex::new(t));
-
-        self.usb_auth.insert(
-            serial.to_string(),
-            AuthenticatedUsbTransport {
-                _serial: serial.to_string(),
-                send_transport: Arc::clone(&arc_t),
-            },
-        );
-
-        eprintln!(
-            "[adb-server] USB transport for '{serial}' authenticated and cached."
-        );
-        Ok(arc_t)
-    }
 }
 
 #[cfg(test)]

@@ -33,6 +33,11 @@ pub enum TransportError {
 
 /// Send, Recv, and I/O abstraction for ADB protocol transport
 pub trait Transport: Read + Write + Send {
+    /// Opt in only for an exclusive, cancellable, progress-preserving URB owner.
+    fn enable_urb_dispatch(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "USB URB dispatcher capability unavailable"))
+    }
+
     /// Flush one ADB message. Transports that need message-level framing
     /// metadata (for example USB ZLP handling) can override this hook.
     fn flush_payload(&mut self, _payload_len: usize) -> Result<(), TransportError> {
@@ -205,6 +210,9 @@ impl Transport for TcpTransport {
 }
 
 impl Transport for Box<dyn Transport + '_> {
+    fn enable_urb_dispatch(&mut self) -> std::io::Result<()> {
+        (**self).enable_urb_dispatch()
+    }
     fn send_message(&mut self, header: &AdbMessageHeader, payload: &[u8]) -> Result<(), TransportError> {
         (**self).send_message(header, payload)
     }

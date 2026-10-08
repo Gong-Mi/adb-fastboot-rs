@@ -295,6 +295,25 @@ fn extract_serial_from_transport_cmd(
     }
 }
 
+#[cfg(feature = "usb")]
+struct UsbLease {
+    registry: Arc<Mutex<TransportRegistry>>,
+    serial: String,
+}
+#[cfg(feature = "usb")]
+impl Drop for UsbLease {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = self.registry.lock() {
+            // Every session invalidates its connection after exclusive close.
+            // Do not return a transport with unread/partially parsed frames.
+            reg.usb_auth.remove(&self.serial);
+            if let Some(d) = reg.devices.iter_mut().find(|d| d.serial == self.serial) {
+                d.state = crate::server::models::DeviceState::Offline;
+            }
+        }
+    }
+}
+
 /// Bridge the client stream to a device after transport selection.
 ///
 /// This reads hex-length-prefixed device-service commands from the client
@@ -339,22 +358,38 @@ pub(crate) fn bridge_to_device_with_smart(
         // with unread client bytes can turn that response's EOF into TCP RST.
         // Get or establish transport. Report handshake/unsupported errors through
         // the smart-socket FAIL contract, never fallback to a different backend.
+        #[cfg(feature = "usb")]
+        let mut _usb_lease = None;
         let opened = if matches!(origin, crate::server::models::DeviceOrigin::Tcp { .. }) {
             crate::server::transport::open_transport_by_origin(&origin, serial)
                 .and_then(|t| crate::server::bridge::tcp_auth_handshake(t, serial))
         } else {
-            // Do not clone a cached USB handle or claim the device a second time.
-            Err("USB server duplex dispatcher not implemented".to_string())
+            #[cfg(feature = "usb")]
+            {
+                let mut reg = registry.lock().map_err(|e| e.to_string())?;
+                match reg.usb_auth.get_mut(serial) {
+                    Some(entry) => match entry.transport.take() {
+                        Some(t) => {
+                            _usb_lease = Some(UsbLease { registry: Arc::clone(registry), serial: serial.into() });
+                            Ok(t)
+                        }
+                        None => Err("USB transport busy (exclusive dispatcher/pre-auth owner)".into()),
+                    },
+                    None => Err("USB URB dispatcher capability unavailable: no authenticated owner".into()),
+                }
+            }
+            #[cfg(not(feature = "usb"))]
+            { Err("USB URB dispatcher capability unavailable: USB feature disabled".into()) }
         };
         let transport = match opened {
             Ok(transport) => transport,
-            Err(error) => { smart.send_fail(&error)?; return Err(error); }
+            Err(error) => { eprintln!("[adb-server] service failure: {error}"); smart.send_fail(&error)?; return Err(error); }
         };
 
         // --- Device service: connect and bridge ---
         let remote = match connect_to_remote(transport, &cmd) {
             Ok(remote) => remote,
-            Err(error) => { smart.send_fail(&error)?; return Err(error); }
+            Err(error) => { eprintln!("[adb-server] service failure: {error}"); smart.send_fail(&error)?; return Err(error); }
         };
 
         // Send OKAY to client
@@ -371,6 +406,10 @@ pub(crate) fn bridge_to_device_with_smart(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "usb"))]
+#[path = "usb_dispatch_tests.rs"]
+mod usb_dispatch_tests;
 
 #[cfg(test)]
 mod tests {
@@ -455,7 +494,7 @@ mod tests {
         let mut length = [0; 4]; peer.read_exact(&mut length).unwrap();
         let len = usize::from_str_radix(std::str::from_utf8(&length).unwrap(), 16).unwrap();
         let mut error = vec![0; len]; peer.read_exact(&mut error).unwrap();
-        assert_eq!(error, b"USB server duplex dispatcher not implemented");
+        assert!(String::from_utf8(error).unwrap().contains("USB URB dispatcher capability unavailable"));
         let mut byte = [0]; assert_eq!(peer.read(&mut byte).unwrap(), 0);
         assert!(handle.join().unwrap().unwrap_err().contains("USB"));
     }
