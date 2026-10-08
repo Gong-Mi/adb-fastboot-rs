@@ -20,11 +20,11 @@ const PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 /// Close phase, tail drain: a stalled local consumer only (no byte reaches the
 /// client for this long) fails the drain. Refreshed on every byte actually
-/// written, so a slow consumer is never truncated by a fixed deadline.
+/// written, subject to the separate absolute close cap.
 const CLOSE_DRAIN_STALL: Duration = Duration::from_secs(3);
 /// Close phase, absolute ceiling for the tail drain, never refreshed. The tail
-/// is at most one MAX_PAYLOAD_V2 WRTE (1 MiB), so 30s is a ~35 KiB/s floor; a
-/// local consumer below that is dead, not merely slow.
+/// may include a live but slow consumer; this resource bound can intentionally
+/// truncate accepted output. It is not a liveness or throughput classification.
 const CLOSE_DRAIN_CAP: Duration = Duration::from_secs(30);
 const INPUT_CHUNK: usize = 4096; // safe even for legacy 4-KiB peers
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -130,7 +130,10 @@ impl Pending {
         }
     }
     fn write(&mut self, io: &mut (impl Write + ?Sized)) -> Result<bool, String> {
-        if Instant::now() >= self.until {
+        self.write_at(io, Instant::now())
+    }
+    fn write_at(&mut self, io: &mut (impl Write + ?Sized), now: Instant) -> Result<bool, String> {
+        if now >= self.until {
             return Err("bridge write timeout".into());
         }
         if self.offset == self.bytes.len() {
@@ -178,13 +181,27 @@ impl Writer {
         Ok(())
     }
     fn pump(&mut self, io: &mut dyn Transport) -> Result<bool, String> {
+        self.pump_at(io, Instant::now(), false)
+    }
+    fn pump_at(
+        &mut self,
+        io: &mut dyn Transport,
+        now: Instant,
+        closing: bool,
+    ) -> Result<bool, String> {
         let Some(frame) = self.frames.front_mut() else {
             return Ok(false);
         };
-        if Instant::now() >= frame.until {
+        // During close, Close owns flush inactivity and the absolute cap.
+        // A frame's pre-close absolute 10s budget must not override those bounds,
+        // including frames queued ahead of CLSE. Non-close deadlines are unchanged.
+        if closing {
+            frame.progressed(now);
+        }
+        if now >= frame.until {
             return Err("ADB frame write/flush timeout".into());
         }
-        let progress = frame.write(io)?;
+        let progress = frame.write_at(io, now)?;
         if frame.done() {
             match io.flush() {
                 Ok(()) => {
@@ -208,7 +225,7 @@ impl Writer {
 ///    device. Refreshed by device-side progress.
 ///  * `drain_until`: an already accepted device WRTE reaching the local client.
 ///    Refreshed by every byte that really reaches the client, so a slow but live
-///    consumer is never truncated while a truly stalled one still fails.
+///    consumer can continue up to the absolute cap; a stalled one still fails.
 ///  * `cap`: absolute ceiling for the whole phase, never refreshed, so even a
 ///    pathological trickle cannot make the close wait forever.
 struct Close {
@@ -223,6 +240,18 @@ impl Close {
             drain_until: now + CLOSE_DRAIN_STALL,
             cap: now + CLOSE_DRAIN_CAP,
         }
+    }
+    fn check(&self, now: Instant, flushing: bool, draining: bool) -> Result<(), String> {
+        if now >= self.cap {
+            return Err("close phase cap exceeded".into());
+        }
+        if flushing && now >= self.flush_until {
+            return Err("close handshake flush timeout".into());
+        }
+        if draining && now >= self.drain_until {
+            return Err("close drain timeout".into());
+        }
+        Ok(())
     }
     fn flushed(&mut self, now: Instant) {
         self.flush_until = now + CLOSE_FLUSH_TIMEOUT;
@@ -319,7 +348,9 @@ impl RemoteSocket {
                 terminal_error = Some("server bridge cancelled".into());
                 output = None; // cancellation is not output-drain success
             }
-            let mut progress = self.writer.pump(&mut *self.transport)?;
+            let mut progress = self
+                .writer
+                .pump_at(&mut *self.transport, now, closing.is_some())?;
             if progress {
                 // The queued CLSE handshake made real device-side progress: keep
                 // its flush window open. The absolute cap still bounds it.
@@ -425,19 +456,7 @@ impl RemoteSocket {
                         None => Ok(()),
                     };
                 }
-                // Absolute ceiling first: even steady trickle progress cannot
-                // extend the close phase forever.
-                if now >= close.cap {
-                    return Err("close phase cap exceeded".into());
-                }
-                // Handshake flush and tail drain are separate waits: a slow local
-                // consumer must not be cut off by the (tighter) flush deadline.
-                if !self.writer.empty() && now >= close.flush_until {
-                    return Err("close handshake flush timeout".into());
-                }
-                if output.is_some() && now >= close.drain_until {
-                    return Err("close drain timeout".into());
-                }
+                close.check(now, !self.writer.empty(), output.is_some())?;
             } else if awaiting_ack.is_some_and(|until| now >= until) {
                 return Err("device ACK timeout".into());
             }
@@ -657,7 +676,9 @@ mod tests {
         small_recv_buffer(&client);
         // The slow consumer paces itself; allow a slow initial frame parse to
         // finish without a socket read timeout masking the drain behaviour.
-        client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let active = Arc::new(AtomicBool::new(true));
         let flag = active.clone();
         let handle = thread::spawn(move || owner(server_device).bridge(server_client, &flag));
@@ -825,6 +846,140 @@ mod tests {
         let mut out = Vec::new();
         client.read_to_end(&mut out).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn close_boundaries_device_short_writes_cross_ten_seconds_preserve_wire() {
+        let start = Instant::now();
+        let mut q = Writer::default();
+        q.queue(A_WRTE, 29, 73, b"tail").unwrap();
+        q.queue(A_CLSE, 29, 73, &[]).unwrap();
+        for frame in &mut q.frames {
+            frame.until = start + PROGRESS_TIMEOUT;
+        }
+        let mut close = Close::new(start);
+        let mut io = PartialWriter {
+            bytes: vec![],
+            calls: 0,
+            flushes: 0,
+        };
+        for tick in 0..160 {
+            let now = start + Duration::from_millis(tick * 150);
+            if q.pump_at(&mut io, now, true).unwrap() {
+                close.flushed(now);
+            }
+            close.check(now, !q.empty(), false).unwrap();
+            if q.empty() {
+                break;
+            }
+        }
+        assert!(q.empty());
+        let mut expected = wire(b"WRTE", 29, 73, b"tail");
+        expected.extend(wire(b"CLSE", 29, 73, &[]));
+        assert_eq!(io.bytes, expected);
+    }
+
+    #[test]
+    fn close_boundaries_flush_stall_cap_and_near_edges() {
+        let start = Instant::now();
+        let epsilon = Duration::from_nanos(1);
+        let mut close = Close::new(start);
+        assert!(close.check(close.flush_until - epsilon, true, true).is_ok());
+        assert_eq!(
+            close.check(close.flush_until, true, true).unwrap_err(),
+            "close handshake flush timeout"
+        );
+        assert!(close
+            .check(close.drain_until - epsilon, false, true)
+            .is_ok());
+        assert_eq!(
+            close.check(close.drain_until, false, true).unwrap_err(),
+            "close drain timeout"
+        );
+        let cap = close.cap;
+        for second in 0..30 {
+            close.flushed(start + Duration::from_secs(second));
+            close.drained(start + Duration::from_secs(second));
+        }
+        assert_eq!(close.cap, cap);
+        assert!(close.check(cap - epsilon, true, true).is_ok());
+        assert_eq!(
+            close.check(cap, true, true).unwrap_err(),
+            "close phase cap exceeded"
+        );
+        // Cap wins even when both subordinate deadlines have expired.
+        assert_eq!(
+            Close::new(start).check(cap, true, true).unwrap_err(),
+            "close phase cap exceeded"
+        );
+    }
+
+    #[test]
+    fn close_boundaries_no_progress_and_nonclose_deadline_unchanged() {
+        let start = Instant::now();
+        let mut q = Writer::default();
+        q.queue(A_CLSE, 29, 73, &[]).unwrap();
+        q.frames.front_mut().unwrap().until = start + PROGRESS_TIMEOUT;
+        let mut io = PartialWriter {
+            bytes: vec![],
+            calls: 2,
+            flushes: 0,
+        };
+        let close = Close::new(start);
+        assert!(!q.pump_at(&mut io, close.flush_until, true).unwrap());
+        assert!(io.bytes.is_empty());
+        assert_eq!(
+            close.check(close.flush_until, true, false).unwrap_err(),
+            "close handshake flush timeout"
+        );
+        q.frames.front_mut().unwrap().until = start + PROGRESS_TIMEOUT;
+        assert!(q
+            .pump_at(
+                &mut io,
+                start + PROGRESS_TIMEOUT - Duration::from_nanos(1),
+                false
+            )
+            .unwrap());
+        assert_eq!(
+            q.pump_at(&mut io, start + PROGRESS_TIMEOUT, false)
+                .unwrap_err(),
+            "ADB frame write/flush timeout"
+        );
+        // Accepted plaintext with a blocked flush is not progress and cannot
+        // keep the close handshake alive or cause replay.
+        q.frames.front_mut().unwrap().offset = 24;
+        io.flushes = 0;
+        let bytes = io.bytes.clone();
+        assert!(!q.pump_at(&mut io, close.flush_until, true).unwrap());
+        assert_eq!(io.bytes, bytes);
+        assert!(close.check(close.flush_until, true, false).is_err());
+    }
+
+    #[test]
+    fn close_boundaries_full_tail_crosses_ten_seconds() {
+        let start = Instant::now();
+        let data: Vec<u8> = (0..64).collect();
+        let mut tail = Pending::new(data.clone());
+        tail.until = start + PROGRESS_TIMEOUT;
+        let mut close = Close::new(start);
+        let mut io = PartialWriter {
+            bytes: vec![],
+            calls: 0,
+            flushes: 0,
+        };
+        for tick in 0..150 {
+            let now = start + Duration::from_millis(tick * 200);
+            if tail.write_at(&mut io, now).unwrap() {
+                tail.progressed(now);
+                close.drained(now);
+            }
+            if tail.done() {
+                break;
+            }
+            close.check(now, false, true).unwrap();
+        }
+        assert!(tail.done());
+        assert_eq!(io.bytes, data);
     }
 
     #[test]
