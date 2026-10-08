@@ -13,7 +13,19 @@ use adb_protocol::{AdbMessageHeader, Transport, A_CLSE, A_OKAY, A_OPEN, A_WRTE, 
 const TICK: Duration = Duration::from_millis(2);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Close phase, handshake flush: a bounded window for the queued CLSE (and any
+/// frames already ahead of it) to reach the device. It is a tiny write, so 1s
+/// without a single accepted byte means the device side is wedged. Refreshed on
+/// real progress so a slow-but-live device is not cut off mid-handshake.
+const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+/// Close phase, tail drain: a stalled local consumer only (no byte reaches the
+/// client for this long) fails the drain. Refreshed on every byte actually
+/// written, so a slow consumer is never truncated by a fixed deadline.
+const CLOSE_DRAIN_STALL: Duration = Duration::from_secs(3);
+/// Close phase, absolute ceiling for the tail drain, never refreshed. The tail
+/// is at most one MAX_PAYLOAD_V2 WRTE (1 MiB), so 30s is a ~35 KiB/s floor; a
+/// local consumer below that is dead, not merely slow.
+const CLOSE_DRAIN_CAP: Duration = Duration::from_secs(30);
 const INPUT_CHUNK: usize = 4096; // safe even for legacy 4-KiB peers
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -137,6 +149,12 @@ impl Pending {
     fn done(&self) -> bool {
         self.offset == self.bytes.len()
     }
+    /// A byte genuinely reached the peer, so the progress window moves forward.
+    /// Only the relay's absolute close cap bounds the tail afterwards; a caller
+    /// that wants a hard deadline must enforce one separately.
+    fn progressed(&mut self, now: Instant) {
+        self.until = now + PROGRESS_TIMEOUT;
+    }
 }
 
 /// Single serial writer queue. A frame's header+payload and TLS flush complete
@@ -181,6 +199,36 @@ impl Writer {
     }
     fn empty(&self) -> bool {
         self.frames.is_empty()
+    }
+}
+
+/// Close-phase bookkeeping. Two distinct bounded waits, so a tight handshake
+/// flush deadline can never truncate a slower tail drain:
+///  * `flush_until`: the queued CLSE (plus any frames ahead of it) reaching the
+///    device. Refreshed by device-side progress.
+///  * `drain_until`: an already accepted device WRTE reaching the local client.
+///    Refreshed by every byte that really reaches the client, so a slow but live
+///    consumer is never truncated while a truly stalled one still fails.
+///  * `cap`: absolute ceiling for the whole phase, never refreshed, so even a
+///    pathological trickle cannot make the close wait forever.
+struct Close {
+    flush_until: Instant,
+    drain_until: Instant,
+    cap: Instant,
+}
+impl Close {
+    fn new(now: Instant) -> Self {
+        Self {
+            flush_until: now + CLOSE_FLUSH_TIMEOUT,
+            drain_until: now + CLOSE_DRAIN_STALL,
+            cap: now + CLOSE_DRAIN_CAP,
+        }
+    }
+    fn flushed(&mut self, now: Instant) {
+        self.flush_until = now + CLOSE_FLUSH_TIMEOUT;
+    }
+    fn drained(&mut self, now: Instant) {
+        self.drain_until = now + CLOSE_DRAIN_STALL;
     }
 }
 
@@ -259,7 +307,7 @@ impl RemoteSocket {
     fn relay(&mut self, client: &mut TcpStream, running: &AtomicBool) -> Result<(), String> {
         let mut awaiting_ack: Option<Instant> = None;
         let mut output: Option<Pending> = None;
-        let mut closing: Option<Instant> = None;
+        let mut closing: Option<Close> = None;
         let mut device_closed = false;
         let mut terminal_error: Option<String> = None;
         loop {
@@ -267,11 +315,18 @@ impl RemoteSocket {
             if !running.load(Ordering::Acquire) && closing.is_none() {
                 self.writer
                     .queue(A_CLSE, self.local_id, self.remote_id, &[])?;
-                closing = Some(now + CLOSE_TIMEOUT);
+                closing = Some(Close::new(now));
                 terminal_error = Some("server bridge cancelled".into());
                 output = None; // cancellation is not output-drain success
             }
             let mut progress = self.writer.pump(&mut *self.transport)?;
+            if progress {
+                // The queued CLSE handshake made real device-side progress: keep
+                // its flush window open. The absolute cap still bounds it.
+                if let Some(close) = closing.as_mut() {
+                    close.flushed(now);
+                }
+            }
 
             // Dispatch every frame through one reader. OKAY never goes to the
             // output consumer, and WRTE never goes to a competing ACK waiter.
@@ -301,14 +356,23 @@ impl RemoteSocket {
                                 .queue(A_CLSE, self.local_id, self.remote_id, &[])?;
                         }
                         device_closed = true;
-                        closing.get_or_insert(now + CLOSE_TIMEOUT);
+                        closing.get_or_insert(Close::new(now));
                     }
                     A_WRTE if closing.is_some() => {} // close revokes new input/output
                     _ => return Err("invalid device stream frame".into()),
                 }
             }
             if let Some(pending) = output.as_mut() {
-                progress |= pending.write(client)?;
+                let wrote = pending.write(client)?;
+                progress |= wrote;
+                if wrote {
+                    // A byte really reached the client: keep the close drain open
+                    // for a slow but live consumer. Only `close.cap` bounds it.
+                    if let Some(close) = closing.as_mut() {
+                        pending.progressed(now);
+                        close.drained(now);
+                    }
+                }
                 if pending.done() {
                     output = None;
                     // ACK only after all accepted output reaches the local socket.
@@ -324,7 +388,7 @@ impl RemoteSocket {
                     Ok(0) => {
                         self.writer
                             .queue(A_CLSE, self.local_id, self.remote_id, &[])?;
-                        closing = Some(now + CLOSE_TIMEOUT);
+                        closing = Some(Close::new(now));
                     }
                     Ok(n) => {
                         self.writer
@@ -338,7 +402,7 @@ impl RemoteSocket {
             } else if closing.is_none() && read_half_closed(client)? {
                 self.writer
                     .queue(A_CLSE, self.local_id, self.remote_id, &[])?;
-                closing = Some(now + CLOSE_TIMEOUT);
+                closing = Some(Close::new(now));
             } else if closing.is_none() {
                 // Detect client cancellation even while waiting for device ACK
                 // without consuming or buffering more input past the credit limit.
@@ -347,21 +411,31 @@ impl RemoteSocket {
                     Ok(0) => {
                         self.writer
                             .queue(A_CLSE, self.local_id, self.remote_id, &[])?;
-                        closing = Some(now + CLOSE_TIMEOUT);
+                        closing = Some(Close::new(now));
                     }
                     Ok(_) => {}
                     Err(e) if temporary(&e) => {}
                     Err(e) => return Err(format!("client peek: {e}")),
                 }
             }
-            if let Some(until) = closing {
+            if let Some(close) = closing.as_ref() {
                 if output.is_none() && self.writer.empty() {
                     return match terminal_error {
                         Some(error) => Err(error),
                         None => Ok(()),
                     };
                 }
-                if now >= until {
+                // Absolute ceiling first: even steady trickle progress cannot
+                // extend the close phase forever.
+                if now >= close.cap {
+                    return Err("close phase cap exceeded".into());
+                }
+                // Handshake flush and tail drain are separate waits: a slow local
+                // consumer must not be cut off by the (tighter) flush deadline.
+                if !self.writer.empty() && now >= close.flush_until {
+                    return Err("close handshake flush timeout".into());
+                }
+                if output.is_some() && now >= close.drain_until {
                     return Err("close drain timeout".into());
                 }
             } else if awaiting_ack.is_some_and(|until| now >= until) {
@@ -378,7 +452,7 @@ impl RemoteSocket {
                         terminal_error = Some(error);
                         device_closed = true;
                         self.writer.frames.clear();
-                        closing.get_or_insert(now + CLOSE_TIMEOUT);
+                        closing.get_or_insert(Close::new(now));
                     }
                 }
             }
@@ -433,6 +507,22 @@ mod tests {
                     s.as_raw_fd(),
                     libc::SOL_SOCKET,
                     libc::SO_SNDBUF,
+                    (&size as *const i32).cast(),
+                    std::mem::size_of::<i32>() as _,
+                )
+            },
+            0
+        );
+    }
+    fn small_recv_buffer(s: &TcpStream) {
+        use std::os::fd::AsRawFd;
+        let size = 4096i32;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
                     (&size as *const i32).cast(),
                     std::mem::size_of::<i32>() as _,
                 )
@@ -555,6 +645,85 @@ mod tests {
         );
         assert_eq!(output, data);
         assert!(handle.join().unwrap().unwrap_err().contains("EOF"));
+    }
+    // Negative control (a): a live but slow local consumer (>1s to accept the
+    // tail) must receive every accepted byte. An absolute close-phase 1s cap
+    // truncates this tail; a progress-bounded drain must not.
+    #[test]
+    fn fakewire_slow_consumer_drains_whole_tail_without_close_timeout() {
+        let (mut device, server_device) = pair();
+        let (mut client, server_client) = pair();
+        small_send_buffer(&server_client);
+        small_recv_buffer(&client);
+        // The slow consumer paces itself; allow a slow initial frame parse to
+        // finish without a socket read timeout masking the drain behaviour.
+        client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let active = Arc::new(AtomicBool::new(true));
+        let flag = active.clone();
+        let handle = thread::spawn(move || owner(server_device).bridge(server_client, &flag));
+        let data = vec![b'z'; 256 * 1024];
+        device.write_all(&wire(b"WRTE", 73, 29, &data)).unwrap();
+        device.shutdown(Shutdown::Write).unwrap();
+        // ~1 KiB every 10 ms (>=2.5 s for 256 KiB) is far slower than 1 MiB/s
+        // but makes real forward progress on every read.
+        let mut output = Vec::new();
+        let mut buf = [0u8; 1024];
+        while output.len() < data.len() {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    output.extend_from_slice(&buf[..n]);
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("slow consumer read: {e}"),
+            }
+        }
+        let error = handle.join().unwrap().unwrap_err();
+        assert_eq!(
+            output.len(),
+            data.len(),
+            "a slow consumer must not truncate an accepted tail; owner said: {error}"
+        );
+        assert_eq!(output, data);
+        assert!(
+            !error.contains("close drain timeout"),
+            "progressing drain must not hit the close deadline: {error}"
+        );
+        assert!(error.contains("EOF"), "terminal_error preserved: {error}");
+    }
+    // Negative control (b): a peer that never reads makes no progress, so the
+    // bounded close drain must still fail instead of hanging forever.
+    #[test]
+    fn fakewire_stalled_reader_still_fails_close_drain_in_bounded_time() {
+        let (mut device, server_device) = pair();
+        let (client, server_client) = pair();
+        small_send_buffer(&server_client);
+        small_recv_buffer(&client);
+        let active = Arc::new(AtomicBool::new(true));
+        let flag = active.clone();
+        let (done, wait) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            done.send(owner(server_device).bridge(server_client, &flag))
+                .unwrap();
+        });
+        let data = vec![b'z'; 256 * 1024];
+        device.write_all(&wire(b"WRTE", 73, 29, &data)).unwrap();
+        device.shutdown(Shutdown::Write).unwrap();
+        let start = Instant::now();
+        let error = wait
+            .recv_timeout(Duration::from_secs(20))
+            .expect("no-progress close drain must not hang")
+            .unwrap_err();
+        assert!(
+            error.contains("close drain timeout"),
+            "a stalled reader is a real no-progress bound: {error}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "no-progress bound must be timely, took {:?}",
+            start.elapsed()
+        );
+        handle.join().unwrap();
     }
     #[test]
     fn fakewire_cancel_silent_reader_joins_and_closes_both_peers() {
