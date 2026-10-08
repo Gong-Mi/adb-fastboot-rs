@@ -70,8 +70,8 @@ fn reconnect_service(target: Option<&str>) -> Result<&'static str, String> {
 /// The `Revision` line carries build identity, so it must never be a fixed
 /// placeholder such as `deadbeef1234`: that is fabricated evidence. The real
 /// revision is injected at build time (`ADB_RS_BUILD_REVISION`, alias
-/// `GIT_REVISION`, set by CI); when absent we report the crate version, which
-/// is still a true identity rather than an invented hash.
+/// `GIT_REVISION`); ordinary Git builds automatically inject the real HEAD.
+/// Source archives without Git metadata honestly report the crate version.
 fn version_lines() -> Vec<String> {
     vec![
         format!("Android Debug Bridge version {}", env!("CARGO_PKG_VERSION")),
@@ -86,6 +86,7 @@ fn build_revision() -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .or_else(|| option_env!("GIT_REVISION").map(str::trim).filter(|s| !s.is_empty()))
+        .or(option_env!("ADB_RS_GIT_REVISION"))
         .unwrap_or(env!("CARGO_PKG_VERSION"))
         .to_string()
 }
