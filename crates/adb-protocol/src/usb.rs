@@ -92,17 +92,19 @@ pub trait UsbTransport: Send {
 ///
 /// The backend must already represent an authorized connection. This adapter
 /// performs no device discovery or fd opening; it only maps descriptor-derived
-/// endpoints to `Read`/`Write`. ADB's 24-byte framing remains in `Transport`.
+/// endpoints to `Read`/`Write`. Its `send_message` override preserves USB transfer
+/// boundaries and fails terminally after any incomplete frame transfer.
 pub struct UsbTransportAdapter<T> {
     backend: T,
     endpoints: UsbEndpointInfo,
     pending_out_bytes: usize,
+    frame_write_failed: bool,
 }
 
 impl<T: UsbTransport> UsbTransportAdapter<T> {
     pub fn new(backend: T) -> Self {
         let endpoints = backend.endpoint_info();
-        Self { backend, endpoints, pending_out_bytes: 0 }
+        Self { backend, endpoints, pending_out_bytes: 0, frame_write_failed: false }
     }
 
     pub fn endpoint_info(&self) -> UsbEndpointInfo { self.endpoints }
@@ -111,6 +113,16 @@ impl<T: UsbTransport> UsbTransportAdapter<T> {
 
     pub fn configure_bounded_io(&mut self, policy: UsbBoundedIo) -> Result<(), UsbTransportError> {
         self.backend.configure_bounded_io(policy)
+    }
+
+    fn write_frame_transfer(&mut self, bytes: &[u8]) -> IoResult<()> {
+        let count = self.backend.bulk_write(self.endpoints.bulk_out_endpoint_address, bytes)
+            .map_err(usb_io_error)?;
+        if count != bytes.len() {
+            let kind = if count > bytes.len() { ErrorKind::InvalidData } else { ErrorKind::WriteZero };
+            return Err(IoError::new(kind, format!("USB frame transfer count {count}, expected {}", bytes.len())));
+        }
+        Ok(())
     }
 
     pub fn into_inner(self) -> T { self.backend }
@@ -191,6 +203,34 @@ impl<T: UsbTransport> Write for UsbTransportAdapter<T> {
 }
 
 impl<T: UsbTransport> Transport for UsbTransportAdapter<T> {
+    fn send_message(&mut self, header: &crate::header::AdbMessageHeader, payload: &[u8])
+        -> Result<(), crate::transport::TransportError>
+    {
+        if self.frame_write_failed {
+            return Err(IoError::new(ErrorKind::BrokenPipe, "USB frame writer failed; reopen transport").into());
+        }
+        if header.data_length as usize != payload.len() {
+            return Err(crate::transport::TransportError::Protocol("USB frame payload length mismatch".into()));
+        }
+        // AOSP client/transport_usb.cpp UsbConnection::Write: separate header
+        // and payload transfers, exact counts required. Never use write_all:
+        // a short USB transfer terminates the packet boundary, and a timeout
+        // can hide consumed bytes. Neither can safely be retried/resumed.
+        let mut bytes = [0; 24];
+        header.encode(&mut bytes);
+        self.pending_out_bytes = 0;
+        self.frame_write_failed = true;
+        self.write_frame_transfer(&bytes)?;
+        if !payload.is_empty() {
+            self.write_frame_transfer(payload)?;
+        }
+        if should_send_zlp(payload.len(), self.endpoints.out_max_packet_size) {
+            self.write_frame_transfer(&[])?;
+        }
+        self.frame_write_failed = false;
+        Ok(())
+    }
+
     fn flush_payload(&mut self, payload_len: usize) -> Result<(), crate::transport::TransportError> {
         // ADB's USB ZLP decision is based on the payload only. The 24-byte
         // ADB header is a separate transfer and must not affect the decision.
@@ -740,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_reuses_adb_framing_and_handles_short_bulk_io() {
+    fn adapter_receives_short_bulk_io_but_rejects_short_frame_write() {
         let payload = b"hello";
         let header = AdbMessageHeader::new(A_CNXN, 7, 9, payload);
         let mut encoded_header = [0u8; 24];
@@ -757,13 +797,13 @@ mod tests {
         let state = fake.state.clone();
         let mut adapter = UsbTransportAdapter::new(fake);
         let sent = AdbMessageHeader::new(A_CNXN, 1, 2, payload);
-        adapter.send_message(&sent, payload).unwrap();
+        assert!(adapter.send_message(&sent, payload).is_err());
         let (received, received_payload) = adapter.recv_message().unwrap();
         assert_eq!(received, header);
         assert_eq!(received_payload, payload);
         let writes = &state.lock().unwrap().writes;
         assert_ne!(writes.last(), Some(&Vec::new()));
-        assert_eq!(writes.iter().map(Vec::len).sum::<usize>(), 29);
+        assert_eq!(writes.iter().map(Vec::len).sum::<usize>(), 5);
     }
 
     #[test]
