@@ -36,6 +36,8 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
       - name: Verify CI failure propagation
         run: python3 -B .github/scripts/test_ci_gate.py
+      - name: Verify Git revision cache and archive fallback
+        run: python3 -B scripts/test_build_revision.py
       - name: Verify shared Rust execution gate
         run: python3 -B scripts/test_rust_test_runner.py
       - name: Check and test exact source (${{ matrix.features }})
