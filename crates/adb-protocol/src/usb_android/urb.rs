@@ -60,7 +60,7 @@ impl Syscalls for Native {
 
 /// Transfer identity; never reused during an owner's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TransferId(u64);
+pub struct TransferId(pub u64);
 /// Completion keeps progress even when the kernel reports cancellation/error.
 #[derive(Debug)]
 pub struct Completion {
@@ -240,14 +240,18 @@ impl<S: Syscalls> Drop for Engine<S> {
 }
 
 /// Consumes a claimed UsbfsAdbDevice; supports one IN and one OUT in flight.
-/// No Transport implementation yet: the server's dispatcher rejection stays.
+/// Handed to UrbFrameTransport for server handshake/dispatch.
 /// This owner is intentionally non-Clone and must not share its file description.
-/// Raw URB pointers also prevent accidental cross-thread sharing.
+/// It can move between threads but cannot be concurrently shared (not Sync).
 pub struct UsbfsUrbOwner {
     engine: Engine<Native>,
     endpoints: UsbEndpointInfo,
 }
+// SAFETY: owned URB allocations are heap-stable; moving the sole owner does not
+// move pointees. No Sync or clone is provided; ioctl access remains exclusive.
+unsafe impl Send for UsbfsUrbOwner {}
 impl UsbfsUrbOwner {
+    pub fn packet_size(&self) -> usize { usize::from(self.endpoints.out_max_packet_size) }
     pub(super) fn new(fd: File, endpoints: UsbEndpointInfo) -> Self {
         Self {
             engine: Engine::new(Native(Some(fd))),

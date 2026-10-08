@@ -124,6 +124,14 @@ fn preauth_new_usb_devices(registry: &Arc<Mutex<TransportRegistry>>) {
             "[adb-server] Pre-authenticating USB device '{serial}'..."
         );
 
+        // Reserve before claim/auth: no duplicate owner during watcher work.
+        {
+            let Ok(mut reg) = registry.lock() else { return; };
+            if reg.usb_auth.contains_key(serial) { continue; }
+            reg.usb_auth.insert(serial.clone(), AuthenticatedUsbTransport {
+                _serial: serial.clone(), transport: None,
+            });
+        }
         // Open USB transport and perform AUTH/CNXN (outside the lock)
         let transport = match connect_usb_device(serial, registry) {
             Ok(t) => t,
@@ -131,12 +139,12 @@ fn preauth_new_usb_devices(registry: &Arc<Mutex<TransportRegistry>>) {
                 eprintln!(
                     "[adb-server] Pre-auth of '{serial}' failed (will retry): {e}"
                 );
+                if let Ok(mut reg) = registry.lock() { reg.usb_auth.remove(serial); }
                 continue;
             }
         };
 
         // Store the authenticated transport in the registry (brief lock)
-        let arc_t = Arc::new(Mutex::new(transport));
         let mut reg = match registry.lock() {
             Ok(r) => r,
             Err(e) => {
@@ -150,7 +158,7 @@ fn preauth_new_usb_devices(registry: &Arc<Mutex<TransportRegistry>>) {
             serial.clone(),
             AuthenticatedUsbTransport {
                 _serial: serial.clone(),
-                send_transport: Arc::clone(&arc_t),
+                transport: Some(transport),
             },
         );
 

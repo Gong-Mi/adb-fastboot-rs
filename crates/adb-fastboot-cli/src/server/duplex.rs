@@ -271,10 +271,11 @@ pub(crate) struct RemoteSocket {
 impl RemoteSocket {
     /// Ownership moves once: handshake caller -> OPEN owner -> bridge owner.
     pub(crate) fn open(mut transport: Box<dyn Transport>, service: &str) -> Result<Self, String> {
-        // Shared USB transports intentionally fail before OPEN: enabling this
-        // requires a cached-transport-wide dispatcher, not a second USB claim.
-        transport.inner_tcp_mut().ok_or("duplex bridge requires exclusively owned TCP/TLS transport; USB dispatcher not implemented")?
-            .set_nonblocking(true).map_err(|e| e.to_string())?;
+        if let Some(socket) = transport.inner_tcp_mut() {
+            socket.set_nonblocking(true).map_err(|e| e.to_string())?;
+        } else {
+            transport.enable_urb_dispatch().map_err(|e| e.to_string())?;
+        }
         let local_id = loop {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             if id != 0 {

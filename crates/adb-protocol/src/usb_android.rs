@@ -10,6 +10,7 @@
 //! Serial numbers are read from `/sys/bus/usb/devices/<name>/serial`.
 
 pub mod urb;
+pub mod urb_transport;
 
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read as _};
