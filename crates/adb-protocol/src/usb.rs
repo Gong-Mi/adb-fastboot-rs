@@ -130,6 +130,9 @@ impl<T: UsbTransport> Read for UsbTransportAdapter<T> {
             .backend
             .bulk_read(self.endpoints.bulk_in_endpoint_address, &mut transfer)
             .map_err(usb_io_error)?;
+        if read > transfer.len() {
+            return Err(IoError::new(ErrorKind::InvalidData, "USB bulk_read returned more bytes than requested"));
+        }
         if read < buffer.len() {
             buffer[..read].copy_from_slice(&transfer[..read]);
             return Ok(read);
@@ -661,6 +664,40 @@ mod tests {
     fn rejects_unmatched_adb_candidate_without_fabricating_serial() {
         let candidates = vec![RusbAdbCandidate { serial: None, bus_number: 1, address: 7 }];
         assert!(matches!(select_adb_candidate(&candidates, RusbAdbSelector::Serial("missing")), Err(RusbUsbTransportError::NoMatchingDevice { .. })));
+    }
+
+    #[test]
+    fn adapter_preserves_short_reads_writes_and_zero_progress() {
+        for limit in [0, 3] {
+            let fake = fake();
+            let state = fake.state.clone();
+            {
+                let mut s = state.lock().unwrap();
+                s.input.extend(0..8);
+                s.read_limit = limit;
+                s.write_limit = limit;
+            }
+            let mut adapter = UsbTransportAdapter::new(fake);
+            let mut output = [0xa5; 8];
+            assert_eq!(adapter.read(&mut output).unwrap(), limit);
+            assert_eq!(&output[..limit], &(0..limit as u8).collect::<Vec<_>>());
+            assert!(output[limit..].iter().all(|b| *b == 0xa5));
+            assert_eq!(state.lock().unwrap().input.len(), 8 - limit);
+            assert_eq!(adapter.write(&[7; 8]).unwrap(), limit);
+            assert_eq!(state.lock().unwrap().writes, vec![vec![7; limit]]);
+        }
+    }
+
+    #[test]
+    fn adapter_rejects_read_count_above_transfer_buffer() {
+        struct Overcount;
+        impl UsbTransport for Overcount {
+            fn endpoint_info(&self) -> UsbEndpointInfo { fake().endpoint_info() }
+            fn bulk_read(&mut self, _: u8, b: &mut [u8]) -> Result<usize, UsbTransportError> { Ok(b.len() + 1) }
+            fn bulk_write(&mut self, _: u8, _: &[u8]) -> Result<usize, UsbTransportError> { unreachable!() }
+        }
+        let mut adapter = UsbTransportAdapter::new(Overcount);
+        assert_eq!(adapter.read(&mut [0; 8]).unwrap_err().kind(), ErrorKind::InvalidData);
     }
 
     #[test]

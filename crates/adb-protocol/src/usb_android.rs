@@ -357,11 +357,9 @@ impl UsbTransport for UsbfsAdbDevice {
             _pad: 0,
             data: buffer.as_mut_ptr(),
         };
-        let rc = unsafe { usbdevfs_ioctl(self.fd.as_raw_fd(), USBDEVFS_BULK, &mut bulk as *mut _) };
-        match rc {
-            Ok(_) => Ok(bulk.len as usize),
-            Err(e) => Err(map_io_error(e)),
-        }
+        bulk_transfer_with(&mut bulk, |bulk| unsafe {
+            usbdevfs_ioctl(self.fd.as_raw_fd(), USBDEVFS_BULK, bulk)
+        })
     }
 
     fn bulk_write(&mut self, endpoint: u8, buffer: &[u8]) -> Result<usize, UsbTransportError> {
@@ -375,11 +373,9 @@ impl UsbTransport for UsbfsAdbDevice {
             _pad: 0,
             data: buf_copy.as_mut_ptr(),
         };
-        let rc = unsafe { usbdevfs_ioctl(self.fd.as_raw_fd(), USBDEVFS_BULK, &mut bulk as *mut _) };
-        match rc {
-            Ok(_) => Ok(bulk.len as usize),
-            Err(e) => Err(map_io_error(e)),
-        }
+        bulk_transfer_with(&mut bulk, |bulk| unsafe {
+            usbdevfs_ioctl(self.fd.as_raw_fd(), USBDEVFS_BULK, bulk)
+        })
     }
 }
 
@@ -419,6 +415,20 @@ pub enum UsbAndroidError {
     Io(#[from] io::Error),
 }
 
+// Production and tests share this ioctl-result path; usbfs does not update len.
+fn bulk_transfer_with(
+    bulk: &mut UsbdevfsBulkTransfer,
+    ioctl: impl FnOnce(&mut UsbdevfsBulkTransfer) -> io::Result<i32>,
+) -> Result<usize, UsbTransportError> {
+    // Linux devio.c proc_bulk returns actual_length, not the requested len.
+    let requested = bulk.len as usize;
+    let rc = ioctl(bulk).map_err(map_io_error)?;
+    if rc < 0 || rc as usize > requested {
+        return Err(UsbTransportError::Io("USB bulk ioctl returned an invalid byte count".into()));
+    }
+    Ok(rc as usize)
+}
+
 fn map_io_error(e: io::Error) -> UsbTransportError {
     match e.kind() {
         ErrorKind::PermissionDenied => UsbTransportError::PermissionDenied,
@@ -436,6 +446,64 @@ fn map_io_error(e: io::Error) -> UsbTransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_ioctl_counts_both_directions() {
+        for ep in [0x81, 2] {
+            for actual in [0, 3, 8] {
+                let mut bytes = [0xa5; 8];
+                let mut bulk = UsbdevfsBulkTransfer {
+                    ep, len: 8, timeout: 2000, _pad: 0, data: bytes.as_mut_ptr(),
+                };
+                let count = bulk_transfer_with(&mut bulk, |b| {
+                    assert_eq!((b.ep, b.len, b.timeout), (ep, 8, 2000));
+                    if ep == 0x81 {
+                        unsafe { std::ptr::write_bytes(b.data, 0x42, actual as usize); }
+                    } else {
+                        assert_eq!(unsafe { std::slice::from_raw_parts(b.data, 8) }, &[0xa5; 8]);
+                    }
+                    Ok(actual)
+                }).unwrap();
+                assert_eq!(count, actual as usize, "endpoint {ep}");
+                if ep == 0x81 {
+                    assert_eq!(&bytes[..count], &vec![0x42; count]);
+                    assert!(bytes[count..].iter().all(|b| *b == 0xa5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_ioctl_invalid_counts_and_errno() {
+        for ep in [0x81, 2] {
+            let mut bytes = [0; 8];
+            let mut bulk = UsbdevfsBulkTransfer {
+                ep, len: 8, timeout: 0, _pad: 0, data: bytes.as_mut_ptr(),
+            };
+            assert!(bulk_transfer_with(&mut bulk, |_| Ok(9)).is_err());
+            assert!(bulk_transfer_with(&mut bulk, |_| Ok(-1)).is_err());
+            for errno in [libc::ETIMEDOUT, libc::EACCES, libc::EIO] {
+                let expected = map_io_error(io::Error::from_raw_os_error(errno)).to_string();
+                let error = bulk_transfer_with(&mut bulk, |_| Err(io::Error::from_raw_os_error(errno))).unwrap_err();
+                assert_eq!(error.to_string(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_ioctl_negative_syscall_maps_errno() {
+        let mut bytes = [0; 8];
+        let mut bulk = UsbdevfsBulkTransfer {
+            ep: 0x81, len: 8, timeout: 0, _pad: 0, data: bytes.as_mut_ptr(),
+        };
+        // Invalid fd exercises the real libc -1/errno conversion without USB.
+        let raw = unsafe { usbdevfs_ioctl(-1, USBDEVFS_BULK, &mut bulk) }.unwrap_err();
+        assert_eq!(raw.raw_os_error(), Some(libc::EBADF));
+        let error = bulk_transfer_with(&mut bulk, |b| unsafe {
+            usbdevfs_ioctl(-1, USBDEVFS_BULK, b)
+        }).unwrap_err();
+        assert_eq!(error.to_string(), map_io_error(raw).to_string());
+    }
 
     #[test]
     fn usbdevfs_bulktransfer_layout() {
