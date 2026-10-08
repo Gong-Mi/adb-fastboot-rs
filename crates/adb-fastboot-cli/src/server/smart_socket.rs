@@ -19,10 +19,13 @@ use std::net::TcpStream;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use adb_protocol::{AdbMessageHeader, SharedTransport, Transport, A_CLSE, A_OKAY, A_WRTE};
+use adb_protocol::Transport;
+
+#[path = "duplex.rs"]
+mod duplex;
+use duplex::RemoteSocket;
 
 use crate::server::models::TransportRegistry;
-use crate::server::services::device_service_to_socket;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -31,8 +34,6 @@ use crate::server::services::device_service_to_socket;
 /// Maximum hex-length-prefixed command size (AOSP `MAX_PAYLOAD` — 4 KiB).
 const MAX_CMD_LEN: usize = 4096;
 
-/// Buffer size for data relay between smart socket and remote socket.
-const RELAY_BUF_SIZE: usize = 65536;
 
 // ---------------------------------------------------------------------------
 // ASocket enum
@@ -63,74 +64,13 @@ pub(crate) enum ASocket {
 ///
 /// Mirrors AOSP's `local_socket_enqueue` / `local_socket_ready` / `local_socket_close`.
 /// In AOSP the local socket writes to its fd when data arrives from the peer;
-/// here we just hold the stream because the bridge threads own the I/O.
+/// here we just hold the stream; the single bridge owner performs the I/O.
 #[derive(Debug)]
 pub(crate) struct LocalSocket {
     /// Local socket ID (allocated monotonically, like AOSP `local_socket_next_id`).
     pub id: u32,
     /// The client TCP stream.
     pub stream: TcpStream,
-}
-
-// ---------------------------------------------------------------------------
-// RemoteSocket
-// ---------------------------------------------------------------------------
-
-/// Remote socket — sends/receives ADB protocol frames to/from a device service.
-///
-/// Mirrors AOSP's `remote_socket_enqueue` / `remote_socket_ready` / `remote_socket_shutdown` / `remote_socket_close`.
-/// Created via [`connect_to_remote`] which sends A_OPEN and waits for A_OKAY.
-pub(crate) struct RemoteSocket {
-    /// Our local ID for this stream (arg1 in A_WRTE, or arg0 in A_OKAY from peer).
-    pub local_id: u32,
-    /// The peer's (remote) ID for this stream (arg0 in A_WRTE from peer, or arg1 in A_OKAY).
-    pub remote_id: u32,
-    /// The authenticated transport to the device.
-    pub transport: Box<dyn Transport>,
-}
-
-impl RemoteSocket {
-    /// Send a WRITE frame to the device and wait for OKAY.
-    pub(crate) fn send_data(&mut self, data: &[u8]) -> Result<(), String> {
-        let wrte_hdr = AdbMessageHeader::new(A_WRTE, self.local_id, self.remote_id, data);
-        self.transport
-            .send_message(&wrte_hdr, data)
-            .map_err(|e| format!("RemoteSocket WRITE failed: {e}"))?;
-        let (ack_hdr, _) = self
-            .transport
-            .recv_message()
-            .map_err(|e| format!("RemoteSocket ACK recv failed: {e}"))?;
-        if ack_hdr.command != A_OKAY {
-            return Err(format!(
-                "RemoteSocket expected A_OKAY after WRITE, got cmd={:#010x}",
-                ack_hdr.command
-            ));
-        }
-        Ok(())
-    }
-
-    /// Send a CLOSE frame to the device.
-    pub(crate) fn send_close(&mut self) -> Result<(), String> {
-        let clse_hdr = AdbMessageHeader::new(A_CLSE, self.local_id, self.remote_id, &[]);
-        self.transport
-            .send_message(&clse_hdr, &[])
-            .map_err(|e| format!("RemoteSocket CLOSE failed: {e}"))?;
-        // A_CLSE might not get a reply, so don't wait for one.
-        Ok(())
-    }
-
-    /// Receive the next frame from the device.
-    /// Returns `(command, arg0, arg1, payload)` or `None` on disconnect.
-    pub(crate) fn recv_frame(&mut self) -> Option<(u32, u32, u32, Vec<u8>)> {
-        let (hdr, payload) = self.transport.recv_message().ok()?;
-        Some((hdr.command, hdr.arg0, hdr.arg1, payload))
-    }
-
-    /// Send an OKAY acknowledgement back to the device.
-    pub(crate) fn send_okay(&mut self, their_local_id: u32, their_remote_id: u32) {
-        let ack = AdbMessageHeader::new(A_OKAY, their_local_id, their_remote_id, &[]);
-        let _ = self.transport.send_message(&ack, &[]);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,129 +174,20 @@ impl SmartSocket {
 // connect_to_remote — open a device service via A_OPEN
 // ---------------------------------------------------------------------------
 
-/// Connect to a remote device service by sending A_OPEN over the transport.
-///
-/// Mirrors AOSP `connect_to_remote()` in `sockets.cpp` — sends A_OPEN with
-/// the service string as payload, then waits for A_OKAY from adbd.
-///
-/// Returns a `RemoteSocket` on success containing the local/remote IDs and
-/// a *cloned* transport handle (the original `transport` is unchanged).
-/// This lets the caller keep using the original transport for further
-/// A_OPEN calls while the `RemoteSocket` drives its own clone.
-///
-/// # Errors
-///
-/// Returns an error string if:
-/// - The transport fails to send A_OPEN or receive the response.
-/// - The device responds with anything other than A_OKAY (e.g. A_CLSE).
-/// - The transport does not support cloning.
+/// Move the exclusively owned transport to its only frame reader/writer.
 pub(crate) fn connect_to_remote(
-    transport: &mut Box<dyn Transport>,
+    transport: Box<dyn Transport>,
     service: &str,
 ) -> Result<RemoteSocket, String> {
-    let (local_id, remote_id) = device_service_to_socket(service, transport)?;
-
-    // Clone the transport so RemoteSocket owns its own handle.  The original
-    // transport stays with the caller for reuse.
-    let cloned = transport
-        .try_clone_box()
-        .ok_or_else(|| format!("Transport for '{}' cannot be cloned", service))?;
-
-    Ok(RemoteSocket {
-        local_id,
-        remote_id,
-        transport: cloned,
-    })
+    RemoteSocket::open(transport, service)
 }
 
-// ---------------------------------------------------------------------------
-// bridge_smart_remote — bidirectional relay
-// ---------------------------------------------------------------------------
-
-/// Bridge data between a smart socket (client TcpStream) and a remote socket
-/// (device transport stream).
-///
-/// Mirrors AOSP's smart socket + remote socket pairing after
-/// `connect_to_remote` succeeds.  Spawns two threads:
-///
-/// - **Device → Client**: reads ADB frames (A_WRTE / A_CLSE) from the device
-///   transport, sends OKAY back to the device, and writes payload to the
-///   client stream.
-/// - **Client → Device**: reads raw data from the client stream, sends A_WRTE
-///   to the device, waits for A_OKAY, and repeats until EOF or error.
-///
-/// The function blocks until both threads finish.
-///
-/// # Arguments
-///
-/// * `client` — the client's `TcpStream` (cloned for the reader thread).
-/// * `remote` — the `RemoteSocket` to bridge with.
-///
-/// # Returns
-///
-/// `Ok(())` on clean disconnect, `Err(...)` on protocol failure.
 pub(crate) fn bridge_smart_remote(
-    mut client: TcpStream,
-    mut remote: RemoteSocket,
+    client: TcpStream,
+    remote: RemoteSocket,
+    running: &AtomicBool,
 ) -> Result<(), String> {
-    let client_clone = client
-        .try_clone()
-        .map_err(|e| format!("client clone: {e}"))?;
-
-    // --- Thread 1: Device → Client ---
-    let mut dev_transport = remote.transport.try_clone_box()
-        .ok_or_else(|| "transport cannot be cloned for device→client relay".to_string())?;
-    let mut client_writer = client_clone;
-    let dev_to_client = std::thread::Builder::new()
-        .name("dev-to-client".to_string())
-        .spawn(move || -> Result<(), String> {
-            loop {
-                let (hdr, payload) = dev_transport
-                    .recv_message()
-                    .map_err(|_| "device→client: device disconnected".to_string())?;
-                match hdr.command {
-                    A_WRTE => {
-                        // Acknowledge the WRITE
-                        let ack = AdbMessageHeader::new(A_OKAY, hdr.arg1, hdr.arg0, &[]);
-                        let _ = dev_transport.send_message(&ack, &[]);
-                        // Forward payload to client
-                        client_writer
-                            .write_all(&payload)
-                            .map_err(|_| "device→client: client write failed".to_string())?;
-                    }
-                    A_CLSE => {
-                        // Acknowledge the CLOSE
-                        let ack = AdbMessageHeader::new(A_CLSE, hdr.arg1, hdr.arg0, &[]);
-                        let _ = dev_transport.send_message(&ack, &[]);
-                        break;
-                    }
-                    _ => {
-                        // Ignore unexpected frames (OKAY, etc.)
-                    }
-                }
-            }
-            Ok(())
-        })
-        .map_err(|e| format!("spawn dev→client thread: {e}"))?;
-
-    // --- Thread 2: Client → Device ---
-    let mut buf = [0u8; RELAY_BUF_SIZE];
-    loop {
-        let n = client
-            .read(&mut buf)
-            .map_err(|_| "client→device: client read failed".to_string())?;
-        if n == 0 {
-            // Client closed — send CLOSE to device
-            let _ = remote.send_close();
-            break;
-        }
-        remote.send_data(&buf[..n])?;
-    }
-
-    // Wait for device→client thread to finish
-    let _ = dev_to_client.join();
-
-    Ok(())
+    remote.bridge(client, running)
 }
 
 // ---------------------------------------------------------------------------
@@ -422,7 +253,7 @@ pub(crate) fn run_smart_socket_loop(
             if is_transport_cmd {
                 // Transport selected — enter bridge mode.
                 let serial = extract_serial_from_transport_cmd(&cmd, registry)?;
-                return bridge_to_device_with_smart(client, &serial, registry);
+                return bridge_to_device_with_smart(client, &serial, registry, running);
             }
         } else {
             // Non-host command (e.g. shell,v2,raw:...) with no transport selected
@@ -464,14 +295,34 @@ fn extract_serial_from_transport_cmd(
     }
 }
 
+#[cfg(feature = "usb")]
+struct UsbLease {
+    registry: Arc<Mutex<TransportRegistry>>,
+    serial: String,
+}
+#[cfg(feature = "usb")]
+impl Drop for UsbLease {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = self.registry.lock() {
+            // Every session invalidates its connection after exclusive close.
+            // Do not return a transport with unread/partially parsed frames.
+            reg.usb_auth.remove(&self.serial);
+            if let Some(d) = reg.devices.iter_mut().find(|d| d.serial == self.serial) {
+                d.state = crate::server::models::DeviceState::Offline;
+            }
+        }
+    }
+}
+
 /// Bridge the client stream to a device after transport selection.
 ///
 /// This reads hex-length-prefixed device-service commands from the client
 /// and bridges them to the device via `connect_to_remote` + `bridge_smart_remote`.
-fn bridge_to_device_with_smart(
+pub(crate) fn bridge_to_device_with_smart(
     client: TcpStream,
     serial: &str,
     registry: &Arc<Mutex<TransportRegistry>>,
+    running: &AtomicBool,
 ) -> Result<(), String> {
     let (origin, _is_tcp) = {
         let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
@@ -482,28 +333,8 @@ fn bridge_to_device_with_smart(
 
     let origin = origin.ok_or_else(|| format!("device '{serial}' not found"))?;
 
-    // Get or establish transport
-    let mut transport = if matches!(origin, crate::server::models::DeviceOrigin::Tcp { .. }) {
-        // TCP: open raw transport and authenticate inline
-        let t = crate::server::transport::open_transport_by_origin(&origin, serial)?;
-        crate::server::bridge::tcp_auth_handshake(t, serial)?
-    } else {
-        // USB: use authenticated transport from registry
-        #[cfg(feature = "usb")]
-        {
-            let mut reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-            let transport_arc = reg.ensure_usb_auth(serial)?;
-            drop(reg);
-            Box::new(SharedTransport::new(transport_arc)) as Box<dyn Transport>
-        }
-        #[cfg(not(feature = "usb"))]
-        {
-            return Err("USB transport not supported (compile with --features usb)".to_string());
-        }
-    };
-
-    // Now read device-service commands and bridge each one
     let mut smart = SmartSocket::new(client.try_clone().map_err(|e| format!("clone: {e}"))?);
+    // Now read device-service commands and bridge one raw session.
 
     loop {
         let cmd = match smart.read_command()? {
@@ -523,14 +354,49 @@ fn bridge_to_device_with_smart(
             continue;
         }
 
+        // Consume the service request before reporting FAIL. Closing a socket
+        // with unread client bytes can turn that response's EOF into TCP RST.
+        // Get or establish transport. Report handshake/unsupported errors through
+        // the smart-socket FAIL contract, never fallback to a different backend.
+        #[cfg(feature = "usb")]
+        let mut _usb_lease = None;
+        let opened = if matches!(origin, crate::server::models::DeviceOrigin::Tcp { .. }) {
+            crate::server::transport::open_transport_by_origin(&origin, serial)
+                .and_then(|t| crate::server::bridge::tcp_auth_handshake(t, serial))
+        } else {
+            #[cfg(feature = "usb")]
+            {
+                let mut reg = registry.lock().map_err(|e| e.to_string())?;
+                match reg.usb_auth.get_mut(serial) {
+                    Some(entry) => match entry.transport.take() {
+                        Some(t) => {
+                            _usb_lease = Some(UsbLease { registry: Arc::clone(registry), serial: serial.into() });
+                            Ok(t)
+                        }
+                        None => Err("USB transport busy (exclusive dispatcher/pre-auth owner)".into()),
+                    },
+                    None => Err("USB URB dispatcher capability unavailable: no authenticated owner".into()),
+                }
+            }
+            #[cfg(not(feature = "usb"))]
+            { Err("USB URB dispatcher capability unavailable: USB feature disabled".into()) }
+        };
+        let transport = match opened {
+            Ok(transport) => transport,
+            Err(error) => { eprintln!("[adb-server] service failure: {error}"); smart.send_fail(&error)?; return Err(error); }
+        };
+
         // --- Device service: connect and bridge ---
-        let remote = connect_to_remote(&mut transport, &cmd)?;
+        let remote = match connect_to_remote(transport, &cmd) {
+            Ok(remote) => remote,
+            Err(error) => { eprintln!("[adb-server] service failure: {error}"); smart.send_fail(&error)?; return Err(error); }
+        };
 
         // Send OKAY to client
         smart.send_okay()?;
 
         // Bridge bidirectionally
-        bridge_smart_remote(client, remote)?;
+        bridge_smart_remote(client, remote, running)?;
 
         // After bridge returns, we're done with this connection
         return Ok(());
@@ -540,6 +406,10 @@ fn bridge_to_device_with_smart(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "usb"))]
+#[path = "usb_dispatch_tests.rs"]
+mod usb_dispatch_tests;
 
 #[cfg(test)]
 mod tests {
@@ -601,6 +471,32 @@ mod tests {
         assert_eq!(std::str::from_utf8(&msg).unwrap(), "test error");
 
         server.join().unwrap();
+    }
+
+    #[test]
+    fn cached_usb_origin_fails_before_claim_or_open() {
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        registry.lock().unwrap().devices.push(DeviceEntry {
+            serial: "fake-usb-no-hardware".into(), transport_id: 42,
+            state: DeviceState::Device, origin: DeviceOrigin::Usb,
+            product: None, model: None, device_name: None, transport_features: None,
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let handle = thread::spawn(move || {
+            bridge_to_device_with_smart(server, "fake-usb-no-hardware", &registry, &AtomicBool::new(true))
+        });
+        peer.write_all(b"0008exec:cat").unwrap();
+        let mut status = [0; 4]; peer.read_exact(&mut status).unwrap();
+        assert_eq!(&status, b"FAIL");
+        let mut length = [0; 4]; peer.read_exact(&mut length).unwrap();
+        let len = usize::from_str_radix(std::str::from_utf8(&length).unwrap(), 16).unwrap();
+        let mut error = vec![0; len]; peer.read_exact(&mut error).unwrap();
+        assert!(String::from_utf8(error).unwrap().contains("USB URB dispatcher capability unavailable"));
+        let mut byte = [0]; assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        assert!(handle.join().unwrap().unwrap_err().contains("USB"));
     }
 
     #[test]

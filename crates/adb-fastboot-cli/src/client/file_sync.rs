@@ -19,6 +19,7 @@
 //!   bridge (which strips ADB framing).
 
 use std::fs;
+use std::io::{self, Read};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -103,10 +104,31 @@ pub fn pull(
     local: &str,
     preserve: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Priority 1: ADB server
-    let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
-    if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
-        if server.switch_transport(serial).is_ok() {
+    // Existing CLI reaches configured server sockets via environment. The
+    // -P/-L CLI flags can use pull_at once the owning entrypoint is integrated.
+    pull_at(
+        crate::resolve_server_port(None, None),
+        serial,
+        remote,
+        local,
+        preserve,
+    )
+}
+
+pub fn pull_at(
+    server_port: u16,
+    serial: Option<&str>,
+    remote: &str,
+    local: &str,
+    preserve: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Explicit TCP selectors mean direct adbd, as in open_adb_transport.
+    if !serial.is_some_and(|value| value.contains(':')) {
+        let server_addr = format!("127.0.0.1:{server_port}");
+        if let Ok(mut server) =
+            AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300))
+        {
+            server.switch_transport(serial)?;
             server.send_host_request("sync:")?;
             server.read_status()?;
             return pull_file_server(&mut server, remote, local, preserve);
@@ -515,6 +537,172 @@ fn push_file_direct(
     Ok(())
 }
 
+/// One direct SYNC channel is a byte stream, not one SYNC message per WRTE.
+/// Keep surplus bytes across STAT/RECV, and retain replies arriving before the
+/// request's transport ACK (protocol::send_wrte currently discards those).
+struct DirectSyncReader<'a> {
+    transport: &'a mut dyn Transport,
+    local_id: u32,
+    remote_id: u32,
+    pending: Vec<u8>,
+    position: usize,
+}
+
+impl<'a> DirectSyncReader<'a> {
+    fn new(transport: &'a mut dyn Transport, local_id: u32, remote_id: u32) -> Self {
+        Self {
+            transport,
+            local_id,
+            remote_id,
+            pending: Vec::new(),
+            position: 0,
+        }
+    }
+
+    fn receive(&mut self) -> io::Result<u32> {
+        let (header, payload) = self.transport.recv_message().map_err(io::Error::other)?;
+        if (header.arg0, header.arg1) != (self.remote_id, self.local_id) {
+            return Err(io::Error::other(
+                "Wrong ADB stream ids on direct SYNC channel",
+            ));
+        }
+        match header.command {
+            A_WRTE => {
+                let ack = AdbMessageHeader::new(A_OKAY, self.local_id, header.arg0, &[]);
+                self.transport
+                    .send_message(&ack, &[])
+                    .map_err(io::Error::other)?;
+                if self.position == self.pending.len() {
+                    self.pending.clear();
+                    self.position = 0;
+                }
+                if self.pending.len().saturating_add(payload.len())
+                    > adb_protocol::MAX_PAYLOAD_V2 as usize
+                {
+                    return Err(io::Error::other(
+                        "Too much buffered direct SYNC response data",
+                    ));
+                }
+                self.pending.extend_from_slice(&payload);
+            }
+            A_OKAY => {}
+            A_CLSE => {
+                let close = AdbMessageHeader::new(A_CLSE, self.local_id, header.arg0, &[]);
+                self.transport
+                    .send_message(&close, &[])
+                    .map_err(io::Error::other)?;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Sync connection closed prematurely",
+                ));
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "Unexpected ADB command on direct SYNC channel",
+                ))
+            }
+        }
+        Ok(header.command)
+    }
+
+    fn send_request(&mut self, request: &[u8]) -> io::Result<()> {
+        let header = AdbMessageHeader::new(A_WRTE, self.local_id, self.remote_id, request);
+        self.transport
+            .send_message(&header, request)
+            .map_err(io::Error::other)?;
+        while self.receive()? != A_OKAY {}
+        Ok(())
+    }
+}
+
+impl Read for DirectSyncReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        while self.position == self.pending.len() {
+            self.receive()?;
+        }
+        let count = output.len().min(self.pending.len() - self.position);
+        output[..count].copy_from_slice(&self.pending[self.position..self.position + count]);
+        self.position += count;
+        Ok(count)
+    }
+}
+
+/// Read only transfer/status framing. DATA and FAIL have lengths; DONE/OKAY
+/// have no data. Reject other ids and unbounded lengths before allocating.
+fn read_pull_response(
+    reader: &mut dyn Read,
+) -> Result<(SyncMessageHeader, Vec<u8>), Box<dyn std::error::Error>> {
+    let mut header = [0u8; 8];
+    reader.read_exact(&mut header)?;
+    let header = SyncMessageHeader::decode(&header)?;
+    let mut payload = Vec::new();
+    match header.id {
+        SYNC_DATA | SYNC_FAIL => {
+            if header.length as usize > MAX_CHUNK {
+                return Err("SYNC DATA/FAIL length exceeds 64 KiB".into());
+            }
+            payload.resize(header.length as usize, 0);
+            reader.read_exact(&mut payload)?;
+        }
+        SYNC_DONE | SYNC_OKAY if header.length == 0 => {}
+        other => {
+            return Err(format!(
+                "Unexpected sync id/size {other:#x}/{} during pull",
+                header.length
+            )
+            .into())
+        }
+    }
+    Ok((header, payload))
+}
+
+fn read_stat_response(reader: &mut dyn Read) -> Result<FileStat, Box<dyn std::error::Error>> {
+    let mut wire = [0u8; SyncStatResponse::WIRE_SIZE];
+    reader.read_exact(&mut wire[..4])?;
+    let id = u32::from_le_bytes(wire[..4].try_into().unwrap());
+    if id == SYNC_FAIL {
+        reader.read_exact(&mut wire[4..8])?;
+        let length = u32::from_le_bytes(wire[4..8].try_into().unwrap()) as usize;
+        if length > MAX_CHUNK {
+            return Err("SYNC FAIL length exceeds 64 KiB".into());
+        }
+        let mut message = vec![0; length];
+        reader.read_exact(&mut message)?;
+        return Err(format!(
+            "Sync FAIL during stat: {}",
+            String::from_utf8_lossy(&message)
+        )
+        .into());
+    }
+    if id != SYNC_STAT {
+        return Err(format!("Unexpected sync id {id:#x} during stat").into());
+    }
+    reader.read_exact(&mut wire[4..])?;
+    let stat = SyncStatResponse::decode_v1_message(&wire)?;
+    // AOSP FinishStat rejects the all-zero V1 response (lstat failed).
+    if !stat.exists() {
+        return Err("STAT request returned no result: remote path unavailable".into());
+    }
+    Ok(FileStat {
+        mode: stat.mode,
+        size: stat.size,
+        mtime: stat.mtime,
+    })
+}
+
+fn stat_on_direct_channel(
+    reader: &mut DirectSyncReader<'_>,
+    path: &str,
+) -> Result<FileStat, Box<dyn std::error::Error>> {
+    let mut request = Vec::new();
+    build_sync_stat_req(path, &mut request)?;
+    reader.send_request(&request)?;
+    read_stat_response(reader)
+}
+
 /// Pull a file via direct transport (ADB WRTE framing).
 fn pull_file_direct(
     transport: &mut dyn Transport,
@@ -525,8 +713,9 @@ fn pull_file_direct(
     preserve: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("[adb-rs] Pulling '{}' -> '{}'", remote, local);
+    let mut reader = DirectSyncReader::new(transport, local_id, remote_id);
     let attrs = if preserve {
-        Some(stat_direct_inner(transport, local_id, remote_id, remote)?)
+        Some(stat_on_direct_channel(&mut reader, remote)?)
     } else {
         None
     };
@@ -534,34 +723,22 @@ fn pull_file_direct(
     let mut recv_buf = Vec::new();
     build_sync_recv_req(remote, &mut recv_buf)
         .map_err(|e| format!("Build RECV req failed: {e}"))?;
-    protocol::send_wrte(transport, local_id, remote_id, &recv_buf)?;
+    reader.send_request(&recv_buf)?;
 
     let mut file_data = Vec::new();
     loop {
-        let (hdr, payload) = transport.recv_message()?;
-        match hdr.command {
-            A_OKAY => {}
-            A_WRTE => {
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                transport.send_message(&ack, &[])?;
-                if payload.len() < SyncMessageHeader::SIZE {
-                    return Err("Sync response too short during pull".into());
-                }
-                let sync_hdr = SyncMessageHeader::decode(&payload)
-                    .map_err(|e| format!("Bad sync header during pull: {e}"))?;
-                match sync_hdr.id {
-                    SYNC_DATA => file_data.extend_from_slice(&payload[SyncMessageHeader::SIZE..]),
-                    // AOSP RECV ends with DONE; retain OKAY for existing peers.
-                    SYNC_DONE | SYNC_OKAY => break,
-                    SYNC_FAIL => return Err(format!(
-                        "Sync FAIL during pull: {}",
-                        String::from_utf8_lossy(&payload[SyncMessageHeader::SIZE..])
-                    ).into()),
-                    other => return Err(format!("Unexpected sync id {other:#x} during pull").into()),
-                }
+        let (header, payload) = read_pull_response(&mut reader)?;
+        match header.id {
+            SYNC_DATA => file_data.extend_from_slice(&payload),
+            SYNC_DONE | SYNC_OKAY => break,
+            SYNC_FAIL => {
+                return Err(format!(
+                    "Sync FAIL during pull: {}",
+                    String::from_utf8_lossy(&payload)
+                )
+                .into())
             }
-            A_CLSE => return Err("Sync connection closed prematurely".into()),
-            _ => {}
+            _ => unreachable!("read_pull_response validates ids"),
         }
     }
 
@@ -609,40 +786,10 @@ fn stat_direct_inner(
     remote_id: u32,
     remote_path: &str,
 ) -> Result<FileStat, Box<dyn std::error::Error>> {
-    let mut req_buf = Vec::new();
-    build_sync_stat_req(remote_path, &mut req_buf)
-        .map_err(|e| format!("Build STAT req failed: {e}"))?;
-    protocol::send_wrte(transport, local_id, remote_id, &req_buf)?;
-
-    loop {
-        let (hdr, payload) = transport.recv_message()?;
-        match hdr.command {
-            A_OKAY => {}
-            A_WRTE => {
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                transport.send_message(&ack, &[])?;
-                if payload.len() < SyncMessageHeader::SIZE {
-                    return Err("Sync response too short during stat".into());
-                }
-                let sync_hdr = SyncMessageHeader::decode(&payload)
-                    .map_err(|e| format!("Bad sync header during stat: {e}"))?;
-                match sync_hdr.id {
-                    SYNC_STAT => {
-                        let s = SyncStatResponse::decode(&payload[SyncMessageHeader::SIZE..])
-                            .map_err(|e| format!("Bad STAT response: {e}"))?;
-                        return Ok(FileStat { mode: s.mode, size: s.size, mtime: s.mtime });
-                    }
-                    SYNC_FAIL => return Err(format!(
-                        "Sync FAIL during stat: {}",
-                        String::from_utf8_lossy(&payload[SyncMessageHeader::SIZE..])
-                    ).into()),
-                    other => return Err(format!("Unexpected sync id {other:#x} during stat").into()),
-                }
-            }
-            A_CLSE => return Err("Sync connection closed during stat".into()),
-            _ => {}
-        }
-    }
+    stat_on_direct_channel(
+        &mut DirectSyncReader::new(transport, local_id, remote_id),
+        remote_path,
+    )
 }
 
 /// Push multiple files via a single direct-mode sync connection.
@@ -798,66 +945,15 @@ fn stat_direct(
     remote_id: u32,
     remote_path: &str,
 ) -> Result<FileStat, Box<dyn std::error::Error>> {
-    let mut req_buf = Vec::new();
-    build_sync_stat_req(remote_path, &mut req_buf)
-        .map_err(|e| format!("Build STAT req failed: {e}"))?;
-    protocol::send_wrte(transport, local_id, remote_id, &req_buf)?;
-
-    let mut stat_result: Option<FileStat> = None;
-    loop {
-        let (hdr, payload) = transport.recv_message()?;
-
-        match hdr.command {
-            A_OKAY => { /* WRTE ack — skip */ }
-            A_WRTE => {
-                let ack = AdbMessageHeader::new(A_OKAY, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-
-                if payload.len() < 8 {
-                    return Err("Sync response too short during stat".into());
-                }
-
-                let sync_hdr = SyncMessageHeader::decode(&payload)
-                    .map_err(|e| format!("Bad sync header during stat: {e}"))?;
-
-                match sync_hdr.id {
-                    SYNC_STAT => {
-                        let s = SyncStatResponse::decode(&payload[8..])
-                            .map_err(|e| format!("Bad STAT response: {e}"))?;
-                        stat_result = Some(FileStat {
-                            mode: s.mode,
-                            size: s.size,
-                            mtime: s.mtime,
-                        });
-                    }
-                    SYNC_OKAY => {
-                        // After STAT data — done
-                        break;
-                    }
-                    SYNC_FAIL => {
-                        let msg = String::from_utf8_lossy(&payload[8..]).to_string();
-                        return Err(format!("Sync FAIL during stat: {msg}").into());
-                    }
-                    other => {
-                        return Err(format!("Unexpected sync id {other:#x} during stat").into());
-                    }
-                }
-            }
-            A_CLSE => {
-                let ack = AdbMessageHeader::new(A_CLSE, local_id, hdr.arg0, &[]);
-                let _ = transport.send_message(&ack, &[]);
-                break;
-            }
-            _ => {}
-        }
+    // STAT is complete after its 16 bytes; adbd sends no extra SYNC_OKAY.
+    let result = stat_direct_inner(transport, local_id, remote_id, remote_path)?;
+    let close = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
+    transport.send_message(&close, &[])?;
+    let (header, _) = transport.recv_message()?;
+    if header.command != A_CLSE || (header.arg0, header.arg1) != (remote_id, local_id) {
+        return Err("Expected direct SYNC close acknowledgement".into());
     }
-
-    // Close sync connection
-    let clse_hdr = AdbMessageHeader::new(A_CLSE, local_id, remote_id, &[]);
-    transport.send_message(&clse_hdr, &[])?;
-    let _ = transport.recv_message();
-
-    stat_result.ok_or_else(|| "STAT request returned no result".into())
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -955,30 +1051,21 @@ fn pull_file_server(
         .map_err(|e| format!("Build RECV req failed: {e}"))?;
     write_raw_sync(transport, &recv_buf)?;
 
-    // Read DATA chunks until DONE or FAIL
+    // Read exact DATA bodies; transport read boundaries are not SYNC boundaries.
     let mut file_data = Vec::new();
     loop {
-        let (sync_hdr, payload) = read_raw_sync(transport)?;
-
-        match sync_hdr.id {
-            SYNC_DATA => {
-                file_data.extend_from_slice(&payload);
-            }
-            SYNC_DENT => {
-                // DENT response — file metadata, not expected for single-file pull
-                file_data.extend_from_slice(&payload);
-            }
-            SYNC_DONE | SYNC_OKAY => {
-                // AOSP RECV terminates with DONE; retain OKAY for existing peers.
-                break;
-            }
+        let (header, payload) = read_pull_response(transport)?;
+        match header.id {
+            SYNC_DATA => file_data.extend_from_slice(&payload),
+            SYNC_DONE | SYNC_OKAY => break,
             SYNC_FAIL => {
-                let msg = String::from_utf8_lossy(&payload).to_string();
-                return Err(format!("Sync FAIL during pull: {msg}").into());
+                return Err(format!(
+                    "Sync FAIL during pull: {}",
+                    String::from_utf8_lossy(&payload)
+                )
+                .into())
             }
-            other => {
-                return Err(format!("Unexpected sync id {other:#x} during pull").into());
-            }
+            _ => unreachable!("read_pull_response validates ids"),
         }
     }
 
@@ -1120,24 +1207,7 @@ fn stat_server(
         .map_err(|e| format!("Build STAT req failed: {e}"))?;
     write_raw_sync(transport, &req_buf)?;
 
-    let (sync_hdr, payload) = read_raw_sync(transport)?;
-    match sync_hdr.id {
-        SYNC_STAT => {
-            let s = SyncStatResponse::decode(&payload)
-                .map_err(|e| format!("Bad STAT response: {e}"))?;
-            Ok(FileStat {
-                mode: s.mode,
-                size: s.size,
-                mtime: s.mtime,
-            })
-        }
-        SYNC_OKAY => Err("STAT request returned no data".into()),
-        SYNC_FAIL => {
-            let msg = String::from_utf8_lossy(&payload).to_string();
-            Err(format!("Sync FAIL during stat: {msg}").into())
-        }
-        other => Err(format!("Unexpected sync id {other:#x} during stat").into()),
-    }
+    read_stat_response(transport)
 }
 
 #[cfg(test)]
@@ -1341,21 +1411,110 @@ mod tests {
         [encoded.as_slice(), payload].concat()
     }
 
+    struct BytewiseTransport(ScriptedTransport);
+    impl Read for BytewiseTransport {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let length = buf.len().min(1);
+            self.0.read(&mut buf[..length])
+        }
+    }
+    impl Write for BytewiseTransport {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+    impl Transport for BytewiseTransport {}
+
+    #[test]
+    fn stat_direct_finishes_after_16_bytes_without_extra_sync_okay_at_every_split() {
+        let wire = [
+            b"STAT".as_slice(),
+            &0o100600u32.to_le_bytes(),
+            &6u32.to_le_bytes(),
+            &1_720_000_000u32.to_le_bytes(),
+        ]
+        .concat();
+        for split in 1..=wire.len() {
+            let mut script = adb_frame(A_OKAY, 41, 7, &[]);
+            script.extend(adb_frame(A_WRTE, 41, 7, &wire[..split]));
+            if split < wire.len() {
+                script.extend(adb_frame(A_WRTE, 41, 7, &wire[split..]));
+            }
+            // Only the ADB close acknowledgement, never an extra SYNC_OKAY.
+            script.extend(adb_frame(A_CLSE, 41, 7, &[]));
+            let mut peer = ScriptedTransport {
+                reads: Cursor::new(script),
+                writes: Vec::new(),
+            };
+            let stat = stat_direct(&mut peer, 7, 41, "/remote/file").unwrap();
+            assert_eq!(
+                (stat.mode, stat.size, stat.mtime),
+                (0o100600, 6, 1_720_000_000)
+            );
+            assert_eq!(peer.reads.position(), peer.reads.get_ref().len() as u64);
+            let close = AdbMessageHeader::decode(&peer.writes[peer.writes.len() - 24..]).unwrap();
+            assert_eq!((close.command, close.arg0, close.arg1), (A_CLSE, 7, 41));
+        }
+    }
+
+    #[test]
+    fn stat_server_one_byte_reads_and_all_truncated_prefixes_fail_closed() {
+        let wire = [
+            b"STAT".as_slice(),
+            &0o100600u32.to_le_bytes(),
+            &6u32.to_le_bytes(),
+            &1_720_000_000u32.to_le_bytes(),
+        ]
+        .concat();
+        for length in 0..=wire.len() {
+            let mut peer = BytewiseTransport(ScriptedTransport {
+                reads: Cursor::new(wire[..length].to_vec()),
+                writes: Vec::new(),
+            });
+            let result = stat_server(&mut peer, "/remote/file");
+            assert_eq!(result.is_ok(), length == 16, "STAT prefix {length}");
+        }
+    }
+
+    #[test]
+    fn stat_server_reads_aosp_fixed_16_bytes_without_consuming_next_message() {
+        let stat = [
+            b"STAT".as_slice(),
+            &0o100600u32.to_le_bytes(),
+            &6u32.to_le_bytes(),
+            &1_720_000_000u32.to_le_bytes(),
+        ]
+        .concat();
+        let mut transport = ScriptedTransport {
+            reads: Cursor::new([stat.as_slice(), b"NEXT"].concat()),
+            writes: Vec::new(),
+        };
+        let result = stat_server(&mut transport, "/remote/file").unwrap();
+        assert_eq!(
+            (result.mode, result.size, result.mtime),
+            (0o100600, 6, 1_720_000_000)
+        );
+        assert_eq!(transport.reads.position(), 16);
+    }
+
     #[test]
     fn pull_with_preserve_stats_then_receives_and_applies_remote_mtime_and_mode() {
-        let mut stat_payload = Vec::new();
-        let stat = SyncStatResponse { mode: 0o100600, size: 6, mtime: 1_720_000_000 };
-        let mut encoded_stat = [0u8; SyncStatResponse::SIZE];
-        stat.encode(&mut encoded_stat);
-        let mut stat_header = [0u8; SyncMessageHeader::SIZE];
-        SyncMessageHeader::new(SYNC_STAT, SyncStatResponse::SIZE as u32).encode(&mut stat_header);
-        stat_payload.extend_from_slice(&stat_header);
-        stat_payload.extend_from_slice(&encoded_stat);
+        // Independent AOSP @9084198a file_sync_protocol.h:48-53 vector:
+        // [id, mode, size, mtime], NOT [id, length, mode, size, mtime].
+        let stat_payload = [
+            b"STAT".as_slice(),
+            &0o100600u32.to_le_bytes(),
+            &6u32.to_le_bytes(),
+            &1_720_000_000u32.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(stat_payload.len(), 16);
 
-        let mut data_payload = Vec::new();
-        build_sync_data_chunk(b"pulled", &mut data_payload).unwrap();
-        let mut done_payload = [0u8; SyncMessageHeader::SIZE];
-        SyncMessageHeader::new(SYNC_DONE, 0).encode(&mut done_payload);
+        let data_payload = [b"DATA".as_slice(), &6u32.to_le_bytes(), b"pulled"].concat();
+        let done_payload = [b"DONE".as_slice(), &0u32.to_le_bytes()].concat();
 
         let script = [
             adb_frame(A_OKAY, 2, 1, &[]),

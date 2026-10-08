@@ -33,3 +33,7 @@ byteorder = "1.5"
 inotify = "0.11"
 zip = { version = "2" }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+# Independent test-only persisted-key/SPKI oracle; already cached by adb-protocol.
+rsa = { version = "0.9", features = ["pem"] }

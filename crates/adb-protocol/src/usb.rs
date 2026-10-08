@@ -62,7 +62,27 @@ pub enum UsbTransportError {
 /// Android `UsbManager` fd handoff are deployment-specific operations.  A
 /// backend can expose bulk transfers through this trait and separately adapt
 /// them to the protocol-level [`crate::Transport`] framing.
+/// Sync BULK cannot report partial progress on timeout. Such errors are terminal,
+/// not a no-data poll result; cancellation is checked between ioctl calls only.
+#[derive(Clone, Debug)]
+pub struct UsbBoundedIo {
+    pub timeout: std::time::Duration,
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsbIoCapability {
+    Unsupported,
+    /// One finite-timeout ioctl, no retry; timeout may have consumed bytes.
+    SynchronousBulk,
+}
+
 pub trait UsbTransport: Send {
+    fn bounded_io_capability(&self) -> UsbIoCapability { UsbIoCapability::Unsupported }
+    fn configure_bounded_io(&mut self, _policy: UsbBoundedIo) -> Result<(), UsbTransportError> {
+        Err(UsbTransportError::Io("bounded USB I/O is unsupported".into()))
+    }
+
     fn endpoint_info(&self) -> UsbEndpointInfo;
     fn bulk_read(&mut self, endpoint: u8, buffer: &mut [u8]) -> Result<usize, UsbTransportError>;
     fn bulk_write(&mut self, endpoint: u8, buffer: &[u8]) -> Result<usize, UsbTransportError>;
@@ -72,20 +92,38 @@ pub trait UsbTransport: Send {
 ///
 /// The backend must already represent an authorized connection. This adapter
 /// performs no device discovery or fd opening; it only maps descriptor-derived
-/// endpoints to `Read`/`Write`. ADB's 24-byte framing remains in `Transport`.
+/// endpoints to `Read`/`Write`. Its `send_message` override preserves USB transfer
+/// boundaries and fails terminally after any incomplete frame transfer.
 pub struct UsbTransportAdapter<T> {
     backend: T,
     endpoints: UsbEndpointInfo,
     pending_out_bytes: usize,
+    frame_write_failed: bool,
 }
 
 impl<T: UsbTransport> UsbTransportAdapter<T> {
     pub fn new(backend: T) -> Self {
         let endpoints = backend.endpoint_info();
-        Self { backend, endpoints, pending_out_bytes: 0 }
+        Self { backend, endpoints, pending_out_bytes: 0, frame_write_failed: false }
     }
 
     pub fn endpoint_info(&self) -> UsbEndpointInfo { self.endpoints }
+
+    pub fn bounded_io_capability(&self) -> UsbIoCapability { self.backend.bounded_io_capability() }
+
+    pub fn configure_bounded_io(&mut self, policy: UsbBoundedIo) -> Result<(), UsbTransportError> {
+        self.backend.configure_bounded_io(policy)
+    }
+
+    fn write_frame_transfer(&mut self, bytes: &[u8]) -> IoResult<()> {
+        let count = self.backend.bulk_write(self.endpoints.bulk_out_endpoint_address, bytes)
+            .map_err(usb_io_error)?;
+        if count != bytes.len() {
+            let kind = if count > bytes.len() { ErrorKind::InvalidData } else { ErrorKind::WriteZero };
+            return Err(IoError::new(kind, format!("USB frame transfer count {count}, expected {}", bytes.len())));
+        }
+        Ok(())
+    }
 
     pub fn into_inner(self) -> T { self.backend }
 }
@@ -130,6 +168,9 @@ impl<T: UsbTransport> Read for UsbTransportAdapter<T> {
             .backend
             .bulk_read(self.endpoints.bulk_in_endpoint_address, &mut transfer)
             .map_err(usb_io_error)?;
+        if read > transfer.len() {
+            return Err(IoError::new(ErrorKind::InvalidData, "USB bulk_read returned more bytes than requested"));
+        }
         if read < buffer.len() {
             buffer[..read].copy_from_slice(&transfer[..read]);
             return Ok(read);
@@ -162,6 +203,34 @@ impl<T: UsbTransport> Write for UsbTransportAdapter<T> {
 }
 
 impl<T: UsbTransport> Transport for UsbTransportAdapter<T> {
+    fn send_message(&mut self, header: &crate::header::AdbMessageHeader, payload: &[u8])
+        -> Result<(), crate::transport::TransportError>
+    {
+        if self.frame_write_failed {
+            return Err(IoError::new(ErrorKind::BrokenPipe, "USB frame writer failed; reopen transport").into());
+        }
+        if header.data_length as usize != payload.len() {
+            return Err(crate::transport::TransportError::Protocol("USB frame payload length mismatch".into()));
+        }
+        // AOSP client/transport_usb.cpp UsbConnection::Write: separate header
+        // and payload transfers, exact counts required. Never use write_all:
+        // a short USB transfer terminates the packet boundary, and a timeout
+        // can hide consumed bytes. Neither can safely be retried/resumed.
+        let mut bytes = [0; 24];
+        header.encode(&mut bytes);
+        self.pending_out_bytes = 0;
+        self.frame_write_failed = true;
+        self.write_frame_transfer(&bytes)?;
+        if !payload.is_empty() {
+            self.write_frame_transfer(payload)?;
+        }
+        if should_send_zlp(payload.len(), self.endpoints.out_max_packet_size) {
+            self.write_frame_transfer(&[])?;
+        }
+        self.frame_write_failed = false;
+        Ok(())
+    }
+
     fn flush_payload(&mut self, payload_len: usize) -> Result<(), crate::transport::TransportError> {
         // ADB's USB ZLP decision is based on the payload only. The 24-byte
         // ADB header is a separate transfer and must not affect the decision.
@@ -664,6 +733,40 @@ mod tests {
     }
 
     #[test]
+    fn adapter_preserves_short_reads_writes_and_zero_progress() {
+        for limit in [0, 3] {
+            let fake = fake();
+            let state = fake.state.clone();
+            {
+                let mut s = state.lock().unwrap();
+                s.input.extend(0..8);
+                s.read_limit = limit;
+                s.write_limit = limit;
+            }
+            let mut adapter = UsbTransportAdapter::new(fake);
+            let mut output = [0xa5; 8];
+            assert_eq!(adapter.read(&mut output).unwrap(), limit);
+            assert_eq!(&output[..limit], &(0..limit as u8).collect::<Vec<_>>());
+            assert!(output[limit..].iter().all(|b| *b == 0xa5));
+            assert_eq!(state.lock().unwrap().input.len(), 8 - limit);
+            assert_eq!(adapter.write(&[7; 8]).unwrap(), limit);
+            assert_eq!(state.lock().unwrap().writes, vec![vec![7; limit]]);
+        }
+    }
+
+    #[test]
+    fn adapter_rejects_read_count_above_transfer_buffer() {
+        struct Overcount;
+        impl UsbTransport for Overcount {
+            fn endpoint_info(&self) -> UsbEndpointInfo { fake().endpoint_info() }
+            fn bulk_read(&mut self, _: u8, b: &mut [u8]) -> Result<usize, UsbTransportError> { Ok(b.len() + 1) }
+            fn bulk_write(&mut self, _: u8, _: &[u8]) -> Result<usize, UsbTransportError> { unreachable!() }
+        }
+        let mut adapter = UsbTransportAdapter::new(Overcount);
+        assert_eq!(adapter.read(&mut [0; 8]).unwrap_err().kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn adapter_reads_into_packet_aligned_usb_buffer() {
         let fake = fake();
         let state = fake.state.clone();
@@ -677,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_reuses_adb_framing_and_handles_short_bulk_io() {
+    fn adapter_receives_short_bulk_io_but_rejects_short_frame_write() {
         let payload = b"hello";
         let header = AdbMessageHeader::new(A_CNXN, 7, 9, payload);
         let mut encoded_header = [0u8; 24];
@@ -694,13 +797,13 @@ mod tests {
         let state = fake.state.clone();
         let mut adapter = UsbTransportAdapter::new(fake);
         let sent = AdbMessageHeader::new(A_CNXN, 1, 2, payload);
-        adapter.send_message(&sent, payload).unwrap();
+        assert!(adapter.send_message(&sent, payload).is_err());
         let (received, received_payload) = adapter.recv_message().unwrap();
         assert_eq!(received, header);
         assert_eq!(received_payload, payload);
         let writes = &state.lock().unwrap().writes;
         assert_ne!(writes.last(), Some(&Vec::new()));
-        assert_eq!(writes.iter().map(Vec::len).sum::<usize>(), 29);
+        assert_eq!(writes.iter().map(Vec::len).sum::<usize>(), 5);
     }
 
     #[test]

@@ -34,6 +34,10 @@ pub enum SparseError {
     BlockCountMismatch { expected: u32, got: u64 },
     #[error("Unknown chunk type: {0:#x}")]
     UnknownChunkType(u16),
+    #[error("Chunk count mismatch: header {expected}, chunks {got}")]
+    ChunkCountMismatch { expected: u32, got: usize },
+    #[error("Sparse size arithmetic overflow: {0}")]
+    SizeOverflow(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,47 +88,38 @@ impl SparseHeader {
         if buf.len() < Self::SIZE {
             return Err(SparseError::HeaderTooShort(buf.len()));
         }
+        let header = Self {
+            magic: LittleEndian::read_u32(&buf[0..4]),
+            major_version: LittleEndian::read_u16(&buf[4..6]),
+            minor_version: LittleEndian::read_u16(&buf[6..8]),
+            file_hdr_sz: LittleEndian::read_u16(&buf[8..10]),
+            chunk_hdr_sz: LittleEndian::read_u16(&buf[10..12]),
+            blk_sz: LittleEndian::read_u32(&buf[12..16]),
+            total_blks: LittleEndian::read_u32(&buf[16..20]),
+            total_chunks: LittleEndian::read_u32(&buf[20..24]),
+            image_checksum: LittleEndian::read_u32(&buf[24..28]),
+        };
+        header.validate_format()?;
+        Ok(header)
+    }
 
-        let magic = LittleEndian::read_u32(&buf[0..4]);
-        if magic != SPARSE_HEADER_MAGIC {
-            return Err(SparseError::InvalidMagic(magic));
+    fn validate_format(&self) -> Result<(), SparseError> {
+        if self.magic != SPARSE_HEADER_MAGIC {
+            return Err(SparseError::InvalidMagic(self.magic));
         }
-
-        let major_version = LittleEndian::read_u16(&buf[4..6]);
-        let minor_version = LittleEndian::read_u16(&buf[6..8]);
-        if major_version != 1 {
+        if self.major_version != 1 {
             return Err(SparseError::UnsupportedVersion {
-                major: major_version,
-                minor: minor_version,
+                major: self.major_version,
+                minor: self.minor_version,
             });
         }
-
-        let file_hdr_sz = LittleEndian::read_u16(&buf[8..10]);
-        if file_hdr_sz < Self::SIZE as u16 {
-            return Err(SparseError::InvalidFileHeaderSize(file_hdr_sz));
+        if self.file_hdr_sz < Self::SIZE as u16 {
+            return Err(SparseError::InvalidFileHeaderSize(self.file_hdr_sz));
         }
-
-        let chunk_hdr_sz = LittleEndian::read_u16(&buf[10..12]);
-        if chunk_hdr_sz < SparseChunkHeader::SIZE as u16 {
-            return Err(SparseError::InvalidChunkHeaderSize(chunk_hdr_sz));
+        if self.chunk_hdr_sz < SparseChunkHeader::SIZE as u16 {
+            return Err(SparseError::InvalidChunkHeaderSize(self.chunk_hdr_sz));
         }
-
-        let blk_sz = LittleEndian::read_u32(&buf[12..16]);
-        let total_blks = LittleEndian::read_u32(&buf[16..20]);
-        let total_chunks = LittleEndian::read_u32(&buf[20..24]);
-        let image_checksum = LittleEndian::read_u32(&buf[24..28]);
-
-        Ok(Self {
-            magic,
-            major_version,
-            minor_version,
-            file_hdr_sz,
-            chunk_hdr_sz,
-            blk_sz,
-            total_blks,
-            total_chunks,
-            image_checksum,
-        })
+        Ok(())
     }
 }
 
@@ -393,99 +388,29 @@ impl SparseFile {
         raw
     }
 
-    pub fn from_bytes(buf: &[u8]) -> Result<Self, SparseError> {
-        let header = SparseHeader::decode(buf)?;
-        let mut offset = header.file_hdr_sz as usize;
-        let mut chunks = Vec::with_capacity(header.total_chunks as usize);
-
-        for _ in 0..header.total_chunks {
-            if offset + (header.chunk_hdr_sz as usize) > buf.len() {
-                return Err(SparseError::HeaderTooShort(buf.len()));
-            }
-
-            let chunk_hdr = SparseChunkHeader::decode(&buf[offset..])?;
-            let payload_offset = offset + (header.chunk_hdr_sz as usize);
-            if (chunk_hdr.total_sz as usize) < (header.chunk_hdr_sz as usize) {
-                return Err(SparseError::InvalidChunkHeaderSize(chunk_hdr.total_sz as u16));
-            }
-            let payload_len = (chunk_hdr.total_sz as usize) - (header.chunk_hdr_sz as usize);
-
-            if payload_offset + payload_len > buf.len() {
-                return Err(SparseError::ChunkPayloadTooShort {
-                    expected: payload_offset + payload_len,
-                    got: buf.len(),
-                });
-            }
-
-            match chunk_hdr.chunk_type {
-                CHUNK_TYPE_RAW => {
-                    let expected_len = chunk_hdr.chunk_sz as usize * header.blk_sz as usize;
-                    if payload_len != expected_len {
-                        return Err(SparseError::ChunkPayloadTooShort {
-                            expected: expected_len,
-                            got: payload_len,
-                        });
-                    }
-                }
-                CHUNK_TYPE_FILL => {
-                    if payload_len != 4 {
-                        return Err(SparseError::ChunkPayloadTooShort {
-                            expected: 4,
-                            got: payload_len,
-                        });
-                    }
-                }
-                CHUNK_TYPE_DONT_CARE => {
-                    if payload_len != 0 {
-                        return Err(SparseError::ChunkPayloadTooShort {
-                            expected: 0,
-                            got: payload_len,
-                        });
-                    }
-                }
-                CHUNK_TYPE_CRC32 => {
-                    if payload_len != 4 {
-                        return Err(SparseError::ChunkPayloadTooShort {
-                            expected: 4,
-                            got: payload_len,
-                        });
-                    }
-                }
-                other => return Err(SparseError::UnknownChunkType(other)),
-            }
-
-            let payload = buf[payload_offset..payload_offset + payload_len].to_vec();
-            chunks.push(SparseChunk {
-                chunk_type: chunk_hdr.chunk_type,
-                chunk_blocks: chunk_hdr.chunk_sz,
-                payload,
-            });
-
-            offset += chunk_hdr.total_sz as usize;
-        }
-
-        Ok(Self { header, chunks })
-    }
-
-    /// Resparse downloads for repeated flashes of the same partition. Each
-    /// download starts at block zero, so gaps (including other downloads' data)
-    /// must be DONT_CARE chunks and every download must retain the full span.
-    /// This mirrors libsparse sparse_file_resparse/write_all_blocks, not payload
-    /// concatenation. Original whole-image checksums do not describe a split.
-    pub fn split(&self, max_size: usize) -> Result<Vec<Self>, SparseError> {
+    /// Structural validation shared by parsing and resparse. Checksums are
+    /// deliberately not verified (the existing libsparse crc=false contract).
+    /// CRC32 has four payload bytes but must contribute zero output blocks.
+    /// Empty files remain valid; zero-length data chunks do not.
+    fn validate(&self) -> Result<(), SparseError> {
+        self.header.validate_format()?;
         let blk_sz = self.header.blk_sz as usize;
-        if blk_sz == 0 {
-            return Err(SparseError::InvalidBlockSize(0));
+        if blk_sz == 0 || blk_sz % 4 != 0 {
+            return Err(SparseError::InvalidBlockSize(self.header.blk_sz));
         }
-
-        // Validate before slicing or entering the retry loop. SparseFile/chunks
-        // are public and may also come from a malformed on-wire image.
+        if self.chunks.len() != self.header.total_chunks as usize {
+            return Err(SparseError::ChunkCountMismatch {
+                expected: self.header.total_chunks,
+                got: self.chunks.len(),
+            });
+        }
         let mut total_blocks = 0u64;
+        let mut wire_size = self.header.file_hdr_sz as usize;
         for chunk in &self.chunks {
             let expected = match chunk.chunk_type {
                 CHUNK_TYPE_RAW => (chunk.chunk_blocks as usize)
                     .checked_mul(blk_sz)
-                    .ok_or(SparseError::InvalidChunkSize(chunk.chunk_blocks))?,
+                    .ok_or(SparseError::SizeOverflow("RAW block bytes"))?,
                 CHUNK_TYPE_FILL | CHUNK_TYPE_CRC32 => 4,
                 CHUNK_TYPE_DONT_CARE => 0,
                 other => return Err(SparseError::UnknownChunkType(other)),
@@ -503,7 +428,21 @@ impl SparseFile {
                     got: chunk.payload.len(),
                 });
             }
-            total_blocks += u64::from(chunk.chunk_blocks);
+            // FILL and DONT_CARE expand without a corresponding wire payload;
+            // check their logical byte lengths as well as RAW's multiplication.
+            (chunk.chunk_blocks as usize)
+                .checked_mul(blk_sz)
+                .ok_or(SparseError::SizeOverflow("logical chunk bytes"))?;
+            let chunk_size = (self.header.chunk_hdr_sz as usize)
+                .checked_add(chunk.payload.len())
+                .ok_or(SparseError::SizeOverflow("chunk wire size"))?;
+            u32::try_from(chunk_size).map_err(|_| SparseError::SizeOverflow("chunk total_sz"))?;
+            wire_size = wire_size
+                .checked_add(chunk_size)
+                .ok_or(SparseError::SizeOverflow("file wire size"))?;
+            total_blocks = total_blocks
+                .checked_add(u64::from(chunk.chunk_blocks))
+                .ok_or(SparseError::SizeOverflow("logical block sum"))?;
         }
         if total_blocks != u64::from(self.header.total_blks) {
             return Err(SparseError::BlockCountMismatch {
@@ -511,6 +450,63 @@ impl SparseFile {
                 got: total_blocks,
             });
         }
+        (self.header.total_blks as usize)
+            .checked_mul(blk_sz)
+            .ok_or(SparseError::SizeOverflow("logical image bytes"))?;
+        Ok(())
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, SparseError> {
+        let header = SparseHeader::decode(buf)?;
+        let mut offset = header.file_hdr_sz as usize;
+        if offset > buf.len() {
+            return Err(SparseError::HeaderTooShort(buf.len()));
+        }
+        // total_chunks is untrusted. Do not reserve memory from it before
+        // proving the corresponding chunk headers actually exist in the input.
+        let mut chunks = Vec::new();
+        for _ in 0..header.total_chunks {
+            let payload_offset = offset
+                .checked_add(header.chunk_hdr_sz as usize)
+                .ok_or(SparseError::SizeOverflow("chunk header offset"))?;
+            if payload_offset > buf.len() {
+                return Err(SparseError::HeaderTooShort(buf.len()));
+            }
+            let chunk_hdr = SparseChunkHeader::decode(&buf[offset..payload_offset])?;
+            let payload_len = (chunk_hdr.total_sz as usize)
+                .checked_sub(header.chunk_hdr_sz as usize)
+                .ok_or(SparseError::InvalidChunkSize(chunk_hdr.total_sz))?;
+            let end = payload_offset
+                .checked_add(payload_len)
+                .ok_or(SparseError::SizeOverflow("chunk payload end"))?;
+            let payload =
+                buf.get(payload_offset..end)
+                    .ok_or(SparseError::ChunkPayloadTooShort {
+                        expected: end,
+                        got: buf.len(),
+                    })?;
+            chunks.push(SparseChunk {
+                chunk_type: chunk_hdr.chunk_type,
+                chunk_blocks: chunk_hdr.chunk_sz,
+                payload: payload.to_vec(),
+            });
+            offset = end;
+        }
+        let file = Self { header, chunks };
+        file.validate()?;
+        Ok(file)
+    }
+
+    /// Resparse downloads for repeated flashes of the same partition. Each
+    /// download starts at block zero, so gaps (including other downloads' data)
+    /// must be DONT_CARE chunks and every download must retain the full span.
+    /// This mirrors libsparse sparse_file_resparse/write_all_blocks, not payload
+    /// concatenation. Original whole-image checksums do not describe a split.
+    pub fn split(&self, max_size: usize) -> Result<Vec<Self>, SparseError> {
+        // Public structs may be mutated after parsing. Reuse the same strict
+        // validator rather than maintaining a second set of format semantics.
+        self.validate()?;
+        let blk_sz = self.header.blk_sz as usize;
         let span = self.header.total_blks;
         let header_size = SparseHeader::SIZE;
         let chunk_header = SparseChunkHeader::SIZE;
@@ -627,6 +623,305 @@ impl SparseFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Independent wire fixtures from AOSP libsparse/sparse_format.h and
+    // sparse_read.cpp @545d2487e38192a2ce25040897ced877cf6b4f53. Never use
+    // SparseFile::encode: it rewrites total_blks and would hide bad headers.
+    fn sparse_wire(block_size: u32, total_blocks: u32, chunks: &[(u16, u32, &[u8])]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(0xed26ff3au32.to_le_bytes());
+        for value in [1u16, 0, 28, 12] {
+            bytes.extend(value.to_le_bytes());
+        }
+        for value in [block_size, total_blocks, chunks.len() as u32, 0] {
+            bytes.extend(value.to_le_bytes());
+        }
+        for &(kind, blocks, payload) in chunks {
+            bytes.extend(kind.to_le_bytes());
+            bytes.extend(0u16.to_le_bytes());
+            bytes.extend(blocks.to_le_bytes());
+            bytes.extend((12 + payload.len() as u32).to_le_bytes());
+            bytes.extend(payload);
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_parse_rejects_wrong_logical_block_sum_without_split() {
+        for (declared, chunks, got) in [
+            (2, vec![(0xcac3, 1, &[][..])], 1),
+            (1, vec![(0xcac3, 2, &[][..])], 2),
+            (1, vec![], 0),
+            // Wide checked accumulation, not u32 wrapping back to zero.
+            (
+                0,
+                vec![(0xcac3, u32::MAX, &[][..]), (0xcac3, 1, &[][..])],
+                0x1_0000_0000,
+            ),
+        ] {
+            assert_eq!(
+                SparseFile::from_bytes(&sparse_wire(4096, declared, &chunks)),
+                Err(SparseError::BlockCountMismatch {
+                    expected: declared,
+                    got
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_and_split_reject_the_same_bad_block_and_payload_contracts() {
+        for (block_size, declared, chunks) in [
+            (0, 0, vec![]),
+            (6, 1, vec![(0xcac2, 1, &b"FILL"[..])]),
+            (4096, 1, vec![(0xcac4, 1, &b"CRC!"[..])]),
+            (4096, 0, vec![(0xcac1, 0, &[][..])]),
+            (4096, 0, vec![(0xcac2, 0, &b"FILL"[..])]),
+            (4096, 0, vec![(0xcac3, 0, &[][..])]),
+            (4096, 1, vec![(0xcac1, 1, &b"SHORT"[..])]),
+            (4096, 1, vec![(0xcac2, 1, &b"TOO LONG"[..])]),
+            (4096, 1, vec![(0xcac3, 1, &b"x"[..])]),
+            (4096, 0, vec![(0xcac4, 0, &b"x"[..])]),
+            (4096, 0, vec![(0xffff, 0, &[][..])]),
+            // Multiplication must not wrap to the tiny actual payload.
+            (
+                0xffff_fffc,
+                0xffff_ffff,
+                vec![(0xcac1, 0xffff_ffff, &[][..])],
+            ),
+        ] {
+            let bytes = sparse_wire(block_size, declared, &chunks);
+            let file = SparseFile {
+                header: SparseHeader::decode(&bytes).unwrap(),
+                chunks: chunks
+                    .iter()
+                    .map(|&(kind, blocks, payload)| SparseChunk {
+                        chunk_type: kind,
+                        chunk_blocks: blocks,
+                        payload: payload.to_vec(),
+                    })
+                    .collect(),
+            };
+            let parsed = SparseFile::from_bytes(&bytes);
+            let split = file.split(65536);
+            assert!(parsed.is_err(), "parser accepted {file:?}");
+            assert!(split.is_err(), "split accepted {file:?}");
+            assert_eq!(
+                parsed.unwrap_err(),
+                split.unwrap_err(),
+                "validation drift: {file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_checks_extended_header_bounds_even_for_empty_image() {
+        let mut bytes = sparse_wire(4096, 0, &[]);
+        bytes[8..10].copy_from_slice(&36u16.to_le_bytes());
+        assert!(
+            SparseFile::from_bytes(&bytes).is_err(),
+            "missing extended header bytes"
+        );
+        bytes.extend([0; 8]);
+        assert!(SparseFile::from_bytes(&bytes).unwrap().chunks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_rejects_crc_output_blocks_without_split() {
+        let bytes = sparse_wire(4096, 1, &[(0xcac4, 1, &b"CRC!"[..])]);
+        assert_eq!(
+            SparseFile::from_bytes(&bytes),
+            Err(SparseError::InvalidChunkSize(1))
+        );
+    }
+
+    #[test]
+    fn test_parse_framing_and_counts_fail_closed_without_large_reserves() {
+        let mut bytes = sparse_wire(4096, 1, &[(0xcac3, 1, &[])]);
+        bytes[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            SparseFile::from_bytes(&bytes),
+            Err(SparseError::HeaderTooShort(_))
+        ));
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            SparseFile::from_bytes(&bytes),
+            Err(SparseError::ChunkPayloadTooShort { .. })
+        ));
+        for size in [0u32, 1, 11] {
+            bytes[36..40].copy_from_slice(&size.to_le_bytes());
+            assert_eq!(
+                SparseFile::from_bytes(&bytes),
+                Err(SparseError::InvalidChunkSize(size))
+            );
+        }
+        let bytes = sparse_wire(
+            16,
+            3,
+            &[
+                (0xcac1, 1, &[0x11; 16]),
+                (0xcac2, 1, &b"FILL"[..]),
+                (0xcac3, 1, &[]),
+            ],
+        );
+        for end in 0..bytes.len() {
+            assert!(
+                SparseFile::from_bytes(&bytes[..end]).is_err(),
+                "truncated image accepted at {end}"
+            );
+        }
+        let mut file = SparseFile::from_bytes(&bytes).unwrap();
+        file.header.total_chunks = 2;
+        assert_eq!(
+            file.split(65536),
+            Err(SparseError::ChunkCountMismatch {
+                expected: 2,
+                got: 3
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_preserves_empty_fill_holes_extensions_and_unverified_crc() {
+        let pattern = [0x78, 0x56, 0x34, 0x12];
+        for bytes in [
+            sparse_wire(4096, 0, &[]), // existing Rust empty-image contract
+            sparse_wire(4096, 2, &[(0xcac2, 2, &pattern)]),
+            sparse_wire(4096, 2, &[(0xcac3, 2, &[])]),
+            sparse_wire(4096, 1, &[(0xcac3, 1, &[]), (0xcac4, 0, &pattern)]),
+        ] {
+            let file = SparseFile::from_bytes(&bytes).unwrap();
+            for split in file.split(65536).unwrap() {
+                assert_eq!(split.header.total_blks, file.header.total_blks);
+            }
+        }
+        // Higher minor versions, reserved fields, extended headers and unchecked
+        // checksum values remain accepted (libsparse import with crc=false).
+        let mut bytes = sparse_wire(4096, 1, &[]);
+        bytes[6..8].copy_from_slice(&7u16.to_le_bytes());
+        bytes[8..10].copy_from_slice(&36u16.to_le_bytes());
+        bytes[10..12].copy_from_slice(&16u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&2u32.to_le_bytes());
+        bytes[24..28].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
+        bytes.extend([0xa5; 8]);
+        for (kind, blocks, payload) in [(0xcac3u16, 1u32, &[][..]), (0xcac4, 0, &pattern[..])] {
+            bytes.extend(kind.to_le_bytes());
+            bytes.extend(0x1234u16.to_le_bytes());
+            bytes.extend(blocks.to_le_bytes());
+            bytes.extend((16 + payload.len() as u32).to_le_bytes());
+            bytes.extend([0xa5; 4]);
+            bytes.extend(payload);
+        }
+        let file = SparseFile::from_bytes(&bytes).unwrap();
+        assert_eq!(file.header.image_checksum, 0xdeadbeef);
+        assert_eq!(file.chunks[1].chunk_blocks, 0);
+        assert_eq!(file.chunks[1].payload, pattern);
+        let splits = file.split(65536).unwrap();
+        assert_eq!(splits[0].header.image_checksum, 0);
+        assert!(splits[0]
+            .chunks
+            .iter()
+            .all(|chunk| chunk.chunk_type != CHUNK_TYPE_CRC32));
+    }
+
+    #[test]
+    #[ignore = "requires installed AOSP-derived simg2img; no downloads or device access"]
+    fn test_parse_simg2img_structural_oracle() {
+        let directory =
+            std::env::temp_dir().join(format!("sparse-parse-oracle-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let pattern = [0x78, 0x56, 0x34, 0x12];
+        let cases = [
+            (
+                "short-span",
+                sparse_wire(4096, 2, &[(0xcac3, 1, &[])]),
+                false,
+                vec![],
+            ),
+            (
+                "long-span",
+                sparse_wire(4096, 1, &[(0xcac3, 2, &[])]),
+                false,
+                vec![],
+            ),
+            (
+                "raw-size",
+                sparse_wire(4096, 1, &[(0xcac1, 1, &pattern)]),
+                false,
+                vec![],
+            ),
+            (
+                "fill-size",
+                sparse_wire(4096, 1, &[(0xcac2, 1, &pattern[..3])]),
+                false,
+                vec![],
+            ),
+            (
+                "skip-size",
+                sparse_wire(4096, 1, &[(0xcac3, 1, &pattern)]),
+                false,
+                vec![],
+            ),
+            (
+                "crc-size",
+                sparse_wire(4096, 1, &[(0xcac3, 1, &[]), (0xcac4, 0, &pattern[..3])]),
+                false,
+                vec![],
+            ),
+            (
+                "block-alignment",
+                sparse_wire(6, 1, &[(0xcac3, 1, &[])]),
+                false,
+                vec![],
+            ),
+            (
+                "holes",
+                sparse_wire(4096, 1, &[(0xcac3, 1, &[])]),
+                true,
+                vec![0; 4096],
+            ),
+            (
+                "fill",
+                sparse_wire(4096, 1, &[(0xcac2, 1, &pattern)]),
+                true,
+                pattern.repeat(1024),
+            ),
+            (
+                "unchecked-crc",
+                sparse_wire(4096, 1, &[(0xcac3, 1, &[]), (0xcac4, 0, &pattern)]),
+                true,
+                vec![0; 4096],
+            ),
+        ];
+        for (name, bytes, accepted, expected) in cases {
+            let input = directory.join(format!("{name}.sparse"));
+            let output = directory.join(format!("{name}.raw"));
+            std::fs::write(&input, &bytes).unwrap();
+            let result = std::process::Command::new("simg2img")
+                .arg(&input)
+                .arg(&output)
+                .output()
+                .unwrap();
+            eprintln!(
+                "simg2img {name}: rc={:?}, stderr={}",
+                result.status.code(),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(result.status.success(), accepted, "oracle {name}");
+            assert_eq!(
+                SparseFile::from_bytes(&bytes).is_ok(),
+                accepted,
+                "Rust {name}"
+            );
+            if accepted {
+                assert_partition_eq(&std::fs::read(output).unwrap(), &expected);
+            }
+        }
+        // Empty Rust sparse files remain legal; AOSP's import API explicitly
+        // rejects total_blks=0 (sparse_read.cpp:629), so do not claim parity there.
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     // Independent wire interpreter: every flash starts at partition offset zero.
     // Do not use from_bytes/to_raw: DONT_CARE must seek, not zero old data.

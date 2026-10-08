@@ -9,14 +9,14 @@
 //! - `transport_registration` + events → callbacks on connect / disconnect / state change
 
 use std::net::SocketAddr;
+#[cfg(test)]
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use adb_protocol::{
-    AdbMessageHeader, ADB_VERSION, A_AUTH, A_AUTH_TOKEN, A_CNXN, MAX_PAYLOAD_V2,
-    TcpTransport, Transport,
-};
+use adb_protocol::{TcpTransport, Transport};
+#[cfg(any(feature = "usb", test))]
+use adb_protocol::{AdbMessageHeader, ADB_VERSION, A_CNXN, MAX_PAYLOAD_V2};
 #[cfg(feature = "usb")]
 use adb_protocol::usb::UsbTransportAdapter;
 #[cfg(feature = "usb")]
@@ -257,81 +257,10 @@ pub(crate) fn connect_to_remote(
     addr: SocketAddr,
     registry: &Arc<Mutex<TransportRegistry>>,
 ) -> Result<Box<dyn Transport>, String> {
-    // 1. Open TCP connection
-    eprintln!("[adb-debug] connect_to_remote: connecting to {addr}...");
-    let stream = TcpStream::connect(addr)
+    let raw = TcpTransport::connect_timeout(addr, TRANSPORT_CONNECT_TIMEOUT)
         .map_err(|e| format!("cannot connect to device at {addr}: {e}"))?;
-    let _ = stream.set_nodelay(true);
-    let mut transport: Box<dyn Transport> = Box::new(TcpTransport::from_stream(stream));
-    eprintln!("[adb-debug] connect_to_remote: connected, sending CNXN...");
-
-    // 2. Send CNXN probe (AOSP: connect_to_remote sends A_CNXN)
-    let probe = b"host::";
-    let cnxn = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, probe);
-    transport
-        .send_message(&cnxn, probe)
-        .map_err(|e| format!("CNXN probe failed: {e}"))?;
-
-    // 3. Handle AUTH handshake if required
-    let auth = crate::client::auth::default_auth();
-    let mut sent_signature = false;
-    let mut sent_public_key = false;
-
-    let (_resp_hdr, payload) = loop {
-        let (resp_hdr, payload) = transport
-            .recv_message()
-            .map_err(|e| format!("CNXN response failed: {e}"))?;
-
-        if resp_hdr.command == A_CNXN {
-            break (resp_hdr, payload);
-        }
-
-        if resp_hdr.command != A_AUTH {
-            return Err(format!(
-                "expected A_CNXN or A_AUTH from adbd at {addr}, got cmd={:#010x}",
-                resp_hdr.command
-            ));
-        }
-
-        // Handle AUTH loop
-        if resp_hdr.arg0 != A_AUTH_TOKEN {
-            return Err(format!(
-                "Unsupported AUTH request type from {addr}: {}",
-                resp_hdr.arg0
-            ));
-        }
-        if payload.len() != 20 {
-            return Err(format!(
-                "Invalid ADB AUTH token length from {addr}: {}",
-                payload.len()
-            ));
-        }
-
-        let (auth_hdr, auth_payload) = if !sent_signature {
-            sent_signature = true;
-            auth.make_signature_message(&payload)
-                .map_err(|e| format!("signature failed: {e}"))?
-        } else if !sent_public_key {
-            sent_public_key = true;
-            auth.make_rsakey_message()
-                .map_err(|e| format!("rsakey failed: {e}"))?
-        } else {
-            return Err(
-                "adbd rejected the ADB RSA key after signature and public-key exchange"
-                    .to_string(),
-            );
-        };
-
-        transport
-            .send_message(&auth_hdr, &auth_payload)
-            .map_err(|e| format!("AUTH send failed: {e}"))?;
-    };
-
-    // Persist public key on Android host
-    #[cfg(target_os = "android")]
-    if sent_public_key {
-        let _ = crate::client::auth::persist_adb_pubkey(auth);
-    }
+    let (info, transport) = crate::server::bridge::authenticated_tcp(Box::new(raw))?;
+    let payload = info.banner.as_bytes();
 
     // 4. Parse banner for features / product / model / device
     let serial = addr.to_string();
@@ -382,22 +311,26 @@ pub(crate) fn connect_usb_device(
     serial: &str,
     registry: &Arc<Mutex<TransportRegistry>>,
 ) -> Result<Box<dyn Transport>, String> {
-    use adb_protocol::{A_AUTH, A_AUTH_TOKEN};
-
     // 1. Open USB device
     let usb_dev = UsbfsAdbDevice::open_by_serial(serial)
         .map_err(|e| format!("cannot open USB device '{serial}': {e}"))?;
-    let transport = UsbTransportAdapter::new(usb_dev);
-    let mut t: Box<dyn Transport> = Box::new(transport);
+    let transport = adb_protocol::usb_android::urb_transport::UrbFrameTransport::new(usb_dev.into_urb_owner());
+    authenticate_usb_transport(Box::new(transport), serial, registry, crate::client::auth::default_auth())
+}
 
-    // 2. Load ADB host auth key (same pattern as models.rs ensure_usb_auth)
-    let auth = crate::client::auth::default_auth();
-
+/// Shared production USB handshake, injectable only at the owned transport
+/// boundary. The native caller consumes the one claimed fd into the URB owner.
+#[cfg(feature = "usb")]
+pub(crate) fn authenticate_usb_transport(
+    mut t: Box<dyn Transport>, serial: &str,
+    registry: &Arc<Mutex<TransportRegistry>>, auth: &adb_protocol::AdbAuth,
+) -> Result<Box<dyn Transport>, String> {
+    use adb_protocol::{A_AUTH, A_AUTH_TOKEN};
     // 3. Perform AUTH/CNXN handshake
-    let cnxn_payload = b"host::";
-    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
+    let cnxn_payload = adb_protocol::host_cnxn_payload();
+    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, &cnxn_payload);
 
-    t.send_message(&cnxn_hdr, cnxn_payload)
+    t.send_message(&cnxn_hdr, &cnxn_payload)
         .map_err(|e| format!("CNXN send failed: {e}"))?;
 
     let (mut resp_hdr, mut payload) = t

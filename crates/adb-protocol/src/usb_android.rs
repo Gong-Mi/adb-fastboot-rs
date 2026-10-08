@@ -9,6 +9,9 @@
 //!
 //! Serial numbers are read from `/sys/bus/usb/devices/<name>/serial`.
 
+pub mod urb;
+pub mod urb_transport;
+
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read as _};
 use std::os::unix::io::AsRawFd;
@@ -131,6 +134,7 @@ pub struct UsbfsAdbDevice {
     bus_number: u8,
     address: u8,
     timeout: Duration,
+    bounded_io: Option<crate::usb::UsbBoundedIo>,
 }
 
 impl std::fmt::Debug for UsbfsAdbDevice {
@@ -145,6 +149,13 @@ impl std::fmt::Debug for UsbfsAdbDevice {
 }
 
 impl UsbfsAdbDevice {
+    /// Move the already claimed exclusive file description into the async URB
+    /// owner. No reopen/clone, and no concurrent synchronous bulk calls remain.
+    /// The server dispatcher is not enabled by this conversion alone.
+    pub fn into_urb_owner(self) -> urb::UsbfsUrbOwner {
+        urb::UsbfsUrbOwner::new(self.fd, self.endpoints)
+    }
+
     /// Try to open the first ADB USB device found.
     pub fn open_first() -> Result<Self, UsbAndroidError> {
         let candidates = Self::enumerate()?;
@@ -302,6 +313,7 @@ impl UsbfsAdbDevice {
             bus_number,
             address,
             timeout: Duration::from_secs(10),
+            bounded_io: None,
         })
     }
 
@@ -344,6 +356,18 @@ impl UsbfsAdbDevice {
 }
 
 impl UsbTransport for UsbfsAdbDevice {
+    fn bounded_io_capability(&self) -> crate::usb::UsbIoCapability {
+        crate::usb::UsbIoCapability::SynchronousBulk
+    }
+
+    fn configure_bounded_io(&mut self, policy: crate::usb::UsbBoundedIo) -> Result<(), UsbTransportError> {
+        if policy.timeout.is_zero() {
+            return Err(UsbTransportError::Io("bounded USB timeout must be nonzero".into()));
+        }
+        self.bounded_io = Some(policy);
+        Ok(())
+    }
+
     fn endpoint_info(&self) -> UsbEndpointInfo {
         self.endpoints
     }
@@ -357,11 +381,9 @@ impl UsbTransport for UsbfsAdbDevice {
             _pad: 0,
             data: buffer.as_mut_ptr(),
         };
-        let rc = unsafe { usbdevfs_ioctl(self.fd.as_raw_fd(), USBDEVFS_BULK, &mut bulk as *mut _) };
-        match rc {
-            Ok(_) => Ok(bulk.len as usize),
-            Err(e) => Err(map_io_error(e)),
-        }
+        bounded_bulk_transfer_with(&mut bulk, self.bounded_io.as_ref(), |bulk| unsafe {
+            usbdevfs_ioctl(self.fd.as_raw_fd(), USBDEVFS_BULK, bulk)
+        })
     }
 
     fn bulk_write(&mut self, endpoint: u8, buffer: &[u8]) -> Result<usize, UsbTransportError> {
@@ -375,11 +397,9 @@ impl UsbTransport for UsbfsAdbDevice {
             _pad: 0,
             data: buf_copy.as_mut_ptr(),
         };
-        let rc = unsafe { usbdevfs_ioctl(self.fd.as_raw_fd(), USBDEVFS_BULK, &mut bulk as *mut _) };
-        match rc {
-            Ok(_) => Ok(bulk.len as usize),
-            Err(e) => Err(map_io_error(e)),
-        }
+        bounded_bulk_transfer_with(&mut bulk, self.bounded_io.as_ref(), |bulk| unsafe {
+            usbdevfs_ioctl(self.fd.as_raw_fd(), USBDEVFS_BULK, bulk)
+        })
     }
 }
 
@@ -419,6 +439,44 @@ pub enum UsbAndroidError {
     Io(#[from] io::Error),
 }
 
+fn timeout_millis(timeout: Duration) -> u32 {
+    timeout.as_nanos().div_ceil(1_000_000).min(u32::MAX as u128) as u32
+}
+
+// Never retry a synchronous BULK timeout: Linux devio.c discards actual_length
+// on error and IN copies to userspace only on success. No safe WouldBlock exists.
+fn bounded_bulk_transfer_with(
+    bulk: &mut UsbdevfsBulkTransfer,
+    policy: Option<&crate::usb::UsbBoundedIo>,
+    ioctl: impl FnOnce(&mut UsbdevfsBulkTransfer) -> io::Result<i32>,
+) -> Result<usize, UsbTransportError> {
+    if let Some(policy) = policy {
+        if policy.timeout.is_zero() {
+            return Err(UsbTransportError::Io("bounded USB timeout must be nonzero".into()));
+        }
+        if policy.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(UsbTransportError::Io("USB operation cancelled before submission".into()));
+        }
+        bulk.timeout = timeout_millis(policy.timeout);
+    }
+    // Successful bytes win over cancellation racing with completion.
+    bulk_transfer_with(bulk, ioctl)
+}
+
+// Production and tests share this ioctl-result path; usbfs does not update len.
+fn bulk_transfer_with(
+    bulk: &mut UsbdevfsBulkTransfer,
+    ioctl: impl FnOnce(&mut UsbdevfsBulkTransfer) -> io::Result<i32>,
+) -> Result<usize, UsbTransportError> {
+    // Linux devio.c proc_bulk returns actual_length, not the requested len.
+    let requested = bulk.len as usize;
+    let rc = ioctl(bulk).map_err(map_io_error)?;
+    if rc < 0 || rc as usize > requested {
+        return Err(UsbTransportError::Io("USB bulk ioctl returned an invalid byte count".into()));
+    }
+    Ok(rc as usize)
+}
+
 fn map_io_error(e: io::Error) -> UsbTransportError {
     match e.kind() {
         ErrorKind::PermissionDenied => UsbTransportError::PermissionDenied,
@@ -436,6 +494,114 @@ fn map_io_error(e: io::Error) -> UsbTransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_bulk_contract() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        for ep in [0x81, 2] {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let policy = crate::usb::UsbBoundedIo {
+                timeout: Duration::from_micros(1500), cancelled: cancelled.clone(),
+            };
+            let mut bytes = [0xa5; 8];
+            let mut bulk = UsbdevfsBulkTransfer { ep, len: 8, timeout: 10000, _pad: 0, data: bytes.as_mut_ptr() };
+            for count in [0, 3, 8] {
+                let mut calls = 0;
+                let got = bounded_bulk_transfer_with(&mut bulk, Some(&policy), |b| {
+                    calls += 1;
+                    assert_eq!(b.timeout, 2);
+                    if ep == 0x81 { unsafe { std::ptr::write_bytes(b.data, 0x42, count); } }
+                    Ok(count as i32)
+                }).unwrap();
+                assert_eq!((got, calls), (count, 1));
+                if ep == 0x81 { assert_eq!(&bytes[..got], &vec![0x42; got]); }
+            }
+            for errno in [libc::ETIMEDOUT, libc::EIO, libc::ENODEV, libc::EPIPE] {
+                let mut calls = 0;
+                let error = bounded_bulk_transfer_with(&mut bulk, Some(&policy), |_| {
+                    calls += 1;
+                    Err(io::Error::from_raw_os_error(errno))
+                }).unwrap_err();
+                assert_eq!(calls, 1);
+                assert_eq!(error, map_io_error(io::Error::from_raw_os_error(errno)));
+            }
+            // A cancellation racing with success must not erase transferred bytes.
+            assert_eq!(bounded_bulk_transfer_with(&mut bulk, Some(&policy), |_| {
+                cancelled.store(true, Ordering::Release); Ok(3)
+            }).unwrap(), 3);
+            assert!(bounded_bulk_transfer_with(&mut bulk, Some(&policy), |_| panic!("cancelled ioctl submitted")).is_err());
+            bulk.timeout = 10000;
+            assert_eq!(bounded_bulk_transfer_with(&mut bulk, None, |b| {
+                assert_eq!(b.timeout, 10000); Ok(0)
+            }).unwrap(), 0);
+            let zero = crate::usb::UsbBoundedIo { timeout: Duration::ZERO, cancelled };
+            assert!(bounded_bulk_transfer_with(&mut bulk, Some(&zero), |_| panic!("infinite timeout submitted")).is_err());
+        }
+    }
+
+    #[test]
+    fn bounded_timeout_never_becomes_infinite() {
+        assert_eq!(timeout_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(timeout_millis(Duration::from_micros(1500)), 2);
+    }
+
+    #[test]
+    fn bulk_ioctl_counts_both_directions() {
+        for ep in [0x81, 2] {
+            for actual in [0, 3, 8] {
+                let mut bytes = [0xa5; 8];
+                let mut bulk = UsbdevfsBulkTransfer {
+                    ep, len: 8, timeout: 2000, _pad: 0, data: bytes.as_mut_ptr(),
+                };
+                let count = bulk_transfer_with(&mut bulk, |b| {
+                    assert_eq!((b.ep, b.len, b.timeout), (ep, 8, 2000));
+                    if ep == 0x81 {
+                        unsafe { std::ptr::write_bytes(b.data, 0x42, actual as usize); }
+                    } else {
+                        assert_eq!(unsafe { std::slice::from_raw_parts(b.data, 8) }, &[0xa5; 8]);
+                    }
+                    Ok(actual)
+                }).unwrap();
+                assert_eq!(count, actual as usize, "endpoint {ep}");
+                if ep == 0x81 {
+                    assert_eq!(&bytes[..count], &vec![0x42; count]);
+                    assert!(bytes[count..].iter().all(|b| *b == 0xa5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_ioctl_invalid_counts_and_errno() {
+        for ep in [0x81, 2] {
+            let mut bytes = [0; 8];
+            let mut bulk = UsbdevfsBulkTransfer {
+                ep, len: 8, timeout: 0, _pad: 0, data: bytes.as_mut_ptr(),
+            };
+            assert!(bulk_transfer_with(&mut bulk, |_| Ok(9)).is_err());
+            assert!(bulk_transfer_with(&mut bulk, |_| Ok(-1)).is_err());
+            for errno in [libc::ETIMEDOUT, libc::EACCES, libc::EIO] {
+                let expected = map_io_error(io::Error::from_raw_os_error(errno)).to_string();
+                let error = bulk_transfer_with(&mut bulk, |_| Err(io::Error::from_raw_os_error(errno))).unwrap_err();
+                assert_eq!(error.to_string(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_ioctl_negative_syscall_maps_errno() {
+        let mut bytes = [0; 8];
+        let mut bulk = UsbdevfsBulkTransfer {
+            ep: 0x81, len: 8, timeout: 0, _pad: 0, data: bytes.as_mut_ptr(),
+        };
+        // Invalid fd exercises the real libc -1/errno conversion without USB.
+        let raw = unsafe { usbdevfs_ioctl(-1, USBDEVFS_BULK, &mut bulk) }.unwrap_err();
+        assert_eq!(raw.raw_os_error(), Some(libc::EBADF));
+        let error = bulk_transfer_with(&mut bulk, |b| unsafe {
+            usbdevfs_ioctl(-1, USBDEVFS_BULK, b)
+        }).unwrap_err();
+        assert_eq!(error.to_string(), map_io_error(raw).to_string());
+    }
 
     #[test]
     fn usbdevfs_bulktransfer_layout() {

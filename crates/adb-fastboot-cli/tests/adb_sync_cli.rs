@@ -1,11 +1,13 @@
 //! Device-free regressions that launch the actual adb-rs binary, not a test client.
-//! `-s 127.0.0.1:PORT` is the CLI's direct adbd transport selector. These commands
-//! do not touch the system ADB server, USB, real devices, or real host keys.
+//! `-s 127.0.0.1:PORT` selects direct adbd; `ADB_SERVER_SOCKET` configures the
+//! smart-server pull path. Tests use loopback peers and disposable public test
+//! identities, not USB, real devices, or real host keys.
 use std::io::{self, Read, Write};
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::{Shutdown, TcpListener};
 use std::path::PathBuf;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -314,3 +316,287 @@ fn staged_install_cli_sends_complete_apk_then_installs_and_cleans_up() { run_cli
 fn staged_install_cli_stops_on_sync_fail() { run_cli(true, Outcome::Fail); }
 #[test]
 fn staged_install_cli_rejects_eof_after_done_transport_ack() { run_cli(true, Outcome::Eof); }
+
+// Wire truth: packages/modules/adb @9084198a2d4b0f6a0f174260fb42da33485b684d
+// file_sync_protocol.h:48-53 and daemon/file_sync_service.cpp:150-159.
+// These vectors never call any project SYNC encoder/decoder.
+fn aosp_stat() -> Vec<u8> {
+    [
+        b"STAT".as_slice(),
+        &0o100600u32.to_le_bytes(),
+        &6u32.to_le_bytes(),
+        &1_720_000_000u32.to_le_bytes(),
+    ]
+    .concat()
+}
+fn aosp_data_done() -> Vec<u8> {
+    [
+        b"DATA".as_slice(),
+        &6u32.to_le_bytes(),
+        b"pulled",
+        b"DONE",
+        &0u32.to_le_bytes(),
+    ]
+    .concat()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PullReply {
+    Whole,
+    Fragmented,
+    Early,
+    StatFail,
+    Missing,
+    StatEof,
+    DataEof,
+    DataFail,
+    Dent,
+    Oversized,
+}
+
+fn accept_bounded(listener: &TcpListener) -> std::net::TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match listener.accept() {
+            Ok((socket, _)) => {
+                socket.set_nodelay(true).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                return socket;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "CLI never connected to fake pull peer"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("accept: {error}"),
+        }
+    }
+}
+fn read_smart(socket: &mut std::net::TcpStream) -> String {
+    let mut size = [0; 4];
+    socket.read_exact(&mut size).unwrap();
+    let size = usize::from_str_radix(std::str::from_utf8(&size).unwrap(), 16).unwrap();
+    assert!(size <= 4096);
+    let mut bytes = vec![0; size];
+    socket.read_exact(&mut bytes).unwrap();
+    String::from_utf8(bytes).unwrap()
+}
+fn read_sync_request(socket: &mut dyn Read, id: &[u8; 4]) {
+    let mut header = [0; 8];
+    socket.read_exact(&mut header).unwrap();
+    assert_eq!(&header[..4], id);
+    let size = word(&header[4..]) as usize;
+    assert!(size <= 1024);
+    let mut path = vec![0; size];
+    socket.read_exact(&mut path).unwrap();
+    assert_eq!(path, b"/remote/file");
+}
+fn pull_cli(server: bool, reply: PullReply) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = Fixture(std::env::temp_dir().join(format!(
+        "adb-stat-cli-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )));
+    fs::create_dir_all(&root.0).unwrap();
+    seed_public_test_identity(&root.0);
+    let destination = root.0.join("pulled");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    // Never probe :5037, USB or a real device in this suite.
+    let unused_server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let unused_port = unused_server.local_addr().unwrap().port();
+    let peer = thread::spawn(move || {
+        let socket = accept_bounded(&listener);
+        let mut adbd = FakeAdbd(socket);
+        let local_id = if server {
+            assert_eq!(read_smart(&mut adbd.0), "host:transport:stat-fixture");
+            adbd.0.write_all(b"OKAY").unwrap();
+            assert_eq!(read_smart(&mut adbd.0), "sync:");
+            adbd.0.write_all(b"OKAY").unwrap();
+            0
+        } else {
+            assert_eq!(adbd.recv_message().unwrap().0.command, A_CNXN);
+            let banner = b"device::features=";
+            adbd.send_message(
+                &AdbMessageHeader::new(A_CNXN, 0x0100_0001, 1024 * 1024, banner),
+                banner,
+            )
+            .unwrap();
+            open(&mut adbd, "sync:")
+        };
+        let request = |adbd: &mut FakeAdbd, id: &[u8; 4]| {
+            if server {
+                read_sync_request(&mut adbd.0, id);
+            } else {
+                let payload = receive(adbd, A_WRTE, local_id);
+                read_sync_request(&mut payload.as_slice(), id);
+                if !matches!(reply, PullReply::Early) {
+                    send(adbd, A_OKAY, local_id, &[]);
+                }
+            }
+        };
+        let respond = |adbd: &mut FakeAdbd, bytes: &[u8]| {
+            let chunks: Vec<&[u8]> = if matches!(reply, PullReply::Fragmented) {
+                bytes.chunks(1).collect()
+            } else {
+                vec![bytes]
+            };
+            for chunk in chunks {
+                if server {
+                    adbd.0.write_all(chunk).unwrap();
+                } else {
+                    send(adbd, A_WRTE, local_id, chunk);
+                    assert!(receive(adbd, A_OKAY, local_id).is_empty());
+                }
+            }
+            if !server && matches!(reply, PullReply::Early) {
+                send(adbd, A_OKAY, local_id, &[]);
+            }
+        };
+        request(&mut adbd, b"STAT");
+        let stat = match reply {
+            PullReply::StatFail => [b"FAIL".as_slice(), &6u32.to_le_bytes(), b"denied"].concat(),
+            PullReply::Missing => [b"STAT".as_slice(), &[0u8; 12]].concat(),
+            PullReply::StatEof => aosp_stat()[..15].to_vec(),
+            _ => aosp_stat(),
+        };
+        respond(&mut adbd, &stat);
+        if matches!(
+            reply,
+            PullReply::StatFail | PullReply::Missing | PullReply::StatEof
+        ) {
+            adbd.0.shutdown(Shutdown::Write).unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                adbd.0.read(&mut byte).unwrap(),
+                0,
+                "failed STAT must not send RECV"
+            );
+            return;
+        }
+        request(&mut adbd, b"RECV");
+        let data = match reply {
+            PullReply::DataEof => [b"DATA".as_slice(), &7u32.to_le_bytes(), b"pulled"].concat(),
+            PullReply::DataFail => [
+                b"DATA".as_slice(),
+                &6u32.to_le_bytes(),
+                b"pulled",
+                b"FAIL",
+                &6u32.to_le_bytes(),
+                b"denied",
+            ]
+            .concat(),
+            PullReply::Dent => [b"DENT".as_slice(), &0u32.to_le_bytes()].concat(),
+            PullReply::Oversized => [b"DATA".as_slice(), &u32::MAX.to_le_bytes()].concat(),
+            _ => aosp_data_done(),
+        };
+        respond(&mut adbd, &data);
+        adbd.0.shutdown(Shutdown::Write).unwrap();
+    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adb-rs"));
+    command.arg("-s").arg(if server {
+        "stat-fixture".to_string()
+    } else {
+        address.to_string()
+    });
+    command
+        .env("HOME", &root.0)
+        .env(
+            "ADB_SERVER_SOCKET",
+            format!(
+                "tcp:127.0.0.1:{}",
+                if server { address.port() } else { unused_port }
+            ),
+        )
+        .env_remove("ANDROID_ADB_SERVER_PORT")
+        .args(["pull", "-a", "/remote/file"])
+        .arg(&destination)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            let _ = peer.join();
+            panic!("pull CLI timeout: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    let peer_result = peer.join();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        peer_result.is_ok(),
+        "server={server}, reply={reply:?}, exit={:?}, stderr={stderr}",
+        output.status.code()
+    );
+    if matches!(
+        reply,
+        PullReply::Whole | PullReply::Fragmented | PullReply::Early
+    ) {
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert_eq!(fs::read(&destination).unwrap(), b"pulled");
+        let metadata = fs::metadata(&destination).unwrap();
+        assert_eq!(metadata.mtime(), 1_720_000_000);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    } else {
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(
+            !destination.exists(),
+            "failed pull must not publish fabricated/partial data"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Pull complete"));
+        if matches!(reply, PullReply::StatFail | PullReply::DataFail) {
+            assert!(stderr.contains("denied"), "{stderr}");
+        }
+    }
+}
+#[test]
+fn pull_a_cli_direct_aosp_stat_and_coalesced_data_done() {
+    pull_cli(false, PullReply::Whole);
+}
+#[test]
+fn pull_a_cli_smart_server_aosp_stat_and_coalesced_data_done() {
+    pull_cli(true, PullReply::Whole);
+}
+#[test]
+fn pull_a_cli_fragmented_stat_data_and_done() {
+    for server in [false, true] {
+        pull_cli(server, PullReply::Fragmented);
+    }
+}
+#[test]
+fn pull_a_cli_preserves_early_response_before_adb_ack() {
+    pull_cli(false, PullReply::Early);
+}
+#[test]
+fn pull_a_cli_fails_closed_without_fabricated_data() {
+    for server in [false, true] {
+        for reply in [
+            PullReply::StatFail,
+            PullReply::Missing,
+            PullReply::StatEof,
+            PullReply::DataEof,
+            PullReply::DataFail,
+            PullReply::Dent,
+            PullReply::Oversized,
+        ] {
+            pull_cli(server, reply);
+        }
+    }
+}

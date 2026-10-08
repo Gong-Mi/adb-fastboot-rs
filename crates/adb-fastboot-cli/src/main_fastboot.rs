@@ -14,15 +14,9 @@ use zip::ZipArchive;
 ///
 /// Constructed once in `main()` from the CLI flags and threaded through
 /// every command that needs them.  Field names match the AOSP C++ globals
-/// (`g_disable_verity`, `fp->skip_reboot`, etc.) for traceability.
+/// (`g_disable_verity`, etc.) for traceability.
 #[derive(Debug, Clone, Copy, Default)]
 struct GlobalOptions {
-    /// `--skip-reboot`: don't reboot after flashing.
-    skip_reboot: bool,
-    /// `--skip-secondary`: don't flash secondary slots in flashall/update.
-    skip_secondary: bool,
-    /// `--force`: force a flash operation that may be unsafe.
-    force_flash: bool,
     /// `--disable-verity`: set bit 0 in vbmeta flags.
     disable_verity: bool,
     /// `--disable-verification`: set bit 1 in vbmeta flags.
@@ -42,55 +36,111 @@ impl GlobalOptions {
 const AVB_MAGIC: &[u8; 4] = b"AVB0";
 /// AOSP `AVB_FOOTER_MAGIC` = "AVBf" (4 bytes).
 const AVB_FOOTER_MAGIC: &[u8; 4] = b"AVBf";
-/// Size of the AVB footer struct (AOSP `AVB_FOOTER_SIZE`).
 const AVB_FOOTER_SIZE: usize = 64;
-/// Offset of the big-endian `flags` field inside the VBMeta header.
-/// The flags field is 32-bit BE at byte offset 120; the LSB is at 123.
+const VBMETA_HEADER_SIZE: usize = 256;
+/// AvbVBMetaImageHeader.flags is BE u32 at 120; bits 0/1 are in byte 123.
 const VBMETA_FLAGS_LSB_OFFSET: usize = 123;
 
-/// Patch vbmeta flags in an image buffer, mirroring AOSP
-/// `fastboot.cpp:SetVbmetaFlags()`.
-///
-/// Returns a new buffer with the flags patched, or `None` if the image
-/// does not contain a recognisable AVB structure (in which case the
-/// caller should flash the original data unchanged).
-fn patch_vbmeta_flags(data: &[u8], opts: &GlobalOptions) -> Option<Vec<u8>> {
-    if !opts.needs_vbmeta_patch() || data.len() < 256 {
-        return None;
+/// Rewrite flags using Android 17's packed AvbFooter/AvbVBMetaImageHeader
+/// layouts (external/avb ba2dec4b, core fastboot.cpp:rewrite_vbmeta_buffer).
+/// No flags or no recognized AVB structure preserves the existing raw-image
+/// behavior. Recognized but truncated/inconsistent structures return an error.
+/// This checks structural bounds, NOT signatures, algorithms or key trust.
+fn patch_vbmeta_flags(data: &[u8], opts: &GlobalOptions) -> Result<Option<Vec<u8>>, String> {
+    if !opts.needs_vbmeta_patch() {
+        return Ok(None);
     }
-
-    // Determine vbmeta offset: either 0 (standalone vbmeta.img) or
-    // read from the AVB footer appended to a boot image.
-    let vbmeta_offset: usize = if data.len() >= AVB_FOOTER_SIZE
-        && &data[data.len() - AVB_FOOTER_SIZE..data.len() - AVB_FOOTER_SIZE + 4] == AVB_FOOTER_MAGIC
-    {
-        // Footer present — read vbmeta_offset (BE u64 at footer + 8).
-        let footer = &data[data.len() - AVB_FOOTER_SIZE..];
-        let off = u64::from_be_bytes(footer[8..16].try_into().ok()?) as usize;
-        off
-    } else {
-        0
+    let error = || "invalid AVB/vbmeta structure: truncated or overflowing field/range".to_string();
+    let read_u32 = |bytes: &[u8], offset: usize| -> Result<u32, String> {
+        let end = offset.checked_add(4).ok_or_else(error)?;
+        let field = bytes.get(offset..end).ok_or_else(error)?;
+        Ok(u32::from_be_bytes(field.try_into().map_err(|_| error())?))
     };
+    let read_u64 = |bytes: &[u8], offset: usize| -> Result<u64, String> {
+        let end = offset.checked_add(8).ok_or_else(error)?;
+        let field = bytes.get(offset..end).ok_or_else(error)?;
+        Ok(u64::from_be_bytes(field.try_into().map_err(|_| error())?))
+    };
+    let native = |value: u64| usize::try_from(value).map_err(|_| error());
 
-    // Verify AVB_MAGIC at the computed offset.
-    if data.len() < vbmeta_offset + 4 || &data[vbmeta_offset..vbmeta_offset + 4] != AVB_MAGIC {
-        return None;
+    let footer_start = data.len().checked_sub(AVB_FOOTER_SIZE);
+    let footer = footer_start.and_then(|start| data.get(start..));
+    let (vbmeta_offset, vbmeta_end) = match footer {
+        Some(footer) if footer.starts_with(AVB_FOOTER_MAGIC) => {
+            // Packed footer: major=4, minor=8, original_size=12,
+            // vbmeta_offset=20, vbmeta_size=28, reserved=36. In particular,
+            // [8..16] is NOT the offset. libavb accepts major <= 1 and any minor.
+            if read_u32(footer, 4)? > 1 {
+                return Err("unsupported AVB footer major version".to_string());
+            }
+            let original_size = native(read_u64(footer, 12)?)?;
+            let offset = native(read_u64(footer, 20)?)?;
+            let size = native(read_u64(footer, 28)?)?;
+            let end = offset.checked_add(size).ok_or_else(error)?;
+            let start = footer_start.ok_or_else(error)?;
+            if original_size > offset || size < VBMETA_HEADER_SIZE || end > start {
+                return Err(error());
+            }
+            data.get(offset..end).ok_or_else(error)?;
+            (offset, end)
+        }
+        _ if data.starts_with(AVB_MAGIC) => (0, data.len()),
+        _ => return Ok(None),
+    };
+    let header_end = vbmeta_offset
+        .checked_add(VBMETA_HEADER_SIZE)
+        .ok_or_else(error)?;
+    if header_end > vbmeta_end {
+        return Err(error());
+    }
+    let header = data.get(vbmeta_offset..header_end).ok_or_else(error)?;
+    if !header.starts_with(AVB_MAGIC) {
+        return Err("invalid AVB/vbmeta structure: footer does not point to AVB0".to_string());
     }
 
-    let flags_byte = vbmeta_offset + VBMETA_FLAGS_LSB_OFFSET;
-    if flags_byte >= data.len() {
-        return None;
+    // Header + auth + aux must be present; all relative ranges must fit their
+    // own block. Reject corrupt sizes without authenticating/re-signing data.
+    let auth_size = native(read_u64(header, 12)?)?;
+    let aux_size = native(read_u64(header, 20)?)?;
+    if auth_size % 64 != 0 || aux_size % 64 != 0 {
+        return Err("invalid AVB/vbmeta structure: unaligned auth/aux block".to_string());
+    }
+    let end = header_end
+        .checked_add(auth_size)
+        .and_then(|end| end.checked_add(aux_size))
+        .ok_or_else(error)?;
+    if end > vbmeta_end {
+        return Err(error());
+    }
+    data.get(vbmeta_offset..end).ok_or_else(error)?;
+    for (offset_field, size_field, block_size) in [
+        (32, 40, auth_size), // hash
+        (48, 56, auth_size), // signature
+        (64, 72, aux_size),  // public key
+        (80, 88, aux_size),  // public key metadata
+        (96, 104, aux_size), // descriptors
+    ] {
+        let offset = native(read_u64(header, offset_field)?)?;
+        let size = native(read_u64(header, size_field)?)?;
+        if offset.checked_add(size).ok_or_else(error)? > block_size {
+            return Err(error());
+        }
     }
 
+    let flags_byte = vbmeta_offset
+        .checked_add(VBMETA_FLAGS_LSB_OFFSET)
+        .ok_or_else(error)?;
     let mut patched = data.to_vec();
+    let flags = patched.get_mut(flags_byte).ok_or_else(error)?;
     if opts.disable_verity {
-        patched[flags_byte] |= 0x01;
+        *flags |= 0x01;
     }
     if opts.disable_verification {
-        patched[flags_byte] |= 0x02;
+        *flags |= 0x02;
     }
-    Some(patched)
+    Ok(Some(patched))
 }
+
 
 /// Returns true when `partition` is a vbmeta partition (AOSP
 /// `is_vbmeta_partition()`).
@@ -118,24 +168,24 @@ struct Cli {
     #[arg(long, global = true)]
     usb: bool,
 
-    /// Use SLOT for slot-suffixed partitions (`all` and `other` require
-    /// multi-slot/device discovery and are reserved for orchestration).
-    #[arg(long, global = true, value_parser = parse_slot_value)]
+    /// Use a concrete SLOT for partition commands (`all` and `other` are not supported).
+    #[arg(id = "global_slot", long = "slot", global = true, value_parser = parse_slot_value)]
     slot: Option<String>,
 
-    /// Set the active slot after the selected command (`--set-active[=SLOT]`).
+    /// Not supported: automatic slot activation; rejected before any I/O.
+    /// Use the explicit set_active SLOT command separately.
     #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
     set_active: Option<String>,
 
-    /// Don't reboot device after flashing (AOSP --skip-reboot).
+    /// Not supported: AOSP --skip-reboot (flash/update currently do not auto-reboot).
     #[arg(long, global = true)]
     skip_reboot: bool,
 
-    /// Don't flash secondary slots in flashall/update (AOSP --skip-secondary).
+    /// Not supported: AOSP secondary-slot policy; rejected before any I/O.
     #[arg(long, global = true)]
     skip_secondary: bool,
 
-    /// Force a flash operation that may be unsafe (AOSP --force).
+    /// Not supported: AOSP --force requirement override; rejected before any I/O.
     #[arg(long, global = true)]
     force: bool,
 
@@ -151,7 +201,7 @@ struct Cli {
     #[arg(short = 'v', long, global = true)]
     verbose: bool,
 
-    /// Don't buffer stdout/stderr (AOSP --unbuffered).
+    /// Not supported: AOSP --unbuffered; rejected before any I/O.
     #[arg(long, global = true)]
     unbuffered: bool,
 
@@ -725,10 +775,7 @@ fn download_and_boot_payload<T: FastbootTransport>(
 
     // Step 3: 读取 payload 发送完成后的 OKAY/FAIL
     let post_dl_resp = transport.recv_response()?;
-    if let fastboot_protocol::FastbootResponse::Fail(reason) = &post_dl_resp {
-        eprintln!("[fastboot-rs] payload 发送失败: {}", reason);
-        std::process::exit(1);
-    }
+    require_terminal_okay(&post_dl_resp)?;
     println!("[fastboot-rs] Download 完成: {:?}", post_dl_resp);
 
     // Step 4: 发送 boot 命令
@@ -818,10 +865,7 @@ fn download_and_flash_payload<T: FastbootTransport>(
 
     // Step 3: 读取 payload 发送完成后的 OKAY/FAIL
     let post_dl_resp = transport.recv_response()?;
-    if let fastboot_protocol::FastbootResponse::Fail(reason) = &post_dl_resp {
-        eprintln!("[fastboot-rs] payload 发送失败: {}", reason);
-        std::process::exit(1);
-    }
+    require_terminal_okay(&post_dl_resp)?;
     println!("[fastboot-rs] Download 完成: {:?}", post_dl_resp);
 
     // Step 4: 发送 flash 命令到指定分区
@@ -832,36 +876,17 @@ fn download_and_flash_payload<T: FastbootTransport>(
     Ok(())
 }
 
-/// Boot 命令发送后的响应处理（设备可能立即重启）。
+/// Boot is confirmed only by a terminal OKAY, not DATA or an I/O error.
 fn handle_boot_response(
     mut transport: FastbootConnection,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let boot_resp = transport.recv_response();
-    match &boot_resp {
-        Ok(fastboot_protocol::FastbootResponse::Okay(msg)) => {
-            println!("[fastboot-rs] Boot OK: {}", msg);
-            let disconnected = wait_for_disconnect(transport, Duration::from_secs(5));
-            if disconnected {
-                println!("[fastboot-rs] 设备已断开 — boot 确认");
-            } else {
-                eprintln!(
-                    "[fastboot-rs] 警告: 设备未在 5s 内断开 (boot 可能仍在进行)"
-                );
-            }
-        }
-        Ok(fastboot_protocol::FastbootResponse::Fail(reason)) => {
-            eprintln!("[fastboot-rs] Boot FAIL: {}", reason);
-            std::process::exit(1);
-        }
-        Ok(other) => {
-            println!("[fastboot-rs] Boot 响应: {:?}", other);
-        }
-        Err(e) => {
-            eprintln!(
-                "[fastboot-rs] 信息: 设备已断开 (boot 正在启动): {}",
-                e
-            );
-        }
+    let response = transport.recv_response()?;
+    require_terminal_okay(&response)?;
+    println!("[fastboot-rs] Boot OK: {:?}", response);
+    if wait_for_disconnect(transport, Duration::from_secs(5)) {
+        println!("[fastboot-rs] 设备已断开 — boot 确认");
+    } else {
+        eprintln!("[fastboot-rs] 警告: 设备未在 5s 内断开 (boot 可能仍在进行)");
     }
     Ok(())
 }
@@ -1066,129 +1091,108 @@ fn run_reboot(
     Ok(())
 }
 
-/// 解析 android-info.txt，检查设备兼容性。
-///
-/// 兼容 AOSP CheckRequirements() 逻辑：
-/// - `require board=<board>`  → getvar:product 检查
-/// - `require version-*=<val>` → getvar 检查对应变量
-/// - `require partition-exists=<name>` → getvar:has-slot:<name> 检查
-/// - `require force=<val>` → 始终要求 force_flash
-/// - 行首 `require` 后的 `inverse` 标签反转检查
-/// - 不支持的行打印警告并跳过
+/// Mandatory update queries never turn FAIL, DATA, or I/O errors into a value.
+fn update_getvar<T: FastbootTransport>(
+    transport: &mut T,
+    variable: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    transport.send_cmd(&format!("getvar:{variable}"))?;
+    let response = transport.recv_response()?;
+    require_terminal_okay(&response).map_err(|error| format!("getvar:{variable}: {error}"))?;
+    match response {
+        fastboot_protocol::FastbootResponse::Okay(value) => Ok(value),
+        _ => unreachable!("terminal OKAY was checked"),
+    }
+}
+
+/// Check the supported android-info grammar before planning any writes.
+/// AOSP require/reject, board alias, product guards, alternatives and trailing
+/// wildcard are supported; legacy `require inverse`/`or` remain accepted.
+/// Unsupported/malformed lines fail closed instead of silently removing a gate.
 fn check_android_info<T: FastbootTransport>(
     transport: &mut T,
     data: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for line in data.lines() {
-        let line = line.trim();
+) -> Result<std::collections::HashSet<String>, Box<dyn std::error::Error>> {
+    let mut requirements = Vec::new();
+    for line in data.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-
-        // 格式: require [inverse] <name>=<value> [or <value2>...]
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 || parts[0] != "require" {
-            eprintln!("[fastboot-rs] android-info.txt 语法警告: {line}");
-            continue;
+        let (mut left, right) = line
+            .split_once('=')
+            .ok_or_else(|| format!("unsupported android-info.txt requirement: {line}"))?;
+        left = left.trim();
+        let mut invert = false;
+        let mut product = None;
+        if let Some(rest) = left.strip_prefix("require-for-product:") {
+            let (guard, variable) = rest
+                .trim()
+                .split_once(char::is_whitespace)
+                .ok_or_else(|| format!("malformed product requirement: {line}"))?;
+            product = Some(guard.to_string());
+            left = variable.trim();
+        } else if let Some(rest) = left.strip_prefix("require inverse ") {
+            invert = true;
+            left = rest.trim();
+        } else if let Some(rest) = left.strip_prefix("require ") {
+            left = rest.trim();
+        } else if let Some(rest) = left.strip_prefix("reject ") {
+            invert = true;
+            left = rest.trim();
         }
-
-        let mut idx = 1;
-        let invert = parts.len() > 2 && parts[1] == "inverse";
-        if invert {
-            idx += 1;
+        if left.is_empty() || left.chars().any(char::is_whitespace) || left == "force" {
+            return Err(format!("unsupported android-info.txt requirement: {line}").into());
         }
-
-        if idx >= parts.len() {
-            eprintln!("[fastboot-rs] android-info.txt 语法警告: {line}");
-            continue;
+        let options: Vec<String> = right
+            .replace(" or ", "|")
+            .split('|')
+            .map(|value| value.trim().to_string())
+            .collect();
+        if options.iter().any(String::is_empty) {
+            return Err(format!("empty android-info.txt requirement value: {line}").into());
         }
+        let variable = if left == "board" { "product" } else { left };
+        requirements.push((variable.to_string(), options, invert, product));
+    }
 
-        let kv = parts[idx];
-        if let Some(eq_pos) = kv.find('=') {
-            let var = &kv[..eq_pos];
-            let expected = &kv[eq_pos + 1..];
-
-            // 解析额外的可选值: ["or val2", "or val3", ...]
-            let mut options = vec![expected];
-            let mut i = idx + 1;
-            while i < parts.len() {
-                if parts[i] == "or" && i + 1 < parts.len() {
-                    options.push(parts[i + 1]);
-                    i += 2;
-                } else {
-                    break;
-                }
+    let mut required_images = std::collections::HashSet::new();
+    for (variable, options, invert, product) in requirements {
+        if let Some(product) = product {
+            if update_getvar(transport, "product")? != product {
+                continue; // explicit product guard, not a failed mandatory query
             }
-
-            match var {
-                "partition-exists" => {
-                    // 检查分区是否存在
-                    let query = format!("getvar:has-slot:{}", options[0]);
-                    if transport.send_cmd(&query).is_ok() {
-                        if let Ok(resp) = transport.recv_response() {
-                            match resp {
-                                fastboot_protocol::FastbootResponse::Okay(val) => {
-                                    if val != "yes" && val != "no" {
-                                        eprintln!(
-                                            "[fastboot-rs] 错误: 设备缺少所需分区 '{}'",
-                                            options[0]
-                                        );
-                                        std::process::exit(1);
-                                    }
-                                }
-                                _ => {
-                                    eprintln!(
-                                        "[fastboot-rs] 错误: 设备缺少所需分区 '{}'",
-                                        options[0]
-                                    );
-                                    std::process::exit(1);
-                                }
-                            }
-                        }
-                    }
-                }
-                other => {
-                    // getvar:other 并检查值
-                    let query = format!("getvar:{other}");
-                    if let Err(e) = transport.send_cmd(&query) {
-                        eprintln!("[fastboot-rs] 警告: 无法获取变量 '{other}': {e}");
-                        continue;
-                    }
-                    let actual = match transport.recv_response() {
-                        Ok(fastboot_protocol::FastbootResponse::Okay(val)) => val,
-                        Ok(fastboot_protocol::FastbootResponse::Fail(reason)) => {
-                            eprintln!("[fastboot-rs] getvar:{other} FAILED: {reason}");
-                            String::new()
-                        }
-                        _ => {
-                            eprintln!("[fastboot-rs] 警告: 无法获取变量 '{other}'");
-                            continue;
-                        }
-                    };
-
-                    let met = options.iter().any(|opt| actual.trim() == *opt);
-                    if invert {
-                        if met {
-                            eprintln!(
-                                "[fastboot-rs] 错误: 设备 {other} 是 '{actual}'，但 update 要求不是 {}",
-                                options.join(" 或 ")
-                            );
-                            std::process::exit(1);
-                        }
-                    } else if !met {
-                        eprintln!(
-                            "[fastboot-rs] 错误: 设备 {other} 是 '{actual}'，但 update 要求 {}",
-                            options.join(" 或 ")
-                        );
-                        std::process::exit(1);
-                    }
-                }
+        }
+        if variable == "partition-exists" {
+            if invert
+                || options.len() != 1
+                || !AOSP_IMAGES.iter().any(|entry| entry.0 == options[0])
+            {
+                return Err(
+                    format!("unsupported required partition: {}", options.join("|")).into(),
+                );
             }
+            let has_slot = update_getvar(transport, &format!("has-slot:{}", options[0]))?;
+            if has_slot != "yes" && has_slot != "no" {
+                return Err(format!("device lacks required partition: {}", options[0]).into());
+            }
+            required_images.insert(options[0].clone());
         } else {
-            eprintln!("[fastboot-rs] android-info.txt 语法警告: {line}");
+            let actual = update_getvar(transport, &variable)?;
+            let matches = options.iter().any(|option| {
+                option
+                    .strip_suffix('*')
+                    .map_or(actual.trim() == option, |prefix| {
+                        actual.trim().starts_with(prefix)
+                    })
+            });
+            if matches == invert {
+                return Err(
+                    format!("android-info.txt requirement not met: {variable}={actual}").into(),
+                );
+            }
         }
     }
-    Ok(())
+    Ok(required_images)
 }
 
 /// AOSP 兼容的分区镜像列表及刷写顺序。
@@ -1222,11 +1226,429 @@ const AOSP_IMAGES: &[(&str, &str, bool)] = &[
     ("cache",          "cache.img",          true),
 ];
 
-/// 执行 fastboot update：解析 update.zip，刷写所有分区镜像。
+/// Raw metadata only, not a ZIP decompressor. APPNOTE 4.3.12, 4.3.14-16.
+/// zip 2.4.2 read.rs SharedBuilder::build overwrites equal effective names;
+/// therefore file_names()/by_index() cannot prove uniqueness. Count every raw
+/// CD record first, then require the decoded library map to retain that count.
+mod update_zip_identity {
+    use std::io::{Read, Seek, SeekFrom};
+
+    #[derive(Debug)]
+    pub(super) struct Directory {
+        pub(super) entries: u64,
+        pub(super) start: u64,
+        pub(super) offset: u64,
+    }
+    fn invalid(message: &str) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+    }
+    fn u16_at(bytes: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap())
+    }
+    fn u32_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+    fn u64_at(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+    fn read_at<R: Read + Seek>(reader: &mut R, at: u64, length: usize) -> std::io::Result<Vec<u8>> {
+        reader.seek(SeekFrom::Start(at))?;
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+    fn add(a: u64, b: u64) -> std::io::Result<u64> {
+        a.checked_add(b)
+            .ok_or_else(|| invalid("metadata offset overflow"))
+    }
+    fn sub(a: u64, b: u64) -> std::io::Result<u64> {
+        a.checked_sub(b)
+            .ok_or_else(|| invalid("invalid metadata boundary/offset"))
+    }
+    // Also reject malformed TLVs which zip 2.4.2 can silently ignore on Io errors.
+    fn extra_fields(extra: &[u8]) -> std::io::Result<Option<&[u8]>> {
+        let mut at = 0;
+        let mut zip64 = None;
+        let mut unicode = false;
+        while at < extra.len() {
+            if extra.len() - at < 4 {
+                return Err(invalid("truncated extra-field header"));
+            }
+            let tag = u16_at(extra, at);
+            let end = at + 4 + u16_at(extra, at + 2) as usize;
+            if end > extra.len() {
+                return Err(invalid("extra-field exceeds entry boundary"));
+            }
+            if tag == 1 {
+                if zip64.is_some() {
+                    return Err(invalid("ambiguous ZIP64 extra field"));
+                }
+                zip64 = Some(&extra[at + 4..end]);
+            } else if tag == 0x7075 {
+                if unicode || end - at < 9 {
+                    return Err(invalid("ambiguous/truncated Unicode Path field"));
+                }
+                unicode = true;
+            }
+            at = end;
+        }
+        Ok(zip64)
+    }
+    fn zip64_value(extra: Option<&[u8]>, at: &mut usize, width: usize) -> std::io::Result<u64> {
+        let extra = extra.ok_or_else(|| invalid("missing ZIP64 entry metadata"))?;
+        if extra.len().saturating_sub(*at) < width {
+            return Err(invalid("truncated ZIP64 entry metadata"));
+        }
+        let value = if width == 8 {
+            u64_at(extra, *at)
+        } else {
+            u32_at(extra, *at) as u64
+        };
+        *at += width;
+        Ok(value)
+    }
+
+    /// Supported update containers: single-disk ZIP/ZIP64 with a plain central
+    /// directory ending immediately at the footer; comments and SFX prefixes.
+    /// Fail closed on trailing junk, ambiguous EOCD, split/encrypted directories,
+    /// digital-signature/archive-extra records, >100000 entries/>64MiB CD, or
+    /// >1MiB ZIP64 extensible sector. These are explicit update safety limits.
+    pub(super) fn scan<R: Read + Seek>(reader: &mut R) -> std::io::Result<Directory> {
+        let file_len = reader.seek(SeekFrom::End(0))?;
+        let tail_start = file_len.saturating_sub(22 + u16::MAX as u64);
+        let tail = read_at(reader, tail_start, (file_len - tail_start) as usize)?;
+        let mut ends = (0..tail.len().saturating_sub(21)).filter(|&at| {
+            u32_at(&tail, at) == 0x06054b50
+                && at + 22 + u16_at(&tail, at + 20) as usize == tail.len()
+        });
+        let at = ends
+            .next()
+            .ok_or_else(|| invalid("missing terminal EOCD (trailing/truncated data)"))?;
+        if ends.next().is_some() {
+            return Err(invalid("ambiguous terminal EOCD"));
+        }
+        let eocd_at = tail_start + at as u64;
+        let eocd = &tail[at..at + 22];
+        if u16_at(eocd, 4) != 0 || u16_at(eocd, 6) != 0 {
+            return Err(invalid("multi-disk ZIP is unsupported"));
+        }
+        let count_disk = u16_at(eocd, 8);
+        let count = u16_at(eocd, 10);
+        let size32 = u32_at(eocd, 12);
+        let offset32 = u32_at(eocd, 16);
+        let locator = if eocd_at >= 20 {
+            read_at(reader, eocd_at - 20, 20)?
+        } else {
+            vec![]
+        };
+        let has64 = locator.len() == 20 && u32_at(&locator, 0) == 0x07064b50;
+        let needs64 = count_disk == u16::MAX
+            || count == u16::MAX
+            || size32 == u32::MAX
+            || offset32 == u32::MAX;
+        if needs64 && !has64 {
+            return Err(invalid("missing ZIP64 locator"));
+        }
+        let (entries, size, relative, footer_at, offset) = if has64 {
+            if u32_at(&locator, 4) != 0 || u32_at(&locator, 16) != 1 {
+                return Err(invalid("invalid ZIP64 locator disk metadata"));
+            }
+            let locator_at = eocd_at - 20;
+            // Bounded search handles ZIP64 SFX with relative locator offsets and
+            // variable-sized extensible sectors; never an unbounded payload scan.
+            let search_at = locator_at.saturating_sub(56 + 1024 * 1024);
+            let search = read_at(reader, search_at, (locator_at - search_at) as usize)?;
+            let mut candidates = (0..search.len().saturating_sub(55)).filter(|&p| {
+                u32_at(&search, p) == 0x06064b50
+                    && u64_at(&search, p + 4) >= 44
+                    && (p as u64)
+                        .checked_add(12)
+                        .and_then(|n| n.checked_add(u64_at(&search, p + 4)))
+                        == Some(search.len() as u64)
+            });
+            let p = candidates
+                .next()
+                .ok_or_else(|| invalid("invalid/oversized ZIP64 end record"))?;
+            if candidates.next().is_some() {
+                return Err(invalid("ambiguous ZIP64 end record"));
+            }
+            let end64 = &search[p..p + 56];
+            // APPNOTE 4.3.14.3-4: extensible-sector blocks have a two-byte
+            // header ID and four-byte data size, not ordinary extra-field TLVs.
+            let mut extension = p + 56;
+            while extension < search.len() {
+                if search.len() - extension < 6 {
+                    return Err(invalid("truncated ZIP64 extensible-sector header"));
+                }
+                let length = u32_at(&search, extension + 2) as u64;
+                let end = add((extension + 6) as u64, length)?;
+                if end > search.len() as u64 {
+                    return Err(invalid("ZIP64 extensible-sector exceeds record boundary"));
+                }
+                extension = end as usize;
+            }
+            let end64_at = search_at + p as u64;
+            if u32_at(end64, 16) != 0
+                || u32_at(end64, 20) != 0
+                || u64_at(end64, 24) != u64_at(end64, 32)
+            {
+                return Err(invalid("invalid ZIP64 disk/count metadata"));
+            }
+            let entries = u64_at(end64, 32);
+            let size = u64_at(end64, 40);
+            let relative = u64_at(end64, 48);
+            for (small, sentinel, large) in [
+                (count_disk as u64, u16::MAX as u64, entries),
+                (count as u64, u16::MAX as u64, entries),
+                (size32 as u64, u32::MAX as u64, size),
+                (offset32 as u64, u32::MAX as u64, relative),
+            ] {
+                if small != sentinel && small != large {
+                    return Err(invalid("contradictory ZIP32/ZIP64 metadata"));
+                }
+            }
+            let offset = sub(end64_at, u64_at(&locator, 8))?;
+            (entries, size, relative, end64_at, offset)
+        } else {
+            if count != count_disk {
+                return Err(invalid("inconsistent EOCD entry counts"));
+            }
+            let offset = sub(sub(eocd_at, size32 as u64)?, offset32 as u64)?;
+            (
+                count as u64,
+                size32 as u64,
+                offset32 as u64,
+                eocd_at,
+                offset,
+            )
+        };
+        if entries > 100_000 || size > 64 * 1024 * 1024 || entries > size / 46 {
+            return Err(invalid(
+                "oversized/inconsistent central directory count/size",
+            ));
+        }
+        let start = add(offset, relative)?;
+        if add(start, size)? != footer_at {
+            return Err(invalid("central directory boundary disagrees with footer"));
+        }
+        let mut position = start;
+        let mut actual = 0u64;
+        while position < footer_at {
+            if footer_at - position < 46 {
+                return Err(invalid("truncated central-directory header"));
+            }
+            let header = read_at(reader, position, 46)?;
+            if u32_at(&header, 0) != 0x02014b50 {
+                return Err(invalid("invalid/unsupported central-directory record"));
+            }
+            let name_len = u16_at(&header, 28) as usize;
+            let extra_len = u16_at(&header, 30) as usize;
+            let comment_len = u16_at(&header, 32) as usize;
+            let end = add(position, (46 + name_len + extra_len + comment_len) as u64)?;
+            if end > footer_at {
+                return Err(invalid("entry exceeds central-directory boundary"));
+            }
+            let fields = read_at(reader, position + 46, name_len + extra_len)?;
+            let name = &fields[..name_len];
+            if name.is_empty() || name.contains(&0) {
+                return Err(invalid("invalid entry name"));
+            }
+            let flags = u16_at(&header, 8);
+            if flags & (1 << 11) != 0 && std::str::from_utf8(name).is_err() {
+                return Err(invalid("invalid UTF-8 entry name"));
+            }
+            let extra = extra_fields(&fields[name_len..])?;
+            let mut extra_at = 0;
+            let unpacked = u32_at(&header, 24);
+            if unpacked == u32::MAX {
+                zip64_value(extra, &mut extra_at, 8)?;
+            }
+            let packed = u32_at(&header, 20);
+            let packed = if packed == u32::MAX {
+                zip64_value(extra, &mut extra_at, 8)?
+            } else {
+                packed as u64
+            };
+            let local = u32_at(&header, 42);
+            let local = if local == u32::MAX {
+                zip64_value(extra, &mut extra_at, 8)?
+            } else {
+                local as u64
+            };
+            let disk = u16_at(&header, 34);
+            let disk = if disk == u16::MAX {
+                zip64_value(extra, &mut extra_at, 4)?
+            } else {
+                disk as u64
+            };
+            if disk != 0 {
+                return Err(invalid("multi-disk entry is unsupported"));
+            }
+            let local_at = add(offset, local)?;
+            if add(local_at, 30)? > start {
+                return Err(invalid("local header overlaps central directory"));
+            }
+            let local_header = read_at(reader, local_at, 30)?;
+            if u32_at(&local_header, 0) != 0x04034b50
+                || u16_at(&local_header, 6) != flags
+                || u16_at(&local_header, 8) != u16_at(&header, 10)
+            {
+                return Err(invalid("local/central header identity mismatch"));
+            }
+            let local_name_len = u16_at(&local_header, 26) as usize;
+            let local_extra_len = u16_at(&local_header, 28) as usize;
+            let data_at = add(local_at, (30 + local_name_len + local_extra_len) as u64)?;
+            if add(data_at, packed)? > start {
+                return Err(invalid("entry payload overlaps central directory"));
+            }
+            let local_fields = read_at(reader, local_at + 30, local_name_len + local_extra_len)?;
+            if &local_fields[..local_name_len] != name {
+                return Err(invalid("local/central entry name mismatch"));
+            }
+            extra_fields(&local_fields[local_name_len..])?;
+            position = end;
+            actual += 1;
+        }
+        if actual != entries {
+            return Err(invalid("raw central-directory count disagrees with footer"));
+        }
+        Ok(Directory {
+            entries: actual,
+            start,
+            offset,
+        })
+    }
+}
+
+fn open_update_zip(mut file: File) -> Result<ZipArchive<File>, Box<dyn std::error::Error>> {
+    let directory = update_zip_identity::scan(&mut file)
+        .map_err(|error| format!("update ZIP identity: {error}"))?;
+    let archive = ZipArchive::with_config(
+        zip::read::Config {
+            archive_offset: zip::read::ArchiveOffset::Known(directory.offset),
+        },
+        file,
+    )
+    .map_err(|error| format!("update ZIP identity: {error}"))?;
+    if archive.offset() != directory.offset || archive.central_directory_start() != directory.start
+    {
+        return Err("update ZIP identity: library/raw directory disagreement".into());
+    }
+    // This is not len() alone as a uniqueness oracle: raw records were scanned
+    // BEFORE the library's effective-name IndexMap was constructed. Any decoded
+    // collision (CP437/UTF-8/Unicode Path included) necessarily shrinks the map.
+    if archive.len() as u64 != directory.entries {
+        return Err("update ZIP identity: duplicate effective update ZIP entry".into());
+    }
+    Ok(archive)
+}
+
+struct UpdateImage {
+    partition: &'static str,
+    image_name: &'static str,
+    wire_partition: String,
+    size: u64,
+    // Freeze the exact converted bytes; never repeat a fallible vbmeta transform
+    // after an earlier image has been flashed. Only selected transforms are kept.
+    prepared_data: Option<Vec<u8>>,
+}
+
+/// Freeze required-image presence/readability and every partition/slot decision
+/// before the first download. Only one entry is decompressed at a time.
+fn prepare_update_images<T: FastbootTransport>(
+    transport: &mut T,
+    archive: &mut ZipArchive<File>,
+    required: &std::collections::HashSet<String>,
+    slot: &fastboot_protocol::SlotSelection,
+    max_download_size: Option<usize>,
+    gopts: &GlobalOptions,
+) -> Result<Vec<UpdateImage>, Box<dyn std::error::Error>> {
+    // open_update_zip checked raw CD records before constructing the name map.
+    // This set is only an image-presence index, never the uniqueness oracle.
+    let names: std::collections::HashSet<_> =
+        archive.file_names().map(str::to_string).collect();
+    let mut images = Vec::new();
+    for &(partition, image_name, optional) in AOSP_IMAGES {
+        if !names.contains(image_name) {
+            if !optional || required.contains(partition) {
+                return Err(
+                    format!("required image '{image_name}' missing from update ZIP").into(),
+                );
+            }
+            continue;
+        }
+        let mut entry = archive.by_name(image_name)?;
+        let size = entry.size();
+        if size == 0 || size > u32::MAX as u64 || entry.is_dir() {
+            return Err(format!("invalid update image '{image_name}' size: {size}").into());
+        }
+        // Read to EOF now: CRC, sparse parsing, or split-planning errors in a
+        // later image must not be discovered after an earlier partition write.
+        // The temporary buffer is released for each entry, not retained for the ZIP.
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data)?;
+        if data.len() as u64 != size {
+            return Err(format!("truncated update image '{image_name}'").into());
+        }
+        let freeze_data = is_vbmeta_partition(partition) && gopts.needs_vbmeta_patch();
+        if freeze_data {
+            if let Some(patched) = patch_vbmeta_flags(&data, gopts)
+                .map_err(|error| format!("update image '{image_name}': {error}"))?
+            {
+                data = patched;
+            }
+        }
+        let sparse = if data.starts_with(&fastboot_protocol::SPARSE_HEADER_MAGIC.to_le_bytes()) {
+            Some(fastboot_protocol::SparseFile::from_bytes(&data)?)
+        } else {
+            None
+        };
+        if let Some(limit) = max_download_size.filter(|limit| *limit > 0 && size > *limit as u64) {
+            let sparse =
+                sparse.unwrap_or_else(|| fastboot_protocol::SparseFile::from_raw(&data, 4096));
+            sparse.split(limit)?;
+        }
+        images.push(UpdateImage {
+            partition,
+            image_name,
+            wire_partition: partition.to_string(),
+            size,
+            prepared_data: if freeze_data { Some(data) } else { None },
+        });
+    }
+    let mut selected_slot = match slot {
+        fastboot_protocol::SlotSelection::Named(name) => Some(name.clone()),
+        fastboot_protocol::SlotSelection::Current => None,
+        _ => return Err("update --slot=all/other is not supported".into()),
+    };
+    for image in &mut images {
+        match update_getvar(transport, &format!("has-slot:{}", image.partition))?.as_str() {
+            "no" => {}
+            "yes" => {
+                if selected_slot.is_none() {
+                    let current = update_getvar(transport, "current-slot")?;
+                    match fastboot_protocol::SlotSelection::parse(Some(&current))? {
+                        fastboot_protocol::SlotSelection::Named(name) => selected_slot = Some(name),
+                        _ => return Err("device returned no concrete current-slot".into()),
+                    }
+                }
+                image.wire_partition =
+                    format!("{}_{}", image.partition, selected_slot.as_ref().unwrap());
+            }
+            value => {
+                return Err(format!("invalid has-slot:{} value: {value}", image.partition).into())
+            }
+        }
+    }
+    Ok(images)
+}
+
+/// Execute the bounded legacy update image-list path (not AOSP's full task planner).
 fn do_update<T: FastbootTransport>(
     transport: &mut T,
     zip_path: &str,
     gopts: &GlobalOptions,
+    slot: &fastboot_protocol::SlotSelection,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // --- Step 1: 打开 update.zip ---
     let zip_file = match File::open(zip_path) {
@@ -1237,13 +1659,9 @@ fn do_update<T: FastbootTransport>(
         }
     };
 
-    let mut archive = match ZipArchive::new(zip_file) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("[fastboot-rs] 错误: 无法解析 zip 文件 '{zip_path}': {e}");
-            std::process::exit(1);
-        }
-    };
+    // Validate raw metadata and effective identity before reading android-info
+    // or issuing any update query/download/flash to the target.
+    let mut archive = open_update_zip(zip_file)?;
 
     println!("[fastboot-rs] 已打开 update.zip ({} 个条目)", archive.len());
 
@@ -1276,7 +1694,7 @@ fn do_update<T: FastbootTransport>(
     println!("[fastboot-rs] --------------------------------------------");
 
     // 检查兼容性
-    check_android_info(transport, &android_info)?;
+    let required = check_android_info(transport, &android_info)?;
     println!("[fastboot-rs] 设备兼容性检查通过");
 
     // 获取 max-download-size
@@ -1295,78 +1713,29 @@ fn do_update<T: FastbootTransport>(
         );
     }
 
-    // 获取当前 slot
-    let current_slot = match transport.send_cmd("getvar:current-slot") {
-        Ok(_) => match transport.recv_response() {
-            Ok(fastboot_protocol::FastbootResponse::Okay(val)) => {
-                let s = val.trim().to_string();
-                if !s.is_empty() { Some(s) } else { None }
-            }
-            _ => None,
-        },
-        _ => None,
-    };
-    if let Some(ref slot) = current_slot {
-        println!("[fastboot-rs] 当前 slot: {slot}");
-    }
-
-    // --- Step 3: 按 AOSP 顺序刷写分区镜像 ---
-    // 收集 zip 中存在的镜像文件名以便快速查找
-    let zip_names: std::collections::HashSet<String> = archive
-        .file_names()
-        .map(|n| n.to_string())
-        .collect();
-
+    let images = prepare_update_images(transport, &mut archive, &required, slot, max_download_size, gopts)?;
+    // Every selected image and partition/slot query passed before any download.
     println!("[fastboot-rs] 开始刷写分区镜像...\n");
-
-    for &(partition, img_name, optional) in AOSP_IMAGES {
-        // 检查 zip 中是否存在此镜像
-        if !zip_names.contains(img_name) {
-            if optional {
-                println!(
-                    "[fastboot-rs]   {img_name}: 未找到，跳过（可选）"
-                );
-            } else {
-                eprintln!(
-                    "[fastboot-rs] 错误: 必需的镜像 '{img_name}' 在 zip 中未找到"
-                );
-                std::process::exit(1);
-            }
-            continue;
-        }
-
+    for image in images {
+        let partition = image.partition;
+        let img_name = image.image_name;
+        let partition_with_slot = image.wire_partition;
         println!("[fastboot-rs] >>> 刷写 {img_name} -> 分区 {partition}");
 
-        // 从 zip 读取镜像数据
-        let image_data = match archive.by_name(img_name) {
-            Ok(mut entry) => {
-                let mut data = Vec::new();
-                entry.read_to_end(&mut data)?;
-                data
-            }
-            Err(e) => {
-                eprintln!(
-                    "[fastboot-rs] 错误: 无法从 zip 读取 '{img_name}': {e}"
-                );
-                std::process::exit(1);
-            }
-        };
-
-        // AOSP SetVbmetaFlags: patch disable-verity/verification bits
-        // before flashing vbmeta partitions.
-        let image_data = if is_vbmeta_partition(partition) {
-            match patch_vbmeta_flags(&image_data, gopts) {
-                Some(patched) => {
-                    vlog!(gopts, "[fastboot-rs] vbmeta flags patched for {img_name} ({} bytes)", patched.len());
-                    patched
-                }
-                None => image_data,
-            }
+        // Selected vbmeta transforms were executed and frozen during preflight.
+        let image_data = if let Some(data) = image.prepared_data {
+            data
         } else {
-            image_data
+            let mut entry = archive.by_name(img_name)?;
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data)?;
+            data
         };
 
         let file_size = image_data.len();
+        if file_size as u64 != image.size {
+            return Err(format!("update image changed after preflight: {img_name}").into());
+        }
         if file_size == 0 {
             eprintln!("[fastboot-rs] 错误: 镜像 '{img_name}' 为空");
             std::process::exit(1);
@@ -1381,16 +1750,6 @@ fn do_update<T: FastbootTransport>(
         println!(
             "[fastboot-rs]   {img_name}: {file_size} 字节"
         );
-
-        let partition_with_slot = if let Some(ref slot) = current_slot {
-            if !partition.ends_with('_') {
-                format!("{partition}_{slot}")
-            } else {
-                partition.to_string()
-            }
-        } else {
-            partition.to_string()
-        };
 
         let need_split = match max_download_size {
             Some(limit) if limit > 0 && file_size > limit => true,
@@ -1480,19 +1839,13 @@ fn do_update<T: FastbootTransport>(
                 transport.flush()?;
 
                 let post_resp = transport.recv_response()?;
-                if let fastboot_protocol::FastbootResponse::Fail(reason) = post_resp {
-                    eprintln!(
-                        "[fastboot-rs] payload 发送失败 (chunk {}/{}): {reason}",
-                        idx + 1,
-                        splits.len()
-                    );
-                    std::process::exit(1);
-                }
+                require_terminal_okay(&post_resp)?;
 
                 // flash
                 let flash_cmd = fastboot_protocol::flash(&partition_with_slot);
                 transport.send_cmd(&flash_cmd)?;
                 let flash_resp = transport.recv_response()?;
+                require_terminal_okay(&flash_resp)?;
                 match &flash_resp {
                     fastboot_protocol::FastbootResponse::Okay(val) => {
                         println!(
@@ -1554,15 +1907,13 @@ fn do_update<T: FastbootTransport>(
             transport.flush()?;
 
             let post_resp = transport.recv_response()?;
-            if let fastboot_protocol::FastbootResponse::Fail(reason) = &post_resp {
-                eprintln!("[fastboot-rs] payload 发送失败 ({img_name}): {reason}");
-                std::process::exit(1);
-            }
+            require_terminal_okay(&post_resp)?;
 
             // 发送 flash 命令
             let flash_cmd = fastboot_protocol::flash(&partition_with_slot);
             transport.send_cmd(&flash_cmd)?;
             let flash_resp = transport.recv_response()?;
+            require_terminal_okay(&flash_resp)?;
             match &flash_resp {
                 fastboot_protocol::FastbootResponse::Okay(val) => {
                     println!("[fastboot-rs]   {img_name} -> {partition_with_slot} OK: {val}");
@@ -1654,7 +2005,7 @@ fn flash_image_file<T: FastbootTransport>(
         // AOSP SetVbmetaFlags: patch disable-verity/verification bits
         // before flashing vbmeta partitions.
         let image_data = if is_vbmeta_partition(partition_label) {
-            match patch_vbmeta_flags(&image_data, gopts) {
+            match patch_vbmeta_flags(&image_data, gopts)? {
                 Some(patched) => {
                     vlog!(gopts, "[fastboot-rs] vbmeta flags patched ({} bytes)", patched.len());
                     patched
@@ -1734,10 +2085,7 @@ fn flash_image_file<T: FastbootTransport>(
             transport.flush()?;
 
             let post_dl_resp = transport.recv_response()?;
-            if let fastboot_protocol::FastbootResponse::Fail(reason) = post_dl_resp {
-                eprintln!("Error after payload send for chunk {}: {}", idx + 1, reason);
-                std::process::exit(1);
-            }
+            require_terminal_okay(&post_dl_resp)?;
 
             let flash_cmd = fastboot_protocol::flash(wire_partition);
             transport.send_cmd(&flash_cmd)?;
@@ -1763,7 +2111,7 @@ fn flash_image_file<T: FastbootTransport>(
                     std::process::exit(1);
                 }
             };
-            match patch_vbmeta_flags(&data, gopts) {
+            match patch_vbmeta_flags(&data, gopts)? {
                 Some(patched) => {
                     vlog!(gopts, "[fastboot-rs] vbmeta flags patched ({} bytes)", patched.len());
                     Some(patched)
@@ -1845,10 +2193,7 @@ fn flash_image_file<T: FastbootTransport>(
         transport.flush()?;
 
         let post_dl_resp = transport.recv_response()?;
-        if let fastboot_protocol::FastbootResponse::Fail(reason) = post_dl_resp {
-            eprintln!("Error after payload send: {}", reason);
-            std::process::exit(1);
-        }
+        require_terminal_okay(&post_dl_resp)?;
 
         let flash_cmd = fastboot_protocol::flash(wire_partition);
         transport.send_cmd(&flash_cmd)?;
@@ -1860,8 +2205,53 @@ fn flash_image_file<T: FastbootTransport>(
     Ok(())
 }
 
+/// Parsed compatibility flags must never silently promise missing orchestration.
+/// Keep this gate before target opening, local-file reads, and storage operations.
+fn validate_supported_options(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    for (requested, option) in [
+        (cli.set_active.is_some(), "--set-active"),
+        (cli.skip_secondary, "--skip-secondary"),
+        (cli.force, "--force"),
+        (cli.unbuffered, "--unbuffered"),
+    ] {
+        if requested {
+            return Err(format!("{option} is not supported; refusing before any I/O").into());
+        }
+    }
+    if cli.skip_reboot {
+        return Err("--skip-reboot is not supported; flash/update currently do not automatically reboot; refusing before any I/O".into());
+    }
+    if matches!(cli.slot.as_deref(), Some("all" | "other")) {
+        return Err("--slot=all/other is not supported; refusing before any I/O".into());
+    }
+    if cli.slot.is_some()
+        && !matches!(
+            cli.command,
+            Commands::Flash { .. }
+                | Commands::WipeSuper { .. }
+                | Commands::FlashRaw { .. }
+                | Commands::Erase { .. }
+                | Commands::Format { .. }
+                | Commands::Fetch { .. }
+                | Commands::Update { .. }
+        )
+    {
+        return Err("--slot is not supported for this command; refusing before any I/O".into());
+    }
+    if (cli.disable_verity || cli.disable_verification)
+        && !matches!(
+            cli.command,
+            Commands::Flash { .. } | Commands::WipeSuper { .. } | Commands::Update { .. }
+        )
+    {
+        return Err("--disable-verity/--disable-verification are not supported for this command; refusing before any I/O".into());
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    validate_supported_options(&cli)?;
     let environment_serial = std::env::var("ANDROID_SERIAL").ok();
     let connection_target = match &cli.command {
         // connect has its own explicit positional target; disconnect is a
@@ -1876,9 +2266,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // AOSP-mirror global options, constructed once and threaded through.
     let gopts = GlobalOptions {
-        skip_reboot: cli.skip_reboot,
-        skip_secondary: cli.skip_secondary,
-        force_flash: cli.force,
         disable_verity: cli.disable_verity,
         disable_verification: cli.disable_verification,
         verbose: cli.verbose,
@@ -1886,18 +2273,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if gopts.verbose {
         eprintln!("[fastboot-rs] verbose mode enabled");
         eprintln!("[fastboot-rs] global options: {gopts:?}");
-    }
-
-    // `--set-active[=SLOT]` is parsed and validated here. Applying it around
-    // flashall/update requires orchestration deliberately outside this slice.
-    if let Some(value) = cli.set_active.as_deref() {
-        let requested = if value.is_empty() { None } else { Some(value) };
-        match fastboot_protocol::SlotSelection::parse(requested)? {
-            fastboot_protocol::SlotSelection::Named(_) | fastboot_protocol::SlotSelection::Current => {}
-            fastboot_protocol::SlotSelection::All | fastboot_protocol::SlotSelection::Other => {
-                return Err("--set-active requires a concrete slot (or no value)".into());
-            }
-        }
     }
 
     match cli.command {
@@ -2283,6 +2658,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // 读取 flash 响应
             let flash_resp = transport.recv_response()?;
+            require_terminal_okay(&flash_resp)?;
             match &flash_resp {
                 fastboot_protocol::FastbootResponse::Okay(val) => {
                     println!(
@@ -2610,8 +2986,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             transport.flush()?;
 
-            // Step 4: 读取最终 OKAY/FAIL 响应
+            // Step 4: only OKAY completes the accepted download.
             let final_resp = transport.recv_response()?;
+            require_terminal_okay(&final_resp)?;
             match &final_resp {
                 fastboot_protocol::FastbootResponse::Okay(msg) => {
                     println!("[fastboot-rs] Stage 成功: {}", msg);
@@ -2698,7 +3075,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             println!("[fastboot-rs] 已连接至 fastboot 目标 {addr}");
-            do_update(&mut transport, &zip_file, &gopts)?;
+            do_update(&mut transport, &zip_file, &gopts, &slot_selection)?;
         }
         Commands::Gsi { action } => {
             let mut transport = match open_transport(&connection_target, Duration::from_secs(3)) {
@@ -3061,7 +3438,7 @@ mod tests {
     fn patch_vbmeta_sets_verity_bit() {
         let data = fake_vbmeta();
         let opts = GlobalOptions { disable_verity: true, ..Default::default() };
-        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch");
+        let patched = patch_vbmeta_flags(&data, &opts).expect("valid structure").expect("should patch");
         assert_eq!(patched[123] & 0x01, 0x01, "bit 0 = disable-verity");
         assert_eq!(patched[123] & 0x02, 0x00, "bit 1 unchanged");
     }
@@ -3070,7 +3447,7 @@ mod tests {
     fn patch_vbmeta_sets_verification_bit() {
         let data = fake_vbmeta();
         let opts = GlobalOptions { disable_verification: true, ..Default::default() };
-        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch");
+        let patched = patch_vbmeta_flags(&data, &opts).expect("valid structure").expect("should patch");
         assert_eq!(patched[123] & 0x02, 0x02, "bit 1 = disable-verification");
         assert_eq!(patched[123] & 0x01, 0x00, "bit 0 unchanged");
     }
@@ -3079,7 +3456,7 @@ mod tests {
     fn patch_vbmeta_sets_both_bits() {
         let data = fake_vbmeta();
         let opts = GlobalOptions { disable_verity: true, disable_verification: true, ..Default::default() };
-        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch");
+        let patched = patch_vbmeta_flags(&data, &opts).expect("valid structure").expect("should patch");
         assert_eq!(patched[123] & 0x03, 0x03, "both bits set");
     }
 
@@ -3087,14 +3464,14 @@ mod tests {
     fn patch_vbmeta_noop_without_flags() {
         let data = fake_vbmeta();
         let opts = GlobalOptions::default();
-        assert!(patch_vbmeta_flags(&data, &opts).is_none(), "no flags → None");
+        assert!(patch_vbmeta_flags(&data, &opts).expect("unrecognized or unchanged").is_none(), "no flags → None");
     }
 
     #[test]
     fn patch_vbmeta_rejects_short_buffer() {
         let data = vec![0u8; 100];
         let opts = GlobalOptions { disable_verity: true, ..Default::default() };
-        assert!(patch_vbmeta_flags(&data, &opts).is_none(), "too short → None");
+        assert!(patch_vbmeta_flags(&data, &opts).expect("unrecognized or unchanged").is_none(), "too short → None");
     }
 
     #[test]
@@ -3102,7 +3479,7 @@ mod tests {
         let mut data = vec![0u8; 256];
         data[0..4].copy_from_slice(b"XXXX"); // wrong magic
         let opts = GlobalOptions { disable_verity: true, ..Default::default() };
-        assert!(patch_vbmeta_flags(&data, &opts).is_none(), "no AVB0 → None");
+        assert!(patch_vbmeta_flags(&data, &opts).expect("unrecognized or unchanged").is_none(), "no AVB0 → None");
     }
 
     #[test]
@@ -3115,11 +3492,14 @@ mod tests {
         // Build footer at the end
         let footer_start = data.len() - AVB_FOOTER_SIZE;
         data[footer_start..footer_start + 4].copy_from_slice(b"AVBf");
-        // vbmeta_offset as BE u64 at footer+8
-        data[footer_start + 8..footer_start + 16].copy_from_slice(&256u64.to_be_bytes());
+        // Packed AvbFooter: major=4, original_size=12, offset=20, size=28.
+        data[footer_start + 4..footer_start + 8].copy_from_slice(&1u32.to_be_bytes());
+        data[footer_start + 12..footer_start + 20].copy_from_slice(&128u64.to_be_bytes());
+        data[footer_start + 20..footer_start + 28].copy_from_slice(&256u64.to_be_bytes());
+        data[footer_start + 28..footer_start + 36].copy_from_slice(&256u64.to_be_bytes());
 
         let opts = GlobalOptions { disable_verity: true, disable_verification: true, ..Default::default() };
-        let patched = patch_vbmeta_flags(&data, &opts).expect("should patch via footer");
+        let patched = patch_vbmeta_flags(&data, &opts).expect("valid structure").expect("should patch via footer");
         // flags LSB at 256 + 123 = 379
         assert_eq!(patched[379] & 0x03, 0x03, "both bits set via footer path");
     }

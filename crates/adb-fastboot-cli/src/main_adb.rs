@@ -6,8 +6,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use adb_protocol::{
     AdbAuth, AdbMessageHeader, AdbServerTransport, TcpTransport, Transport,
-    ADB_VERSION, A_AUTH, A_AUTH_TOKEN,
-    A_CLSE, A_CNXN, A_OPEN, A_STLS, MAX_PAYLOAD_V2,
+    A_CLSE, A_OPEN,
     build_sync_send_req, build_sync_data_chunk, build_sync_done,
     host_cnxn_payload,
 };
@@ -64,6 +63,32 @@ fn reconnect_service(target: Option<&str>) -> Result<&'static str, String> {
         Some("offline") => Ok("host:reconnect-offline"),
         Some(other) => Err(format!("unknown reconnect target '{other}'. Use 'device' or 'offline'.")),
     }
+}
+
+/// Lines printed by `adb-rs version` (AOSP `adb_version()`, adb.cpp:101-110).
+///
+/// The `Revision` line carries build identity, so it must never be a fixed
+/// placeholder such as `deadbeef1234`: that is fabricated evidence. The real
+/// revision is injected at build time (`ADB_RS_BUILD_REVISION`, alias
+/// `GIT_REVISION`); ordinary Git builds automatically inject the real HEAD.
+/// Source archives without Git metadata honestly report the crate version.
+fn version_lines() -> Vec<String> {
+    vec![
+        format!("Android Debug Bridge version {}", env!("CARGO_PKG_VERSION")),
+        format!("Revision {}-android", build_revision()),
+    ]
+}
+
+/// Real build revision for the `Revision` line, or the crate version when no
+/// revision was injected. Never a fabricated constant.
+fn build_revision() -> String {
+    option_env!("ADB_RS_BUILD_REVISION")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| option_env!("GIT_REVISION").map(str::trim).filter(|s| !s.is_empty()))
+        .or(option_env!("ADB_RS_GIT_REVISION"))
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+        .to_string()
 }
 
 /// The only compression selection safe on the current V1 SYNC transfer path.
@@ -207,7 +232,7 @@ pub enum Commands {
         remote: Option<String>,
         local: Option<String>,
     },
-    /// Install one APK; streamed mode is chosen from the device feature banner by default
+    /// Install one APK or APEX; APEX requires streamed mode and device apex support
     Install {
         /// Require streamed install; fail if the device lacks the cmd feature
         #[arg(long, conflicts_with = "no_streaming")]
@@ -677,160 +702,21 @@ pub(crate) fn persist_adb_pubkey(auth: &AdbAuth) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Connect to adbd, perform CNXN handshake with A_STLS TLS upgrade support.
-///
-/// If the device responds with A_STLS, the transport is upgraded to TLS
-/// using the auth key, and the CNXN handshake is retried over the encrypted channel.
-#[cfg(feature = "tls")]
+/// Connect through the shared production CNXN/AUTH/STLS handshake.
+/// AOSP adb.cpp replies STLS before TLS; client/auth.cpp waits for device CNXN.
 pub fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     transport: T,
     cnxn_payload: &[u8],
     auth: &AdbAuth,
 ) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
-    let mut transport: Box<dyn Transport> = Box::new(transport);
-
-    // AOSP client semantics (adb.cpp handle_packet → A_AUTH/TOKEN, auth.cpp
-    // send_auth_response): answer each A_AUTH TOKEN with a SIGNATURE from the
-    // next key; when keys are exhausted send RSAPUBLICKEY once and wait.
-    let mut responder = adb_protocol::AuthResponder::single(auth.clone());
-
-    // Send initial CNXN
-    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-    transport.send_message(&cnxn_hdr, cnxn_payload)?;
-
-    loop {
-        let (resp_hdr, payload) = transport.recv_message()?;
-
-        match resp_hdr.command {
-            A_CNXN => {
-                // Normal path — no TLS required
-                let banner = String::from_utf8_lossy(&payload).to_string();
-
-                // Persist the public key so future SIGNATURE verifications
-                // succeed without requiring another authorization dialog
-                // (HyperOS does not always persist via AdbDebuggingManager).
-                #[cfg(target_os = "android")]
-                if responder.pubkey_sent() {
-                    persist_adb_pubkey(auth)?;
-                }
-
-                return Ok((DeviceInfo { banner }, transport));
-            }
-            A_AUTH if resp_hdr.arg0 == A_AUTH_TOKEN => {
-                if payload.len() != 20 {
-                    return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
-                }
-                if let Some((hdr, auth_payload)) = responder.respond_to_token(&payload)? {
-                    transport.send_message(&hdr, &auth_payload)?;
-                }
-                continue;
-            }
-            A_STLS => break, // TLS upgrade path below
-            _ => {
-                return Err(format!(
-                    "Unexpected handshake response: cmd={:#x}",
-                    resp_hdr.command
-                )
-                .into());
-            }
-        }
-    }
-
-    // A_STLS received — upgrade to TLS and re-send CNXN.
-    {
-        use adb_protocol::tls;
-        use adb_protocol::AdbTlsTransport;
-
-        let rsa_pem = match adb_protocol::auth::export_private_key_to_pem(auth.private_key()) {
-            Ok(pem) => pem,
-            Err(e) => return Err(format!("Failed to export RSA key: {e}").into()),
-        };
-        let (cert_der, key_der) = match tls::generate_self_signed_cert(&rsa_pem) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[adb-auth] TLS cert generation failed (falling back to non-TLS): {e}");
-                return Ok((DeviceInfo { banner: String::new() }, transport));
-            }
-        };
-        let config = match tls::create_tls_config(cert_der, key_der) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[adb-auth] TLS config creation failed (falling back to non-TLS): {e}");
-                return Ok((DeviceInfo { banner: String::new() }, transport));
-            }
-        };
-
-        let tls_transport = match AdbTlsTransport::new(transport, config, "adb") {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[adb-auth] TLS upgrade failed: {e}");
-                return Err(format!("TLS upgrade failed: {e}").into());
-            }
-        };
-
-        // Re-send CNXN over TLS
-        let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-        let mut tls_box: Box<dyn Transport> = Box::new(tls_transport);
-        tls_box.send_message(&cnxn_hdr, cnxn_payload)?;
-
-        let (resp_hdr2, payload2) = tls_box.recv_message()?;
-        if resp_hdr2.command != A_CNXN {
-            return Err(format!(
-                "Unexpected handshake response after TLS upgrade: cmd={:#x}",
-                resp_hdr2.command
-            )
-            .into());
-        }
-
-        let banner = String::from_utf8_lossy(&payload2).to_string();
-        Ok((DeviceInfo { banner }, tls_box))
-    }
-}
-
-/// Non-TLS fallback — A_STLS will return an error if the device requires TLS.
-#[cfg(not(feature = "tls"))]
-fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
-    transport: T,
-    cnxn_payload: &[u8],
-    auth: &AdbAuth,
-) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
-    let mut transport: Box<dyn Transport> = Box::new(transport);
-    let mut responder = adb_protocol::AuthResponder::single(auth.clone());
-    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-
-    transport.send_message(&cnxn_hdr, cnxn_payload)?;
-
-    loop {
-        let (resp_hdr, payload) = transport.recv_message()?;
-        if resp_hdr.command == A_STLS {
-            return Err("Device requires TLS (A_STLS) but the `tls` feature is not enabled. \
-                        Rebuild with --features tls"
-                .into());
-        }
-        if resp_hdr.command == A_AUTH && resp_hdr.arg0 == A_AUTH_TOKEN {
-            if payload.len() != 20 {
-                return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
-            }
-            if let Some((hdr, auth_payload)) = responder.respond_to_token(&payload)? {
-                transport.send_message(&hdr, &auth_payload)?;
-            }
-            continue;
-        }
-        if resp_hdr.command != A_CNXN {
-            return Err(format!("Unexpected handshake response: cmd={:#x}", resp_hdr.command).into());
-        }
-
-        let banner = String::from_utf8_lossy(&payload).to_string();
-
-        // Persist the public key so future SIGNATURE verifications succeed
-        // without requiring another authorization dialog.
-        #[cfg(target_os = "android")]
-        if responder.pubkey_sent() {
-            persist_adb_pubkey(auth)?;
-        }
-
-        return Ok((DeviceInfo { banner }, transport));
-    }
+    let (info, transport) =
+        client::transport::connect_and_handshake_with_tls_upgrade(transport, cnxn_payload, auth)?;
+    Ok((
+        DeviceInfo {
+            banner: info.banner,
+        },
+        transport,
+    ))
 }
 
 /// AOSP install_app_incremental (adb_install.cpp:299-357) over an already
@@ -951,9 +837,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Send shell service via host service protocol
                     server.send_host_request(&shell_service)?;
                     server.read_status()?; // OKAY -> server created A_OPEN, device OK'd
-                    // Now in raw forwarding mode — stream shell output
-                    shell::stream_shell_v2_server(&mut server, false)?;
-                    return Ok(());
+                    // Now in raw forwarding mode — stream shell output and
+                    // relay the remote exit code as our own process status.
+                    let (_captured, exit_code) = shell::stream_shell_v2_server(&mut server, false)?;
+                    std::process::exit(exit_code.unwrap_or(255) as i32);
                 }
             }
 
@@ -987,8 +874,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => return Err(e),
             };
 
-            let (_lid, remote_id) = protocol::open_service(&mut transport, &shell_service, 1)?;
-            shell::stream_shell_v2(&mut transport, _lid, remote_id, false)?;
+            let (local_id, remote_id) = protocol::open_service(&mut transport, &shell_service, 1)?;
+            // Relay the remote exit code (AOSP read_and_dump_protocol); 255 for
+            // an unexpected disconnection without an ExitCode packet.
+            let (_captured, exit_code) =
+                shell::stream_shell_v2_exit(&mut transport, local_id, remote_id, false)?;
+            std::process::exit(exit_code.unwrap_or(255) as i32);
         }
         Commands::ExecOut { command } | Commands::ExecIn { command } => {
             // AOSP commandline.cpp:1802: exec-in/exec-out open the raw `exec:`
@@ -1071,7 +962,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Pull { remote, local, preserve, algorithm, no_compress } => {
             let serial = cli.serial.as_deref();
             let _compression = sync_compression_option(algorithm.as_deref(), *no_compress)?;
-            match file_sync::pull(serial, remote, local, *preserve) {
+            match file_sync::pull_at(server_port, serial, remote, local, *preserve) {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("Error: pull failed: {e}");
@@ -1173,15 +1064,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !apk_path.exists() {
                 return Err(format!("APK not found: {apk}").into());
             }
-            if !apk_path
+            let extension = apk_path
                 .extension()
                 .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("apk"))
-            {
-                return Err("This install command currently supports .apk files only; APEX install is not implemented".into());
+                .unwrap_or_default();
+            let is_apex = extension.eq_ignore_ascii_case("apex");
+            if !extension.eq_ignore_ascii_case("apk") && !is_apex {
+                return Err(format!("filename doesn't end .apk or .apex: {apk}").into());
+            }
+            if is_apex && *no_streaming {
+                return Err("APEX packages are only compatible with Streamed Install".into());
+            }
+            if is_apex && *incremental {
+                return Err("--incremental does not support .apex files".into());
             }
 
-            let mode_from_args = if *streaming {
+            // APEX is a streamed-only package, not an unsigned incremental
+            // companion. An explicit regular mode also bypasses the automatic
+            // incremental settings probe in calculate_install_mode.
+            let mode_from_args = if *streaming || is_apex {
                 Some(client::adb_install::InstallMode::Streamed)
             } else if *no_streaming {
                 Some(client::adb_install::InstallMode::Push)
@@ -1203,6 +1104,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &cnxn_payload,
                 default_auth(),
             )?;
+
+            if is_apex
+                && !client::adb_install::CommandTransport::apex_supported(&device_info.banner)
+            {
+                return Err(".apex is not supported on the target device".into());
+            }
 
             // AOSP calculate_install_mode (adb_install.cpp:353-415): pick the
             // primary mode and optional fallback; the incremental-by-default
@@ -1527,8 +1434,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Version => {
-            println!("Android Debug Bridge version {}", env!("CARGO_PKG_VERSION"));
-            println!("Revision deadbeef1234-android");
+            for line in version_lines() {
+                println!("{line}");
+            }
         }
 
         Commands::GetState => {
@@ -2297,6 +2205,25 @@ mod tests {
     #[test]
     fn reconnect_offline_uses_aosp_host_service() {
         assert_eq!(reconnect_service(Some("offline")).unwrap(), "host:reconnect-offline");
+    }
+
+    /// `adb-rs version` must report a real build identity, not a placeholder.
+    #[test]
+    fn version_reports_real_build_identity_not_placeholder() {
+        let lines = version_lines();
+        let joined = lines.join("\n");
+        assert!(
+            !joined.to_ascii_lowercase().contains("deadbeef"),
+            "version must not contain a placeholder revision: {joined:?}"
+        );
+        assert!(
+            joined.contains(env!("CARGO_PKG_VERSION")),
+            "version must contain the real package version: {joined:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("Revision ")),
+            "version must still report a Revision line: {joined:?}"
+        );
     }
 
     #[test]
