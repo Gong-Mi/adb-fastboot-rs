@@ -75,8 +75,19 @@ fn reconnect_service(target: Option<&str>) -> Result<&'static str, String> {
 fn version_lines() -> Vec<String> {
     vec![
         format!("Android Debug Bridge version {}", env!("CARGO_PKG_VERSION")),
-        "Revision deadbeef1234-android".to_string(),
+        format!("Revision {}-android", build_revision()),
     ]
+}
+
+/// Real build revision for the `Revision` line, or the crate version when no
+/// revision was injected. Never a fabricated constant.
+fn build_revision() -> String {
+    option_env!("ADB_RS_BUILD_REVISION")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| option_env!("GIT_REVISION").map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+        .to_string()
 }
 
 /// The only compression selection safe on the current V1 SYNC transfer path.
