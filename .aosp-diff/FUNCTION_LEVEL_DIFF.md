@@ -43,6 +43,7 @@ Android.bp 权威源码分母: 67 个 host 侧 .cpp；附录的函数定义计�
 - Emulator transport: verified emulator serial parsing/port mapping, CNXN probe vs unexpected command validation, and fake console TCP greeting/command roundtrip.
 - Auth & Trace: `adb_auth_keygen` and `adb_auth_pubkey` roundtrip verification with 0600 mode and `.pub` content equality; `adb pubkey <FILE>` CLI command support; `adb_trace_init` and `get_trace_setting` parsing verified; `AdbAuthInotify` dynamically monitors key directories and updates in response to `IN_CREATE`/`IN_MOVED_TO` ignoring `.pub` artifacts.
 - Local exact worktree: `cargo check --workspace --all-features` exit 0; workspace all-targets tests across 11 binaries: default 569 passed/0 failed, all-features 573/0, no-default-features 538/0. ADB CLI binary is 268/0 and `adb-mdns` is 40/0.
+- Push sync slice: `adb push --sync` now implements AOSP `sync_send` semantics (remote STAT mtime == local mtime → skip; any STAT failure → send) for single files and directories (`push()` dispatches dirs to `push_dir`). SYNC V1 DONE now carries the local mtime instead of `0xFFFFFFFF`; direct-mode STAT no longer lets `send_wrte` swallow the A_WRTE result. `ANDROID_ADB_SERVER_PORT` is honored by file_sync's server probe. Tests: `push_sync_skips_when_remote_mtime_matches`, `push_sync_sends_when_remote_mtime_differs` (real CLI + fake adbd, asserts DONE mtime and no SEND on skip). CLI all-features: 387 passed/0 failed.
 
 ## ADB install AOSP差异（源码静态审计；尚未做设备端验收）
 
