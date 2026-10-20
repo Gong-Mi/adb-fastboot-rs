@@ -87,6 +87,58 @@ fn sync_equal(st: &FileStat, local_mtime: u32) -> bool {
     remote_exists(st) && st.mtime == local_mtime
 }
 
+/// `S_ISDIR` over a raw V1 STAT mode word.
+fn mode_is_dir(mode: u32) -> bool {
+    mode & 0o170000 == 0o040000
+}
+
+/// Basename of the local file, used when the destination is a directory.
+///
+/// AOSP uses `android::base::Basename(src_path)`. A path whose basename cannot
+/// be named (trailing `/..`, filesystem root) or is not UTF-8 is an error — the
+/// remote path is never built by silently lossy-converting the name.
+fn local_push_basename(local: &str) -> Result<String, String> {
+    let name = Path::new(local)
+        .file_name()
+        .ok_or_else(|| format!("cannot determine basename of local path '{local}'"))?;
+    name.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("local file name '{name:?}' is not valid UTF-8"))
+}
+
+/// Resolve the remote SEND path for a single local file.
+///
+/// Mirrors AOSP `do_sync_push` (`client/file_sync_client.cpp:1454-1486`, then
+/// `1523-1533` for the file destination, consumed by `sync_send` at `:1537`):
+/// - destination exists and is a directory → `remote + "/" + basename(local)`;
+/// - destination exists and is not a directory, `remote` ends with `/` →
+///   `failed to access '<remote>': Not a directory` (AOSP only rejects a
+///   trailing slash when the path *exists*, `:1479-1484`);
+/// - otherwise → `remote` verbatim, trailing slash included.
+fn resolve_remote_file_target(
+    remote: &str,
+    remote_is_dir: bool,
+    remote_exists: bool,
+    local_basename: &str,
+) -> Result<String, String> {
+    if remote_is_dir {
+        let mut target = String::with_capacity(remote.len() + 1 + local_basename.len());
+        target.push_str(remote);
+        if !target.ends_with('/') {
+            target.push('/');
+        }
+        target.push_str(local_basename);
+        return Ok(target);
+    }
+
+    // A path that ends with a slash doesn't have to be a directory if it
+    // doesn't exist yet (AOSP `:1479-1481`).
+    if remote.ends_with('/') && remote_exists {
+        return Err(format!("failed to access '{remote}': Not a directory"));
+    }
+    Ok(remote.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Public API — existing single-file push/pull (unchanged)
 // ---------------------------------------------------------------------------
@@ -520,12 +572,32 @@ fn push_file_direct(
     remote: &str,
     sync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // AOSP do_sync_push stats the destination first and sends to the resolved
+    // dst_path; sync_send then compares that resolved path (`:1537`).
+    let (remote_present, remote_is_dir) =
+        match stat_direct_inner(transport, local_id, remote_id, remote) {
+            Ok(st) => (remote_exists(&st), mode_is_dir(st.mode)),
+            // V1 STAT cannot report errno: a failed stat takes AOSP's
+            // ENOENT/ENOPROTOOPT branch (destination treated as absent).
+            Err(_) => (false, false),
+        };
+    let target = if remote_is_dir {
+        resolve_remote_file_target(
+            remote,
+            true,
+            remote_present,
+            &local_push_basename(local)?,
+        )?
+    } else {
+        resolve_remote_file_target(remote, false, remote_present, "")?
+    };
+
     let local_path = Path::new(local);
     let mtime = local_mtime_secs(local_path)?;
     if sync {
-        if let Ok(st) = stat_direct_inner(transport, local_id, remote_id, remote) {
+        if let Ok(st) = stat_direct_inner(transport, local_id, remote_id, &target) {
             if sync_equal(&st, mtime) {
-                println!("[adb-rs] Skipped '{}' (remote mtime matches)", remote);
+                println!("[adb-rs] Skipped '{}' (remote mtime matches)", target);
                 return Ok(());
             }
         }
@@ -533,11 +605,11 @@ fn push_file_direct(
     let file_data = std::fs::read(local_path)
         .map_err(|e| format!("Cannot read local file '{local}': {e}"))?;
 
-    println!("[adb-rs] Pushing '{}' -> '{}' ({} bytes)", local, remote, file_data.len());
+    println!("[adb-rs] Pushing '{}' -> '{}' ({} bytes)", local, target, file_data.len());
 
     // Build SEND request (sync header + path,mode)
     let mut send_buf = Vec::new();
-    build_sync_send_req(remote, 0o644, &mut send_buf)
+    build_sync_send_req(&target, 0o644, &mut send_buf)
         .map_err(|e| format!("Build SEND req failed: {e}"))?;
     protocol::send_wrte(transport, local_id, remote_id, &send_buf)?;
 
@@ -964,6 +1036,18 @@ fn push_file_server(
     remote: &str,
     sync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Same AOSP do_sync_push destination resolution as the direct path.
+    let (remote_present, remote_is_dir) = match stat_server(transport, remote) {
+        Ok(st) => (remote_exists(&st), mode_is_dir(st.mode)),
+        Err(_) => (false, false),
+    };
+    let target = if remote_is_dir {
+        resolve_remote_file_target(remote, true, remote_present, &local_push_basename(local)?)?
+    } else {
+        resolve_remote_file_target(remote, false, remote_present, "")?
+    };
+    let remote = target.as_str();
+
     let local_path = Path::new(local);
     let mtime = local_mtime_secs(local_path)?;
     if sync {
@@ -1274,6 +1358,7 @@ mod tests {
         outcome: SendOutcome,
         completed: usize,
         status_acks: usize,
+        stats: usize,
     }
 
     impl SendPeer {
@@ -1281,6 +1366,27 @@ mod tests {
             let header = SyncMessageHeader::decode(payload).unwrap();
             let data = &payload[8..];
             match header.id {
+                SYNC_STAT => {
+                    // do_sync_push stats the destination before choosing dst_path.
+                    assert_eq!(header.length as usize, data.len());
+                    self.stats += 1;
+                    let requested = std::str::from_utf8(data).unwrap();
+                    let (pending_path, _, _) = self.expected.front().expect("STAT without pending SEND");
+                    assert_eq!(requested, pending_path.as_str(), "STAT must target the requested path");
+                    // A plain file keeps the SEND path unchanged (no basename append).
+                    let stat = SyncStatResponse { mode: 0o100644, size: 0, mtime: 0 };
+                    let mut encoded_stat = [0u8; SyncStatResponse::SIZE];
+                    stat.encode(&mut encoded_stat);
+                    let mut stat_header = [0u8; SyncMessageHeader::SIZE];
+                    SyncMessageHeader::new(SYNC_STAT, SyncStatResponse::SIZE as u32)
+                        .encode(&mut stat_header);
+                    let reply = [stat_header.as_slice(), encoded_stat.as_slice()].concat();
+                    if self.direct {
+                        self.incoming.push_back((AdbMessageHeader::new(A_WRTE, 41, 7, &reply), reply));
+                    } else {
+                        self.raw_reply = Cursor::new(reply);
+                    }
+                }
                 adb_protocol::SYNC_SEND => {
                     assert!(self.active.is_none(), "SEND before previous DONE");
                     assert_eq!(header.length as usize, data.len());
@@ -1400,7 +1506,7 @@ mod tests {
                 active: None,
                 pending_mtime: None,
                 incoming: Default::default(), raw_reply: Cursor::new(Vec::new()),
-                direct, outcome, completed: 0, status_acks: 0,
+                direct, outcome, completed: 0, status_acks: 0, stats: 0,
             };
             let result = match (direct, batch) {
                 (true, false) => push_file_direct(&mut peer, 7, 41, &files[0].local, &files[0].remote, false),
@@ -1417,9 +1523,12 @@ mod tests {
                 }
             }
             assert_eq!(peer.completed, if batch && matches!(outcome, SendOutcome::Okay) { 2 } else { 1 });
+            // Single-file push stats the destination once (do_sync_push); the
+            // batch path (push_dir) has already resolved its own targets.
+            assert_eq!(peer.stats, if batch { 0 } else { 1 }, "direct={direct}");
             assert!(peer.active.is_none());
             if direct && !matches!(outcome, SendOutcome::Disconnect) {
-                assert_eq!(peer.status_acks, peer.completed);
+                assert_eq!(peer.status_acks, peer.completed + peer.stats);
                 assert!(peer.incoming.is_empty());
             }
         }
@@ -1488,5 +1597,74 @@ mod tests {
             adb_protocol::SYNC_RECV
         );
         let _ = fs::remove_file(destination);
+    }
+
+    // ---- do_sync_push destination resolution (pure) ----
+
+    #[test]
+    fn resolve_appends_basename_only_for_an_existing_directory() {
+        assert_eq!(
+            resolve_remote_file_target("/remote/dir", true, true, "payload.bin").unwrap(),
+            "/remote/dir/payload.bin"
+        );
+        // A directory destination that already ends with '/' keeps one slash.
+        assert_eq!(
+            resolve_remote_file_target("/remote/dir/", true, true, "payload.bin").unwrap(),
+            "/remote/dir/payload.bin"
+        );
+        // Root directory destination.
+        assert_eq!(
+            resolve_remote_file_target("/", true, true, "payload.bin").unwrap(),
+            "/payload.bin"
+        );
+    }
+
+    #[test]
+    fn resolve_keeps_an_existing_file_path_verbatim() {
+        assert_eq!(
+            resolve_remote_file_target("/remote/payload.bin", false, true, "payload.bin").unwrap(),
+            "/remote/payload.bin"
+        );
+        // A different local name must not be appended onto a file destination.
+        assert_eq!(
+            resolve_remote_file_target("/remote/other.bin", false, true, "payload.bin").unwrap(),
+            "/remote/other.bin"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_trailing_slash_on_an_existing_non_directory() {
+        let error = resolve_remote_file_target("/remote/payload.bin/", false, true, "payload.bin")
+            .unwrap_err();
+        assert_eq!(error, "failed to access '/remote/payload.bin/': Not a directory");
+    }
+
+    #[test]
+    fn resolve_keeps_trailing_slash_when_the_target_does_not_exist() {
+        // AOSP :1479-1481 — only an *existing* non-directory is an error.
+        assert_eq!(
+            resolve_remote_file_target("/remote/missing/", false, false, "payload.bin").unwrap(),
+            "/remote/missing/"
+        );
+        assert_eq!(
+            resolve_remote_file_target("/remote/missing", false, false, "payload.bin").unwrap(),
+            "/remote/missing"
+        );
+    }
+
+    #[test]
+    fn local_basename_is_explicit_and_never_lossy() {
+        assert_eq!(local_push_basename("/data/local/tmp/payload.bin").unwrap(), "payload.bin");
+        assert_eq!(local_push_basename("payload.bin").unwrap(), "payload.bin");
+        // ".." has no basename (AOSP would build "./.." from it).
+        assert!(local_push_basename("/data/local/tmp/..").is_err());
+        assert!(local_push_basename("/").is_err());
+    }
+
+    #[test]
+    fn mode_word_dir_detection_matches_s_isdir() {
+        assert!(mode_is_dir(0o040755));
+        assert!(!mode_is_dir(0o100644));
+        assert!(!mode_is_dir(0));
     }
 }

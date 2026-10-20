@@ -376,9 +376,13 @@ fn run_push_sync(remote_mtime_matches: bool) {
         let banner = b"device::ro.product.name=sync-peer;features=cmd";
         peer.send_message(&AdbMessageHeader::new(A_CNXN, 0x0100_0001, 1024 * 1024, banner), banner).unwrap();
         let local_id = open(&mut peer, "sync:");
-        reply_stat(&mut peer, local_id, remote_path, StatReply {
-            mode: 0o100644, size: expected.len() as u32, mtime: remote_mtime,
-        });
+        // do_sync_push stats the destination, then sync_send stats the resolved
+        // path. Both are the same path here: the destination is a plain file.
+        for _ in 0..2 {
+            reply_stat(&mut peer, local_id, remote_path, StatReply {
+                mode: 0o100644, size: expected.len() as u32, mtime: remote_mtime,
+            });
+        }
 
         if remote_mtime_matches {
             // AOSP sync_send: equal mtime means no SEND/DATA/DONE at all.
@@ -444,3 +448,243 @@ fn push_sync_skips_when_remote_mtime_matches() { run_push_sync(true); }
 
 #[test]
 fn push_sync_sends_when_remote_mtime_differs() { run_push_sync(false); }
+
+// ---------------------------------------------------------------------------
+// do_sync_push destination resolution (AOSP client/file_sync_client.cpp:1454-1486)
+//
+// One `adb push` run per case against a scripted fake adbd. `stats` is the
+// exact STAT sequence the client must emit, so the resolved path is asserted on
+// the wire, not inferred from stdout.
+// ---------------------------------------------------------------------------
+
+struct PushTargetCase {
+    remote: &'static str,
+    sync: bool,
+    /// STAT script in wire order, given the real local mtime of the fixture.
+    stats: fn(u32) -> Vec<(&'static str, StatReply)>,
+    /// Exact SEND path the CLI must use; `None` = the CLI must abort, no SEND.
+    send_path: Option<&'static str>,
+    exit_code: i32,
+    stdout_contains: Vec<&'static str>,
+    stderr_contains: Vec<&'static str>,
+}
+
+const DIR: u32 = 0o040755;
+const FILE: u32 = 0o100644;
+const ABSENT: StatReply = StatReply { mode: 0, size: 0, mtime: 0 };
+
+fn run_push_target_case(case: PushTargetCase) {
+    use std::os::unix::fs::MetadataExt;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let PushTargetCase { remote, sync, stats, send_path, exit_code, stdout_contains, stderr_contains } = case;
+
+    let root = Fixture(std::env::temp_dir().join(format!(
+        "adb-push-target-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+    )));
+    seed_public_test_identity(&root.0);
+    let source = root.0.join("payload.bin");
+    let bytes: Vec<u8> = (0..4096).map(|index| (index % 253) as u8).collect();
+    fs::write(&source, &bytes).unwrap();
+    let local_mtime = fs::metadata(&source).unwrap().mtime() as u32;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let expected = bytes.clone();
+    let peer = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "CLI never connected to strict fake adbd");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        socket.set_nodelay(true).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut peer = FakeAdbd::from_stream(socket);
+        let (header, _) = peer.recv_message().unwrap();
+        assert_eq!(header.command, A_CNXN);
+        let banner = b"device::ro.product.name=push-target;features=cmd";
+        peer.send_message(&AdbMessageHeader::new(A_CNXN, 0x0100_0001, 1024 * 1024, banner), banner).unwrap();
+        let local_id = open(&mut peer, "sync:");
+
+        // Wire-order STAT script; reply_stat asserts the requested path.
+        for (path, reply) in stats(local_mtime) {
+            reply_stat(&mut peer, local_id, path, reply);
+        }
+
+        let Some(send_path) = send_path else {
+            // Negative control: the CLI must abort before any SEND frame.
+            match peer.recv_message() {
+                Err(_) => {}
+                Ok((header, payload)) => panic!(
+                    "client kept talking after a failed destination resolution: command={:#x} payload={:?}",
+                    header.command,
+                    String::from_utf8_lossy(&payload)
+                ),
+            }
+            return;
+        };
+
+        let payload = receive(&mut peer, A_WRTE, local_id);
+        let header = SyncMessageHeader::decode(&payload).unwrap();
+        assert_eq!(header.id, SYNC_SEND, "expected SEND, got {:#x}", header.id);
+        assert_eq!(header.length as usize, payload.len() - 8);
+        assert_eq!(&payload[8..], format!("{send_path},{}", 0o644).as_bytes());
+        send(&mut peer, A_OKAY, local_id, &[]);
+
+        let mut received = Vec::new();
+        loop {
+            let payload = receive(&mut peer, A_WRTE, local_id);
+            let header = SyncMessageHeader::decode(&payload).unwrap();
+            match header.id {
+                SYNC_DATA => {
+                    received.extend_from_slice(&payload[8..]);
+                    assert_eq!(received.as_slice(), &expected[..received.len()]);
+                    send(&mut peer, A_OKAY, local_id, &[]);
+                }
+                SYNC_DONE => {
+                    assert_eq!(header.length, local_mtime, "DONE must carry the local mtime");
+                    assert_eq!(received, expected);
+                    send(&mut peer, A_OKAY, local_id, &[]);
+                    break;
+                }
+                other => panic!("unexpected SYNC id {other:#x}"),
+            }
+        }
+        let mut okay = [0u8; 8];
+        SyncMessageHeader::new(SYNC_OKAY, 0).encode(&mut okay);
+        send(&mut peer, A_WRTE, local_id, &okay);
+        assert!(receive(&mut peer, A_OKAY, local_id).is_empty());
+        assert!(matches!(peer.recv_message(), Err(error)
+            if error.kind() == std::io::ErrorKind::UnexpectedEof));
+    });
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adb-rs"));
+    command.arg("-s").arg(address.to_string()).arg("push");
+    if sync {
+        command.arg("--sync");
+    }
+    command.arg(&source).arg(remote)
+        .env("HOME", &root.0)
+        .env("ANDROID_ADB_SERVER_PORT", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(peer.join().is_ok(), "strict fake adbd failed; stdout={stdout} stderr={stderr}");
+
+    assert_eq!(
+        output.status.code(),
+        Some(exit_code),
+        "stdout={stdout} stderr={stderr}"
+    );
+    for needle in &stdout_contains {
+        assert!(stdout.contains(needle), "stdout missing {needle:?}: {stdout}");
+    }
+    for needle in &stderr_contains {
+        assert!(stderr.contains(needle), "stderr missing {needle:?}: {stderr}");
+    }
+    if send_path.is_none() {
+        assert!(!stdout.contains("Pushing"), "no transfer may start: {stdout}");
+    }
+}
+
+#[test]
+fn push_to_existing_remote_directory_appends_basename() {
+    run_push_target_case(PushTargetCase {
+        remote: "/remote/dir",
+        sync: false,
+        stats: |_| vec![("/remote/dir", StatReply { mode: DIR, size: 0, mtime: 1_600_000_000 })],
+        send_path: Some("/remote/dir/payload.bin"),
+        exit_code: 0,
+        stdout_contains: vec!["Pushing", "/remote/dir/payload.bin"],
+        stderr_contains: vec![],
+    });
+}
+
+#[test]
+fn push_to_existing_remote_file_uses_exact_path() {
+    run_push_target_case(PushTargetCase {
+        remote: "/remote/payload.bin",
+        sync: false,
+        stats: |_| vec![("/remote/payload.bin", StatReply { mode: FILE, size: 12, mtime: 1_600_000_000 })],
+        send_path: Some("/remote/payload.bin"),
+        exit_code: 0,
+        stdout_contains: vec!["Pushing", "-> '/remote/payload.bin'"],
+        stderr_contains: vec![],
+    });
+}
+
+// AOSP client/file_sync_client.cpp:1479-1484 — "a path that ends with a slash
+// doesn't have to be a directory if it doesn't exist yet", so :1481 only fails
+// when dst_exists. A missing target keeps the path (and its slash) verbatim
+// (:1489 `dst_path = dst`).
+#[test]
+fn push_to_missing_target_with_trailing_slash_keeps_path_verbatim() {
+    run_push_target_case(PushTargetCase {
+        remote: "/remote/missing/",
+        sync: false,
+        stats: |_| vec![("/remote/missing/", ABSENT)],
+        send_path: Some("/remote/missing/"),
+        exit_code: 0,
+        stdout_contains: vec!["Pushing", "'/remote/missing/'"],
+        stderr_contains: vec![],
+    });
+}
+
+// Negative control: the destination exists as a regular file, so a trailing
+// slash must abort with AOSP's message and never open a SEND.
+#[test]
+fn push_to_existing_file_with_trailing_slash_fails_without_send() {
+    run_push_target_case(PushTargetCase {
+        remote: "/remote/payload.bin/",
+        sync: false,
+        stats: |_| vec![("/remote/payload.bin/", StatReply { mode: FILE, size: 12, mtime: 1_600_000_000 })],
+        send_path: None,
+        exit_code: 1,
+        stdout_contains: vec![],
+        stderr_contains: vec!["push failed", "failed to access '/remote/payload.bin/': Not a directory"],
+    });
+}
+
+// `--sync` must compare the *resolved* path: the directory's own mtime is
+// irrelevant, only /remote/dir/payload.bin decides the skip.
+#[test]
+fn push_sync_skips_on_the_resolved_remote_path() {
+    run_push_target_case(PushTargetCase {
+        remote: "/remote/dir",
+        sync: true,
+        stats: |local_mtime| vec![
+            ("/remote/dir", StatReply { mode: DIR, size: 0, mtime: local_mtime.wrapping_add(99) }),
+            ("/remote/dir/payload.bin", StatReply { mode: FILE, size: 4096, mtime: local_mtime }),
+        ],
+        send_path: None,
+        exit_code: 0,
+        stdout_contains: vec!["Skipped", "/remote/dir/payload.bin"],
+        stderr_contains: vec![],
+    });
+}
+
+#[test]
+fn push_sync_sends_to_resolved_path_when_mtime_differs() {
+    run_push_target_case(PushTargetCase {
+        remote: "/remote/dir",
+        sync: true,
+        stats: |local_mtime| vec![
+            ("/remote/dir", StatReply { mode: DIR, size: 0, mtime: local_mtime }),
+            ("/remote/dir/payload.bin", StatReply { mode: FILE, size: 4096, mtime: local_mtime.wrapping_add(7) }),
+        ],
+        send_path: Some("/remote/dir/payload.bin"),
+        exit_code: 0,
+        stdout_contains: vec!["Pushing", "/remote/dir/payload.bin"],
+        stderr_contains: vec![],
+    });
+}
+
