@@ -1056,11 +1056,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Push { local, remote, sync, algorithm, no_compress } => {
             let serial = cli.serial.as_deref();
-            if *sync {
-                return Err("--sync is not implemented for push".into());
-            }
             let _compression = sync_compression_option(algorithm.as_deref(), *no_compress)?;
-            match file_sync::push(serial, local, remote) {
+            match file_sync::push(serial, local, remote, *sync) {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("Error: push failed: {e}");

@@ -18,6 +18,7 @@ const A_OKAY: u32 = u32::from_le_bytes(*b"OKAY");
 const A_WRTE: u32 = u32::from_le_bytes(*b"WRTE");
 const A_CLSE: u32 = u32::from_le_bytes(*b"CLSE");
 const SYNC_SEND: u32 = u32::from_le_bytes(*b"SEND");
+const SYNC_STAT: u32 = u32::from_le_bytes(*b"STAT");
 const SYNC_DATA: u32 = u32::from_le_bytes(*b"DATA");
 const SYNC_DONE: u32 = u32::from_le_bytes(*b"DONE");
 const SYNC_OKAY: u32 = u32::from_le_bytes(*b"OKAY");
@@ -314,3 +315,132 @@ fn staged_install_cli_sends_complete_apk_then_installs_and_cleans_up() { run_cli
 fn staged_install_cli_stops_on_sync_fail() { run_cli(true, Outcome::Fail); }
 #[test]
 fn staged_install_cli_rejects_eof_after_done_transport_ack() { run_cli(true, Outcome::Eof); }
+
+#[derive(Clone, Copy)]
+struct StatReply { mode: u32, size: u32, mtime: u32 }
+
+fn reply_stat(peer: &mut FakeAdbd, local_id: u32, path: &str, st: StatReply) {
+    let payload = receive(peer, A_WRTE, local_id);
+    let header = SyncMessageHeader::decode(&payload).unwrap();
+    assert_eq!(header.id, SYNC_STAT, "push --sync must lstat the remote path first");
+    assert_eq!(header.length as usize, payload.len() - 8);
+    assert_eq!(&payload[8..], path.as_bytes());
+    let mut response = vec![0u8; 8 + 12];
+    let mut sync_header = [0u8; 8];
+    SyncMessageHeader::new(SYNC_STAT, 12).encode(&mut sync_header);
+    response[..8].copy_from_slice(&sync_header);
+    response[8..12].copy_from_slice(&st.mode.to_le_bytes());
+    response[12..16].copy_from_slice(&st.size.to_le_bytes());
+    response[16..20].copy_from_slice(&st.mtime.to_le_bytes());
+    // Real adbd acks the STAT WRTE before writing the result back.
+    send(peer, A_OKAY, local_id, &[]);
+    send(peer, A_WRTE, local_id, &response);
+    assert!(receive(peer, A_OKAY, local_id).is_empty());
+}
+
+fn run_push_sync(remote_mtime_matches: bool) {
+    use std::os::unix::fs::MetadataExt;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = Fixture(std::env::temp_dir().join(format!(
+        "adb-push-sync-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+    )));
+    seed_public_test_identity(&root.0);
+    let source = root.0.join("payload.bin");
+    let bytes: Vec<u8> = (0..(SYNC_DATA_MAX + 31)).map(|i| (i % 249) as u8).collect();
+    fs::write(&source, &bytes).unwrap();
+    let local_mtime = fs::metadata(&source).unwrap().mtime() as u32;
+    let remote_mtime = if remote_mtime_matches { local_mtime } else { local_mtime.wrapping_add(10) };
+    let remote_path = "/remote/payload.bin";
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let expected = bytes.clone();
+    let peer = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "CLI never connected");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        socket.set_nodelay(true).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut peer = FakeAdbd::from_stream(socket);
+        let (header, _) = peer.recv_message().unwrap();
+        assert_eq!(header.command, A_CNXN);
+        let banner = b"device::ro.product.name=sync-peer;features=cmd";
+        peer.send_message(&AdbMessageHeader::new(A_CNXN, 0x0100_0001, 1024 * 1024, banner), banner).unwrap();
+        let local_id = open(&mut peer, "sync:");
+        reply_stat(&mut peer, local_id, remote_path, StatReply {
+            mode: 0o100644, size: expected.len() as u32, mtime: remote_mtime,
+        });
+
+        if remote_mtime_matches {
+            // AOSP sync_send: equal mtime means no SEND/DATA/DONE at all.
+            assert!(matches!(peer.recv_message(), Err(error)
+                if error.kind() == std::io::ErrorKind::UnexpectedEof));
+            return;
+        }
+
+        let payload = receive(&mut peer, A_WRTE, local_id);
+        let header = SyncMessageHeader::decode(&payload).unwrap();
+        assert_eq!(header.id, SYNC_SEND);
+        assert_eq!(&payload[8..], format!("{remote_path},{}", 0o644).as_bytes());
+        send(&mut peer, A_OKAY, local_id, &[]);
+
+        let mut received = Vec::new();
+        loop {
+            let payload = receive(&mut peer, A_WRTE, local_id);
+            let header = SyncMessageHeader::decode(&payload).unwrap();
+            match header.id {
+                SYNC_DATA => {
+                    received.extend_from_slice(&payload[8..]);
+                    assert_eq!(received.as_slice(), &expected[..received.len()]);
+                    send(&mut peer, A_OKAY, local_id, &[]);
+                }
+                SYNC_DONE => {
+                    assert_eq!(header.length, local_mtime, "DONE must carry the local mtime");
+                    assert_eq!(received, expected);
+                    send(&mut peer, A_OKAY, local_id, &[]);
+                    break;
+                }
+                other => panic!("unexpected SYNC id {other:#x}"),
+            }
+        }
+        let mut ok = [0u8; 8];
+        SyncMessageHeader::new(SYNC_OKAY, 0).encode(&mut ok);
+        send(&mut peer, A_WRTE, local_id, &ok);
+        assert!(receive(&mut peer, A_OKAY, local_id).is_empty());
+        assert!(matches!(peer.recv_message(), Err(error)
+            if error.kind() == std::io::ErrorKind::UnexpectedEof));
+    });
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adb-rs"));
+    command.arg("-s").arg(address.to_string())
+        .arg("push").arg("--sync").arg(&source).arg(remote_path)
+        .env("HOME", &root.0)
+        .env("ANDROID_ADB_SERVER_PORT", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(peer.join().is_ok(), "fake adbd failed; stdout={stdout} stderr={stderr}");
+    assert_eq!(output.status.code(), Some(0), "stdout={stdout} stderr={stderr}");
+    if remote_mtime_matches {
+        assert!(stdout.contains("Skipped"), "stdout={stdout}");
+    } else {
+        assert!(stdout.contains("Pushing"), "stdout={stdout}");
+    }
+}
+
+#[test]
+fn push_sync_skips_when_remote_mtime_matches() { run_push_sync(true); }
+
+#[test]
+fn push_sync_sends_when_remote_mtime_differs() { run_push_sync(false); }

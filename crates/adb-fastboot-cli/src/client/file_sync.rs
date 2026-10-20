@@ -41,6 +41,15 @@ const MAX_CHUNK: usize = 64 * 1024;
 
 const ADB_SERVER_PORT: u16 = 5037;
 
+/// AOSP honors `ANDROID_ADB_SERVER_PORT`; without it every server probe would
+/// hit 5037 even when the caller selected a different server.
+fn adb_server_port() -> u16 {
+    std::env::var("ANDROID_ADB_SERVER_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(ADB_SERVER_PORT)
+}
+
 /// File and directory entry from a remote `list` operation.
 #[derive(Debug, Clone)]
 pub struct RemoteEntry {
@@ -58,11 +67,36 @@ pub struct FileStat {
     pub mtime: u32,
 }
 
+/// Local file mtime in whole seconds, saturating at `u32::MAX` (SYNC wire field).
+fn local_mtime_secs(path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
+    let modified = fs::metadata(path)?.modified()?;
+    let secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(u32::try_from(secs).unwrap_or(u32::MAX))
+}
+
+/// A SYNC STAT response of all zeros means "not found" (V1 cannot report errno).
+fn remote_exists(st: &FileStat) -> bool {
+    st.mode != 0 || st.size != 0 || st.mtime != 0
+}
+
+/// AOSP `sync_send(sync=true)`: skip only when the remote mtime equals the local one.
+fn sync_equal(st: &FileStat, local_mtime: u32) -> bool {
+    remote_exists(st) && st.mtime == local_mtime
+}
+
 // ---------------------------------------------------------------------------
 // Public API — existing single-file push/pull (unchanged)
 // ---------------------------------------------------------------------------
 
 /// Push a local file or directory to a remote path on the device.
+///
+/// `sync` mirrors AOSP `adb push --sync`: before sending, the remote path is
+/// stat'ed and the file is skipped when the remote mtime equals the local one.
+/// This port uses SYNC V1 `STAT` (12-byte reply) rather than AOSP's LSTAT_V2;
+/// symlinks are not pushed, so following the link is equivalent for this surface.
 ///
 /// # Priority
 /// 1. ADB server (port 5037) — borrows the system ADB's authenticated
@@ -72,16 +106,20 @@ pub fn push(
     serial: Option<&str>,
     local: &str,
     remote: &str,
+    sync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if Path::new(local).is_dir() {
+        return push_dir(serial, local, remote, sync);
+    }
     // Priority 1: ADB server (port 5037)
-    let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+    let server_addr = format!("127.0.0.1:{}", adb_server_port());
     if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
         if server.switch_transport(serial).is_ok() {
             // Open sync: service via server bridge
             server.send_host_request("sync:")?;
             server.read_status()?;
             // Now in forwarding mode — raw sync protocol
-            return push_file_server(&mut server, local, remote);
+            return push_file_server(&mut server, local, remote, sync);
         }
     }
 
@@ -90,7 +128,7 @@ pub fn push(
     let (_info, mut transport) =
         connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
     let (local_id, remote_id) = protocol::open_service(&mut transport, "sync:", 1)?;
-    push_file_direct(&mut transport, local_id, remote_id, local, remote)
+    push_file_direct(&mut transport, local_id, remote_id, local, remote, sync)
 }
 
 /// Pull a remote file from the device to a local path.
@@ -104,7 +142,7 @@ pub fn pull(
     preserve: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Priority 1: ADB server
-    let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+    let server_addr = format!("127.0.0.1:{}", adb_server_port());
     if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
         if server.switch_transport(serial).is_ok() {
             server.send_host_request("sync:")?;
@@ -133,7 +171,7 @@ pub fn list(
     serial: Option<&str>,
     remote_path: &str,
 ) -> Result<Vec<RemoteEntry>, Box<dyn std::error::Error>> {
-    let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+    let server_addr = format!("127.0.0.1:{}", adb_server_port());
     if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
         if server.switch_transport(serial).is_ok() {
             server.send_host_request("sync:")?;
@@ -157,7 +195,7 @@ pub fn stat(
     serial: Option<&str>,
     remote_path: &str,
 ) -> Result<FileStat, Box<dyn std::error::Error>> {
-    let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+    let server_addr = format!("127.0.0.1:{}", adb_server_port());
     if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
         if server.switch_transport(serial).is_ok() {
             server.send_host_request("sync:")?;
@@ -183,6 +221,7 @@ pub fn push_dir(
     serial: Option<&str>,
     local_dir: &str,
     remote_dir: &str,
+    sync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Collect all files to push
     let files = build_local_file_list(local_dir, remote_dir)?;
@@ -198,14 +237,14 @@ pub fn push_dir(
         remote_dir
     );
 
-    let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+    let server_addr = format!("127.0.0.1:{}", adb_server_port());
 
     // Try ADB server first
     if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
         if server.switch_transport(serial).is_ok() {
             server.send_host_request("sync:")?;
             server.read_status()?;
-            return push_files_server(&mut server, &files);
+            return push_files_server(&mut server, &files, sync);
         }
     }
 
@@ -214,7 +253,7 @@ pub fn push_dir(
     let (_info, mut transport) =
         connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
     let (local_id, remote_id) = protocol::open_service(&mut transport, "sync:", 1)?;
-    push_files_direct(&mut transport, local_id, remote_id, &files)
+    push_files_direct(&mut transport, local_id, remote_id, &files, sync)
 }
 
 /// Recursively pull a remote directory to a local path.
@@ -228,7 +267,7 @@ pub fn pull_dir(
     local_dir: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Build list of remote entries recursively
-    let server_addr = format!("127.0.0.1:{ADB_SERVER_PORT}");
+    let server_addr = format!("127.0.0.1:{}", adb_server_port());
 
     // First, enumerate remote directory recursively
     let entries = if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
@@ -479,8 +518,18 @@ fn push_file_direct(
     remote_id: u32,
     local: &str,
     remote: &str,
+    sync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let local_path = Path::new(local);
+    let mtime = local_mtime_secs(local_path)?;
+    if sync {
+        if let Ok(st) = stat_direct_inner(transport, local_id, remote_id, remote) {
+            if sync_equal(&st, mtime) {
+                println!("[adb-rs] Skipped '{}' (remote mtime matches)", remote);
+                return Ok(());
+            }
+        }
+    }
     let file_data = std::fs::read(local_path)
         .map_err(|e| format!("Cannot read local file '{local}': {e}"))?;
 
@@ -503,9 +552,9 @@ fn push_file_direct(
         protocol::send_wrte(transport, local_id, remote_id, &data_buf)?;
     }
 
-    // Send DONE
+    // Send DONE: the SYNC V1 DONE field carries the file mtime.
     let mut done_buf = Vec::new();
-    build_sync_done(0xFFFF_FFFF, &mut done_buf)
+    build_sync_done(mtime, &mut done_buf)
         .map_err(|e| format!("Build DONE failed: {e}"))?;
     protocol::send_wrte(transport, local_id, remote_id, &done_buf)?;
 
@@ -612,7 +661,10 @@ fn stat_direct_inner(
     let mut req_buf = Vec::new();
     build_sync_stat_req(remote_path, &mut req_buf)
         .map_err(|e| format!("Build STAT req failed: {e}"))?;
-    protocol::send_wrte(transport, local_id, remote_id, &req_buf)?;
+    // send_wrte would consume and discard the first A_WRTE reply while waiting
+    // for A_OKAY — that reply is the STAT result. Send raw and let the loop read it.
+    let req_hdr = AdbMessageHeader::new(A_WRTE, local_id, remote_id, &req_buf);
+    transport.send_message(&req_hdr, &req_buf)?;
 
     loop {
         let (hdr, payload) = transport.recv_message()?;
@@ -651,9 +703,10 @@ fn push_files_direct(
     local_id: u32,
     remote_id: u32,
     files: &[FilePair],
+    sync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for file in files {
-        push_file_direct_with_ids(transport, local_id, remote_id, &file.local, &file.remote)?;
+        push_file_direct_with_ids(transport, local_id, remote_id, &file.local, &file.remote, sync)?;
     }
 
     // Close sync connection
@@ -671,9 +724,20 @@ fn push_file_direct_with_ids(
     remote_id: u32,
     local: &str,
     remote: &str,
+    sync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if sync {
+        let mtime = local_mtime_secs(Path::new(local))?;
+        if let Ok(st) = stat_direct_inner(transport, local_id, remote_id, remote) {
+            if sync_equal(&st, mtime) {
+                println!("[adb-rs] Skipped '{}' (remote mtime matches)", remote);
+                return Ok(());
+            }
+        }
+    }
     let file_data = std::fs::read(local)
         .map_err(|e| format!("Cannot read local file '{local}': {e}"))?;
+    let mtime = local_mtime_secs(Path::new(local))?;
 
     // Build SEND request
     let mut send_buf = Vec::new();
@@ -690,9 +754,9 @@ fn push_file_direct_with_ids(
         protocol::send_wrte(transport, local_id, remote_id, &data_buf)?;
     }
 
-    // Send DONE
+    // Send DONE: the SYNC V1 DONE field carries the file mtime.
     let mut done_buf = Vec::new();
-    build_sync_done(0xFFFF_FFFF, &mut done_buf)
+    build_sync_done(mtime, &mut done_buf)
         .map_err(|e| format!("Build DONE failed: {e}"))?;
     protocol::send_wrte(transport, local_id, remote_id, &done_buf)?;
 
@@ -801,7 +865,10 @@ fn stat_direct(
     let mut req_buf = Vec::new();
     build_sync_stat_req(remote_path, &mut req_buf)
         .map_err(|e| format!("Build STAT req failed: {e}"))?;
-    protocol::send_wrte(transport, local_id, remote_id, &req_buf)?;
+    // Same STAT rule as stat_direct_inner: read the A_WRTE result, don't let
+    // send_wrte swallow it while waiting for the request A_OKAY.
+    let req_hdr = AdbMessageHeader::new(A_WRTE, local_id, remote_id, &req_buf);
+    transport.send_message(&req_hdr, &req_buf)?;
 
     let mut stat_result: Option<FileStat> = None;
     loop {
@@ -895,8 +962,19 @@ fn push_file_server(
     transport: &mut dyn Transport,
     local: &str,
     remote: &str,
+    sync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let local_path = Path::new(local);
+    let mtime = local_mtime_secs(local_path)?;
+    if sync {
+        // AOSP sync_lstat: any failure to stat the remote path means "send".
+        if let Ok(st) = stat_server(transport, remote) {
+            if sync_equal(&st, mtime) {
+                println!("[adb-rs] Skipped '{}' (remote mtime matches)", remote);
+                return Ok(());
+            }
+        }
+    }
     let file_data = std::fs::read(local_path)
         .map_err(|e| format!("Cannot read local file '{local}': {e}"))?;
 
@@ -919,9 +997,9 @@ fn push_file_server(
         write_raw_sync(transport, &data_buf)?;
     }
 
-    // Send DONE
+    // Send DONE: the SYNC V1 DONE field carries the file mtime.
     let mut done_buf = Vec::new();
-    build_sync_done(0xFFFF_FFFF, &mut done_buf)
+    build_sync_done(mtime, &mut done_buf)
         .map_err(|e| format!("Build DONE failed: {e}"))?;
     write_raw_sync(transport, &done_buf)?;
 
@@ -1002,9 +1080,10 @@ fn pull_file_server(
 fn push_files_server(
     transport: &mut dyn Transport,
     files: &[FilePair],
+    sync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for file in files {
-        push_file_server_inner(transport, &file.local, &file.remote)?;
+        push_file_server_inner(transport, &file.local, &file.remote, sync)?;
     }
     Ok(())
 }
@@ -1014,7 +1093,17 @@ fn push_file_server_inner(
     transport: &mut dyn Transport,
     local: &str,
     remote: &str,
+    sync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mtime = local_mtime_secs(Path::new(local))?;
+    if sync {
+        if let Ok(st) = stat_server(transport, remote) {
+            if sync_equal(&st, mtime) {
+                println!("[adb-rs] Skipped '{}' (remote mtime matches)", remote);
+                return Ok(());
+            }
+        }
+    }
     let file_data = std::fs::read(local)
         .map_err(|e| format!("Cannot read local file '{local}': {e}"))?;
 
@@ -1034,9 +1123,9 @@ fn push_file_server_inner(
         write_raw_sync(transport, &data_buf)?;
     }
 
-    // Send DONE
+    // Send DONE: the SYNC V1 DONE field carries the file mtime.
     let mut done_buf = Vec::new();
-    build_sync_done(0xFFFF_FFFF, &mut done_buf)
+    build_sync_done(mtime, &mut done_buf)
         .map_err(|e| format!("Build DONE failed: {e}"))?;
     write_raw_sync(transport, &done_buf)?;
 
@@ -1176,8 +1265,9 @@ mod tests {
     /// A strict adbd SYNC peer: SEND has no application reply. Only a complete
     /// DATA sequence followed by DONE produces the terminal status.
     struct SendPeer {
-        expected: std::collections::VecDeque<(String, Vec<u8>)>,
+        expected: std::collections::VecDeque<(String, Vec<u8>, u32)>,
         active: Option<(Vec<u8>, Vec<u8>)>,
+        pending_mtime: Option<u32>,
         incoming: std::collections::VecDeque<(AdbMessageHeader, Vec<u8>)>,
         raw_reply: Cursor<Vec<u8>>,
         direct: bool,
@@ -1194,9 +1284,10 @@ mod tests {
                 adb_protocol::SYNC_SEND => {
                     assert!(self.active.is_none(), "SEND before previous DONE");
                     assert_eq!(header.length as usize, data.len());
-                    let (path, bytes) = self.expected.pop_front().expect("unexpected SEND");
+                    let (path, bytes, mtime) = self.expected.pop_front().expect("unexpected SEND");
                     assert_eq!(data, format!("{path},{}", 0o644).as_bytes());
                     self.active = Some((bytes, Vec::new()));
+                    self.pending_mtime = Some(mtime);
                 }
                 SYNC_DATA => {
                     assert_eq!(header.length as usize, data.len());
@@ -1208,7 +1299,8 @@ mod tests {
                 }
                 SYNC_DONE => {
                     assert!(data.is_empty(), "DONE has no payload");
-                    assert_eq!(header.length, u32::MAX, "DONE mtime changed");
+                    let expected_mtime = self.pending_mtime.take().expect("DONE before SEND");
+                    assert_eq!(header.length, expected_mtime, "DONE must carry the local mtime");
                     let (expected, received) = self.active.take().expect("DONE before SEND");
                     assert_eq!(received, expected, "DONE before complete DATA");
                     self.completed += 1;
@@ -1296,16 +1388,25 @@ mod tests {
                 FilePair { local: file.to_str().unwrap().into(), remote: "/remote/payload".into() },
                 FilePair { local: empty.to_str().unwrap().into(), remote: "/remote/empty".into() },
             ];
+            let mtime = |path: &std::path::Path| -> u32 {
+                use std::os::unix::fs::MetadataExt;
+                fs::metadata(path).unwrap().mtime() as u32
+            };
             let mut peer = SendPeer {
-                expected: [(files[0].remote.clone(), bytes.clone()), (files[1].remote.clone(), Vec::new())].into(),
-                active: None, incoming: Default::default(), raw_reply: Cursor::new(Vec::new()),
+                expected: [
+                    (files[0].remote.clone(), bytes.clone(), mtime(std::path::Path::new(&files[0].local))),
+                    (files[1].remote.clone(), Vec::new(), mtime(std::path::Path::new(&files[1].local))),
+                ].into(),
+                active: None,
+                pending_mtime: None,
+                incoming: Default::default(), raw_reply: Cursor::new(Vec::new()),
                 direct, outcome, completed: 0, status_acks: 0,
             };
             let result = match (direct, batch) {
-                (true, false) => push_file_direct(&mut peer, 7, 41, &files[0].local, &files[0].remote),
-                (true, true) => push_files_direct(&mut peer, 7, 41, &files),
-                (false, false) => push_file_server(&mut peer, &files[0].local, &files[0].remote),
-                (false, true) => push_files_server(&mut peer, &files),
+                (true, false) => push_file_direct(&mut peer, 7, 41, &files[0].local, &files[0].remote, false),
+                (true, true) => push_files_direct(&mut peer, 7, 41, &files, false),
+                (false, false) => push_file_server(&mut peer, &files[0].local, &files[0].remote, false),
+                (false, true) => push_files_server(&mut peer, &files, false),
             };
             match outcome {
                 SendOutcome::Okay => result.unwrap_or_else(|e| panic!("direct={direct}, batch={batch}: {e}")),
