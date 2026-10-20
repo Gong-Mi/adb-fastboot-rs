@@ -392,7 +392,16 @@ impl Write for AdbServerTransport {
     }
 }
 
-impl Transport for AdbServerTransport {}
+impl Transport for AdbServerTransport {
+    fn try_clone_box(&self) -> Option<Box<dyn Transport>> {
+        // A dup'd TcpStream shares the same connection. Callers that write
+        // (e.g. ShellV2 stdin) must not read from the clone: one reader per
+        // connection stays the rule.
+        self.stream.try_clone().ok().map(|stream| {
+            Box::new(AdbServerTransport { stream }) as Box<dyn Transport>
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TLS Transport wrapper

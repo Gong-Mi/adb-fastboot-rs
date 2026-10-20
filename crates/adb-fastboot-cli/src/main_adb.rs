@@ -15,6 +15,11 @@ use adb_protocol::{
 mod server;
 mod client;
 
+// `client/mod.rs` is outside this slice's edit set, so the abb client module is
+// included by explicit path rather than declared there.
+#[path = "client/abb.rs"]
+mod abb;
+
 use client::{adb_wifi, console, detach, file_sync, protocol, shell, exec_out};
 use client::server_cmds::{ensure_server_running, kill_server};
 use client::host_command::host_command;
@@ -136,6 +141,13 @@ pub enum Commands {
     /// Run remote shell command
     Shell {
         command: Vec<String>,
+    },
+    /// Run an abb command on the device (requires the device 'abb' feature).
+    /// Arguments are forwarded verbatim as a NUL-joined `abb:...` service
+    /// (AOSP `adb abb`, client/commandline.cpp:799-822).
+    Abb {
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
     },
     /// Run remote shell command and return raw stdout (no ShellV2 framing).
     /// Uses the 'exec:' service which provides raw Unix stdout without
@@ -989,6 +1001,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let (_lid, remote_id) = protocol::open_service(&mut transport, &shell_service, 1)?;
             shell::stream_shell_v2(&mut transport, _lid, remote_id, false)?;
+        }
+        Commands::Abb { args } => {
+            // AOSP `adb_abb` (client/commandline.cpp:799-822).
+            //
+            // AOSP's local escape character '~' (commandline.cpp:808) belongs
+            // to its stdin read loop; this client's command paths (including
+            // `adb shell`) have no stdin pump, so there is nothing to escape
+            // here — the service string the device sees is identical either
+            // way. The output side reuses the ShellV2 pump, which is the same
+            // `read_and_dump(fd, use_shell_protocol=<abb>)` AOSP ends up in.
+            let service_string = abb::abb_service_string(args);
+
+            // Priority 1: ADB server (port 5037). A server-side transport does
+            // not expose the adbd CNXN banner, so the device features come from
+            // the server itself (AOSP adb_get_feature_set, adb_client.cpp:432-448).
+            if let Ok(mut server) =
+                AdbServerTransport::connect_timeout(server_addr.as_str(), Duration::from_millis(300))
+            {
+                let features = match abb::query_server_features(&server_addr, cli.serial.as_deref())
+                {
+                    Ok(features) => features,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                // Gate before opening anything: a device without `abb` must
+                // never receive the `abb:` service.
+                if !abb::device_supports_abb(&features) {
+                    eprintln!("error: abb is not supported by the device");
+                    std::process::exit(1);
+                }
+                if server.switch_transport(cli.serial.as_deref()).is_ok() {
+                    // Same shape as the shell arm: the service goes over the
+                    // host-service protocol with a hex length prefix, so the
+                    // NULs inside the abb service string survive verbatim.
+                    server.send_host_request(&service_string)?;
+                    server.read_status()?;
+                    shell::stream_shell_v2_server_with_stdin(&mut server, false)?;
+                    return Ok(());
+                }
+            }
+
+            // Priority 2: direct USB/TCP transport — full CNXN/AUTH handshake,
+            // where the banner gives the device feature set.
+            // The direct path has no stdin pump (ADB WRTE/A_OKAY shares the
+            // single reader), so interactive abb (no args) must fail closed
+            // instead of hanging on a session that cannot accept input.
+            if args.is_empty() {
+                eprintln!(
+                    "error: interactive abb (no arguments) requires the ADB server path; \
+                     direct USB/TCP supports only `adb abb <args>`"
+                );
+                std::process::exit(1);
+            }
+            let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let (info, mut transport) = match connect_and_handshake_with_tls_upgrade(
+                transport,
+                &host_cnxn_payload(),
+                default_auth(),
+            ) {
+                Ok(result) => result,
+                Err(e) if e.to_string().contains("0x45534c43") => {
+                    std::thread::sleep(Duration::from_secs(15));
+                    let retry_transport = open_adb_transport(
+                        cli.serial.as_deref(),
+                        cli.d,
+                        Duration::from_secs(3),
+                    )?;
+                    connect_and_handshake_with_tls_upgrade(
+                        retry_transport,
+                        &host_cnxn_payload(),
+                        default_auth(),
+                    )?
+                }
+                Err(e) => return Err(e),
+            };
+
+            // AOSP checks the negotiated feature set, not a hardcoded device
+            // list, and exits before `adb_connect` when `abb` is missing.
+            let device_features = adb_protocol::parse_banner_features(&info.banner);
+            if !abb::device_supports_abb(&device_features) {
+                eprintln!("error: abb is not supported by the device");
+                std::process::exit(1);
+            }
+
+            let (local_id, remote_id) = protocol::open_service(&mut transport, &service_string, 1)?;
+            shell::stream_shell_v2(&mut transport, local_id, remote_id, false)?;
         }
         Commands::ExecOut { command } | Commands::ExecIn { command } => {
             // AOSP commandline.cpp:1802: exec-in/exec-out open the raw `exec:`

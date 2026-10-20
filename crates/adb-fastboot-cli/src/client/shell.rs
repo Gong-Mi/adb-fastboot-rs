@@ -4,7 +4,7 @@
 //! These functions operate over a raw `Transport` (direct USB/TCP to adbd)
 //! or through the ADB server forwarding mode.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::time::Duration;
 
 use adb_protocol::{
@@ -167,6 +167,87 @@ pub fn stream_shell_v2_server(
     Ok(captured)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StdinEscape {
+    StartOfLine,
+    MidFlow,
+    InEscape,
+}
+
+fn stdin_state_after(ch: u8) -> StdinEscape {
+    if ch == b'\n' || ch == b'\r' {
+        StdinEscape::StartOfLine
+    } else {
+        StdinEscape::MidFlow
+    }
+}
+
+/// AOSP `stdin_read_thread_loop` escape handling (commandline.cpp:545-585).
+/// Returns the next state, the bytes to forward, and whether `~.` was seen.
+fn escape_stdin_byte(state: StdinEscape, ch: u8) -> (StdinEscape, Vec<u8>, bool) {
+    match (state, ch) {
+        (StdinEscape::InEscape, b'.') => (StdinEscape::StartOfLine, Vec::new(), true),
+        (StdinEscape::InEscape, b'~') => (StdinEscape::MidFlow, vec![b'~'], false),
+        (StdinEscape::InEscape, _) => {
+            // Swallowed escape char was not part of a valid sequence: emit both.
+            (stdin_state_after(ch), vec![b'~', ch], false)
+        }
+        (StdinEscape::StartOfLine, b'~') => (StdinEscape::InEscape, Vec::new(), false),
+        (_, b'~') => (StdinEscape::MidFlow, vec![b'~'], false),
+        _ => (stdin_state_after(ch), vec![ch], false),
+    }
+}
+
+/// Stream ShellV2 output through ADB server forwarding mode while forwarding
+/// local stdin as ShellV2 `Stdin` packets.
+///
+/// Only safe in server forwarding mode: there the connection is a raw byte
+/// stream (no ADB WRTE/A_OKAY on this socket), so a dup'd write side cannot
+/// steal the single reader's frames. Direct USB/TCP keeps the output-only path.
+pub fn stream_shell_v2_server_with_stdin(
+    transport: &mut dyn Transport,
+    capture: bool,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    if let Some(mut writer) = transport.try_clone_box() {
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut stdin = stdin.lock();
+            let mut state = StdinEscape::StartOfLine;
+            let mut byte = [0u8; 1];
+            loop {
+                match stdin.read(&mut byte) {
+                    Ok(0) => {
+                        let mut packet = Vec::new();
+                        ShellV2Packet::CloseStdin.encode(&mut packet);
+                        let _ = writer.write_all(&packet);
+                        let _ = writer.flush();
+                        break;
+                    }
+                    Ok(_) => {
+                        let (next, out, disconnect) = escape_stdin_byte(state, byte[0]);
+                        state = next;
+                        if disconnect {
+                            eprintln!("\r\n[ disconnected ]\r\n");
+                            std::process::exit(0);
+                        }
+                        if out.is_empty() {
+                            continue;
+                        }
+                        let mut packet = Vec::new();
+                        ShellV2Packet::Stdin(&out).encode(&mut packet);
+                        if writer.write_all(&packet).is_err() || writer.flush().is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    stream_shell_v2_server(transport, capture)
+}
+
 /// Open shell connection and stream output to stdout.
 pub fn run_shell(
     transport: &mut dyn Transport,
@@ -189,4 +270,57 @@ pub fn shell_over_adbd(cmd: &str, addr: &str) -> Result<Vec<u8>, Box<dyn std::er
         connect_and_handshake_with_tls_upgrade(transport, b"host::features=shell_v2,cmd", default_auth())?;
     let captured = run_shell(&mut transport, cmd, true)?;
     Ok(captured.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(bytes: &[u8]) -> (Vec<u8>, bool) {
+        let mut state = StdinEscape::StartOfLine;
+        let mut out = Vec::new();
+        let mut disconnected = false;
+        for &byte in bytes {
+            let (next, emitted, disc) = escape_stdin_byte(state, byte);
+            state = next;
+            disconnected |= disc;
+            out.extend_from_slice(&emitted);
+        }
+        (out, disconnected)
+    }
+
+    #[test]
+    fn plain_stdin_is_forwarded_byte_for_byte() {
+        let (out, disconnected) = run(b"hello\nworld");
+        assert_eq!(out, b"hello\nworld");
+        assert!(!disconnected);
+    }
+
+    #[test]
+    fn tilde_dot_disconnects_without_forwarding() {
+        let (out, disconnected) = run(b"~.");
+        assert!(disconnected);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn doubled_tilde_emits_one_literal_tilde() {
+        let (out, disconnected) = run(b"~~");
+        assert_eq!(out, b"~");
+        assert!(!disconnected);
+    }
+
+    #[test]
+    fn invalid_escape_emits_tilde_and_the_byte() {
+        let (out, disconnected) = run(b"~x");
+        assert_eq!(out, b"~x");
+        assert!(!disconnected);
+    }
+
+    #[test]
+    fn escape_only_applies_at_start_of_line() {
+        // A tilde mid-line is a normal character; only the leading one is eaten.
+        let (out, _) = run(b"a~.");
+        assert_eq!(out, b"a~.");
+    }
 }
