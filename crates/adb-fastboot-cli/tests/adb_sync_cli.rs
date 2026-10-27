@@ -17,6 +17,7 @@ const A_OPEN: u32 = u32::from_le_bytes(*b"OPEN");
 const A_OKAY: u32 = u32::from_le_bytes(*b"OKAY");
 const A_WRTE: u32 = u32::from_le_bytes(*b"WRTE");
 const A_CLSE: u32 = u32::from_le_bytes(*b"CLSE");
+const SYNC_RECV: u32 = u32::from_le_bytes(*b"RECV");
 const SYNC_SEND: u32 = u32::from_le_bytes(*b"SEND");
 const SYNC_STAT: u32 = u32::from_le_bytes(*b"STAT");
 const SYNC_DATA: u32 = u32::from_le_bytes(*b"DATA");
@@ -319,23 +320,40 @@ fn staged_install_cli_rejects_eof_after_done_transport_ack() { run_cli(true, Out
 #[derive(Clone, Copy)]
 struct StatReply { mode: u32, size: u32, mtime: u32 }
 
+/// Independent AOSP vector: `sync_stat_v1` is exactly four little-endian u32s
+/// (`vendor/adb/file_sync_protocol.h:48-53`), i.e. 16 bytes with NO length word.
+/// A 20-byte `[STAT, length, mode, size, mtime]` frame is this port's old
+/// invention and must never be treated as the wire truth again.
+fn stat_wire(st: StatReply) -> Vec<u8> {
+    [
+        b"STAT".as_slice(),
+        &st.mode.to_le_bytes(),
+        &st.size.to_le_bytes(),
+        &st.mtime.to_le_bytes(),
+    ]
+    .concat()
+}
+
 fn reply_stat(peer: &mut FakeAdbd, local_id: u32, path: &str, st: StatReply) {
     let payload = receive(peer, A_WRTE, local_id);
     let header = SyncMessageHeader::decode(&payload).unwrap();
     assert_eq!(header.id, SYNC_STAT, "push --sync must lstat the remote path first");
     assert_eq!(header.length as usize, payload.len() - 8);
     assert_eq!(&payload[8..], path.as_bytes());
-    let mut response = vec![0u8; 8 + 12];
-    let mut sync_header = [0u8; 8];
-    SyncMessageHeader::new(SYNC_STAT, 12).encode(&mut sync_header);
-    response[..8].copy_from_slice(&sync_header);
-    response[8..12].copy_from_slice(&st.mode.to_le_bytes());
-    response[12..16].copy_from_slice(&st.size.to_le_bytes());
-    response[16..20].copy_from_slice(&st.mtime.to_le_bytes());
+    let response = stat_wire(st);
+    assert_eq!(response.len(), 16, "V1 STAT has no length field");
     // Real adbd acks the STAT WRTE before writing the result back.
     send(peer, A_OKAY, local_id, &[]);
     send(peer, A_WRTE, local_id, &response);
     assert!(receive(peer, A_OKAY, local_id).is_empty());
+}
+
+fn expect_recv(peer: &mut FakeAdbd, local_id: u32, remote: &str) {
+    let payload = receive(peer, A_WRTE, local_id);
+    let header = SyncMessageHeader::decode(&payload).unwrap();
+    assert_eq!(header.id, SYNC_RECV, "pull must open RECV, got {:#x}", header.id);
+    assert_eq!(header.length as usize, payload.len() - 8);
+    assert_eq!(&payload[8..], remote.as_bytes());
 }
 
 fn run_push_sync(remote_mtime_matches: bool) {
@@ -688,3 +706,271 @@ fn push_sync_sends_to_resolved_path_when_mtime_differs() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// `adb pull` / `adb pull -a`: one SYNC channel is a byte stream
+// ---------------------------------------------------------------------------
+//
+// AOSP writes SYNC messages into a socket; ADB WRTE boundaries carry no
+// protocol meaning, so a DATA header may straddle two WRTEs and two DATA
+// frames may share one. The fake adbd below is deliberately free to split and
+// coalesce, and the CLI must still produce the exact remote bytes.
+
+struct PullOutcome {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    /// (contents, mtime, mode & 0o777) of the pulled file, if it was created.
+    file: Option<(Vec<u8>, i64, u32)>,
+}
+
+fn run_pull_case<F>(preserve: bool, remote: &'static str, peer_body: F) -> PullOutcome
+where
+    F: FnOnce(&mut FakeAdbd) + Send + 'static,
+{
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = Fixture(std::env::temp_dir().join(format!(
+        "adb-pull-cli-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+    )));
+    seed_public_test_identity(&root.0);
+    let destination = root.0.join("pulled.bin");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "CLI never connected to strict fake adbd");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        socket.set_nodelay(true).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut peer = FakeAdbd::from_stream(socket);
+        let (header, _) = peer.recv_message().unwrap();
+        assert_eq!(header.command, A_CNXN);
+        let banner = b"device::ro.product.name=pull-peer;features=cmd";
+        peer.send_message(&AdbMessageHeader::new(A_CNXN, 0x0100_0001, 1024 * 1024, banner), banner).unwrap();
+        peer_body(&mut peer);
+    });
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adb-rs"));
+    command.arg("-s").arg(address.to_string()).arg("pull");
+    if preserve {
+        command.arg("-a");
+    }
+    command.arg(remote).arg(&destination)
+        .env("HOME", &root.0)
+        .env("ANDROID_ADB_SERVER_PORT", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = command.output().unwrap();
+    assert!(
+        peer.join().is_ok(),
+        "strict fake adbd failed; CLI exit={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let file = fs::metadata(&destination).ok().map(|metadata| {
+        (
+            fs::read(&destination).unwrap(),
+            metadata.mtime(),
+            metadata.permissions().mode() & 0o777,
+        )
+    });
+    PullOutcome {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        file,
+    }
+}
+
+/// A real adbd answers `pull -a` with a 16-byte STAT, then streams RECV. Split
+/// the DATA header itself across WRTEs: the CLI must buffer the channel, not
+/// assume one message per WRTE.
+#[test]
+fn pull_a_reads_16_byte_stat_and_reassembles_a_header_split_across_wrtes() {
+    let body: Vec<u8> = (0..SYNC_DATA_MAX + 4321).map(|index| (index % 241) as u8).collect();
+    let expected = body.clone();
+    let outcome = run_pull_case(true, "/remote/file", move |peer| {
+        let local_id = open(peer, "sync:");
+        reply_stat(peer, local_id, "/remote/file", StatReply {
+            mode: 0o100600, size: expected.len() as u32, mtime: 1_600_000_123,
+        });
+        expect_recv(peer, local_id, "/remote/file");
+        send(peer, A_OKAY, local_id, &[]);
+
+        // Two legal 64 KiB-bounded DATA frames, concatenated exactly as adbd
+        // would write them into one stream.
+        let mut data = Vec::new();
+        adb_protocol_data(&mut data, &expected[..SYNC_DATA_MAX]);
+        adb_protocol_data(&mut data, &expected[SYNC_DATA_MAX..]);
+        // "DAT" + "A" + length bytes + body: every WRTE below is a transport
+        // fragment, never a SYNC message boundary.
+        let mut rest = data.as_slice();
+        for size in [3usize, 4, 16, 300, 40_000] {
+            let take = size.min(rest.len());
+            let (piece, tail) = rest.split_at(take);
+            send(peer, A_WRTE, local_id, piece);
+            assert!(receive(peer, A_OKAY, local_id).is_empty(), "fragment ack");
+            rest = tail;
+        }
+        while !rest.is_empty() {
+            let take = rest.len().min(1000);
+            let (piece, tail) = rest.split_at(take);
+            send(peer, A_WRTE, local_id, piece);
+            assert!(receive(peer, A_OKAY, local_id).is_empty());
+            rest = tail;
+        }
+        let mut done = [0u8; 8];
+        SyncMessageHeader::new(SYNC_DONE, 0).encode(&mut done);
+        send(peer, A_WRTE, local_id, &done[..5]);
+        assert!(receive(peer, A_OKAY, local_id).is_empty());
+        send(peer, A_WRTE, local_id, &done[5..]);
+        assert!(receive(peer, A_OKAY, local_id).is_empty());
+        // The CLI exits after DONE; it must not invent more framing.
+        assert!(matches!(peer.recv_message(), Err(error)
+            if error.kind() == std::io::ErrorKind::UnexpectedEof));
+    });
+    assert_eq!(outcome.code, Some(0), "stderr={}", outcome.stderr);
+    let (contents, mtime, mode) = outcome.file.expect("pulled file");
+    assert_eq!(contents, body);
+    assert_eq!(mtime, 1_600_000_123, "-a must restore the remote mtime");
+    assert_eq!(mode, 0o600, "-a must restore the remote mode");
+}
+
+fn adb_protocol_data(out: &mut Vec<u8>, bytes: &[u8]) {
+    let mut header = [0u8; 8];
+    SyncMessageHeader::new(SYNC_DATA, bytes.len() as u32).encode(&mut header);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(bytes);
+}
+
+/// adbd may coalesce several SYNC frames into one WRTE. Two DATA frames plus
+/// DONE in a single write must still be split exactly at the SYNC framing.
+#[test]
+fn pull_splits_coalesced_data_frames_sharing_one_wrte() {
+    let outcome = run_pull_case(false, "/remote/file", |peer| {
+        let local_id = open(peer, "sync:");
+        expect_recv(peer, local_id, "/remote/file");
+        send(peer, A_OKAY, local_id, &[]);
+        let mut payload = Vec::new();
+        adb_protocol_data(&mut payload, b"first-");
+        adb_protocol_data(&mut payload, b"second");
+        let mut done = [0u8; 8];
+        SyncMessageHeader::new(SYNC_DONE, 0).encode(&mut done);
+        payload.extend_from_slice(&done);
+        send(peer, A_WRTE, local_id, &payload);
+        assert!(receive(peer, A_OKAY, local_id).is_empty());
+        assert!(matches!(peer.recv_message(), Err(error)
+            if error.kind() == std::io::ErrorKind::UnexpectedEof));
+    });
+    assert_eq!(outcome.code, Some(0), "stderr={}", outcome.stderr);
+    let (contents, _, _) = outcome.file.expect("pulled file");
+    assert_eq!(contents, b"first-second");
+}
+
+/// An early result may arrive before the transport ACK for RECV. It is data,
+/// not a reply to the request: keep it and drain the ACK afterwards.
+#[test]
+fn pull_keeps_a_data_frame_that_arrives_before_the_recv_ack() {
+    let outcome = run_pull_case(false, "/remote/file", |peer| {
+        let local_id = open(peer, "sync:");
+        expect_recv(peer, local_id, "/remote/file");
+        let mut payload = Vec::new();
+        adb_protocol_data(&mut payload, b"early");
+        let mut done = [0u8; 8];
+        SyncMessageHeader::new(SYNC_DONE, 0).encode(&mut done);
+        payload.extend_from_slice(&done);
+        send(peer, A_WRTE, local_id, &payload);
+        assert!(receive(peer, A_OKAY, local_id).is_empty());
+        send(peer, A_OKAY, local_id, &[]);
+        assert!(matches!(peer.recv_message(), Err(error)
+            if error.kind() == std::io::ErrorKind::UnexpectedEof));
+    });
+    assert_eq!(outcome.code, Some(0), "stderr={}", outcome.stderr);
+    let (contents, _, _) = outcome.file.expect("pulled file");
+    assert_eq!(contents, b"early");
+}
+
+/// A DATA length above the 64 KiB SYNC chunk bound must fail before the client
+/// allocates or blocks; a torn stream must not look like a short file.
+#[test]
+fn pull_rejects_a_data_length_above_64k_before_allocating() {
+    let outcome = run_pull_case(false, "/remote/file", |peer| {
+        let local_id = open(peer, "sync:");
+        expect_recv(peer, local_id, "/remote/file");
+        send(peer, A_OKAY, local_id, &[]);
+        let mut header = [0u8; 8];
+        SyncMessageHeader::new(SYNC_DATA, 64 * 1024 + 1).encode(&mut header);
+        send(peer, A_WRTE, local_id, &header);
+        assert!(receive(peer, A_OKAY, local_id).is_empty());
+        peer.0.shutdown(Shutdown::Both).unwrap();
+    });
+    assert_eq!(outcome.code, Some(1), "stdout={} stderr={}", outcome.stdout, outcome.stderr);
+    assert!(outcome.stderr.contains("64 KiB"), "stderr={}", outcome.stderr);
+    assert!(!outcome.stdout.contains("Pull complete"), "no success may be printed: {}", outcome.stdout);
+    assert!(outcome.file.is_none(), "a rejected transfer must not publish a file");
+}
+
+#[test]
+fn pull_reports_the_remote_fail_message_and_publishes_nothing() {
+    let outcome = run_pull_case(false, "/remote/file", |peer| {
+        let local_id = open(peer, "sync:");
+        expect_recv(peer, local_id, "/remote/file");
+        send(peer, A_OKAY, local_id, &[]);
+        let mut fail = Vec::new();
+        let mut header = [0u8; 8];
+        SyncMessageHeader::new(SYNC_FAIL, 13).encode(&mut header);
+        fail.extend_from_slice(&header);
+        fail.extend_from_slice(b"no such file:");
+        send(peer, A_WRTE, local_id, &fail);
+        assert!(receive(peer, A_OKAY, local_id).is_empty());
+        assert!(matches!(peer.recv_message(), Err(error)
+            if error.kind() == std::io::ErrorKind::UnexpectedEof));
+    });
+    assert_eq!(outcome.code, Some(1));
+    assert!(outcome.stderr.contains("no such file:"), "stderr={}", outcome.stderr);
+    assert!(outcome.file.is_none(), "a failed pull must not write a partial file");
+}
+
+#[test]
+fn pull_fails_when_the_stream_ends_before_done() {
+    let outcome = run_pull_case(false, "/remote/file", |peer| {
+        let local_id = open(peer, "sync:");
+        expect_recv(peer, local_id, "/remote/file");
+        send(peer, A_OKAY, local_id, &[]);
+        let mut payload = Vec::new();
+        adb_protocol_data(&mut payload, b"torn");
+        send(peer, A_WRTE, local_id, &payload);
+        assert!(receive(peer, A_OKAY, local_id).is_empty());
+        peer.0.shutdown(Shutdown::Both).unwrap();
+    });
+    assert_eq!(outcome.code, Some(1), "stdout={}", outcome.stdout);
+    assert!(
+        outcome.stderr.contains("fill whole buffer") || outcome.stderr.contains("closed"),
+        "stderr={}",
+        outcome.stderr
+    );
+    assert!(outcome.file.is_none(), "a truncated pull must not publish a file");
+}
+
+/// `pull -a` must not fabricate metadata when the remote stat cannot succeed.
+#[test]
+fn pull_a_fails_closed_when_the_remote_stat_is_all_zero() {
+    let outcome = run_pull_case(true, "/remote/missing", |peer| {
+        let local_id = open(peer, "sync:");
+        reply_stat(peer, local_id, "/remote/missing", ABSENT);
+        peer.0.shutdown(Shutdown::Both).unwrap();
+    });
+    assert_eq!(outcome.code, Some(1), "stdout={}", outcome.stdout);
+    assert!(outcome.file.is_none(), "no file may be created from a failed stat");
+}
