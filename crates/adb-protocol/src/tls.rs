@@ -23,6 +23,108 @@ pub use tls_connection::{
 // re-export X.509 cert generation (moved to crypto::x509_generator)
 pub use crate::crypto::x509_generator::generate_self_signed_cert;
 
+/// AOSP adb.cpp:318-325 / 447-453: reply to device STLS in plaintext before
+/// starting TLS. This is deliberately separate from generic TLS stream setup.
+pub fn send_tls_request(transport: &mut dyn crate::Transport) -> Result<(), crate::TransportError> {
+    let header = crate::AdbMessageHeader::new(crate::A_STLS, crate::A_STLS_VERSION, 0, &[]);
+    transport.send_message(&header, &[])
+}
+
+/// AOSP client/auth.cpp:487-505: upgrade after the host STLS reply and wait
+/// for the device's encrypted CNXN. Never resend host CNXN or return a plaintext
+/// transport after a certificate/configuration/handshake failure.
+pub fn adb_auth_tls_handshake(
+    transport: Box<dyn crate::Transport>,
+    rsa_key_pem: &str,
+) -> Result<(Vec<u8>, Box<dyn crate::Transport>), Box<dyn std::error::Error>> {
+    let (cert, key) = generate_self_signed_cert(rsa_key_pem)
+        .map_err(|error| format!("Failed to generate TLS certificate: {error}"))?;
+    let config = create_adb_tls_config(cert, key)
+        .map_err(|error| format!("Failed to create TLS config: {error}"))?;
+    let mut transport: Box<dyn crate::Transport> =
+        Box::new(crate::AdbTlsTransport::new(transport, config, "adb")?);
+    // The first read drives rustls's lazy handshake without emitting an ADB
+    // application packet. A successful TLS session alone is not ADB online.
+    let (header, banner) = transport
+        .recv_message()
+        .map_err(|error| format!("TLS upgrade failed while waiting for CNXN: {error}"))?;
+    if header.command != crate::A_CNXN {
+        return Err(format!(
+            "Unexpected handshake response after TLS upgrade: cmd={:#x}",
+            header.command
+        )
+        .into());
+    }
+    Ok((banner, transport))
+}
+
+/// ADB trusts self-signed peer chains, not fabricated CertificateVerify proofs.
+/// Keep this production ADB config separate from the generic TLS echo helpers.
+/// TLS 1.3 only, with provider-backed verification of the server's key ownership.
+pub fn create_adb_tls_config(
+    cert: Vec<u8>,
+    key: Vec<u8>,
+) -> Result<std::sync::Arc<rustls::ClientConfig>, TlsError> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(AdbServerCertVerifier))
+    .with_client_auth_cert(
+        vec![CertificateDer::from(cert)],
+        PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key)),
+    )?;
+    Ok(std::sync::Arc::new(config))
+}
+
+#[derive(Debug)]
+struct AdbServerCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for AdbServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // AOSP host-side ADB has no WebPKI server-name/root trust requirement.
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("ADB requires TLS 1.3".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +291,52 @@ mod tests {
 
         let server_result = handle.join().expect("server thread");
         assert_eq!(server_result, b"cross-key-ok");
+    }
+
+    /// Certificate generation errors must consume the transport, not expose
+    /// a successful plaintext connection with an empty banner.
+    #[test]
+    fn test_adb_tls_cert_failure_consumes_transport() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct DropProbe(Arc<AtomicBool>);
+        impl Read for DropProbe {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("certificate failure must precede TLS I/O")
+            }
+        }
+        impl Write for DropProbe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                panic!("certificate failure must not write plaintext")
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::Transport for DropProbe {}
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result =
+            adb_auth_tls_handshake(Box::new(DropProbe(Arc::clone(&dropped))), "invalid PEM");
+        assert!(result.is_err(), "must not return a plaintext transport");
+        let error = result.err().unwrap().to_string();
+        assert!(
+            error.contains("Failed to generate TLS certificate"),
+            "{error}"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "failed transport must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_adb_tls_invalid_config_is_error() {
+        let (cert, _) = generate_self_signed_cert(&rsa_key_pem()).unwrap();
+        assert!(create_adb_tls_config(cert, vec![1, 2, 3]).is_err());
     }
 
     /// Verify that an invalid PEM causes a clear error, not a panic.

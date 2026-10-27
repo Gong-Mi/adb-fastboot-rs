@@ -8,8 +8,10 @@ use adb_protocol::{
     MAX_PAYLOAD_V2,
 };
 
+// Preserve the existing production CLI's Android key-persistence path when
+// consolidating its handshake here (do not switch to the legacy auth copy).
 #[cfg(target_os = "android")]
-use crate::client::auth::persist_adb_pubkey;
+use crate::persist_adb_pubkey;
 
 const ADBD_PORT: u16 = 5555;
 const ADB_SERVER_PORT: u16 = 5037;
@@ -84,116 +86,69 @@ pub fn open_adb_transport(
     Ok(Box::new(t))
 }
 
-/// Connect to adbd with CNXN handshake and optional AUTH support.
-#[cfg(feature = "tls")]
-pub fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
-    transport: T,
-    cnxn_payload: &[u8],
-    auth: &adb_protocol::AdbAuth,
-) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
-    use adb_protocol::tls;
-    use adb_protocol::AdbTlsTransport;
-
-    let mut transport: Box<dyn Transport> = Box::new(transport);
-    let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
-    transport.send_message(&cnxn_hdr, cnxn_payload)?;
-
-    let (mut resp_hdr, mut payload) = transport.recv_message()?;
-    let mut sent_signature = false;
-    let mut sent_public_key = false;
-    while resp_hdr.command == A_AUTH {
-        if resp_hdr.arg0 != A_AUTH_TOKEN {
-            return Err(format!("Unsupported AUTH request type: {}", resp_hdr.arg0).into());
-        }
-        if payload.len() != 20 {
-            return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
-        }
-        let (auth_hdr, auth_payload) = if !sent_signature {
-            sent_signature = true;
-            auth.make_signature_message(&payload)?
-        } else if !sent_public_key {
-            sent_public_key = true;
-            auth.make_rsakey_message()?
-        } else {
-            return Err("adbd rejected the ADB RSA key after signature and public-key exchange".into());
-        };
-        transport.send_message(&auth_hdr, &auth_payload)?;
-        (resp_hdr, payload) = transport.recv_message()?;
-    }
-
-    if resp_hdr.command == A_CNXN {
-        let banner = String::from_utf8_lossy(&payload).to_string();
-        #[cfg(target_os = "android")]
-        if sent_public_key {
-            persist_adb_pubkey(auth)?;
-        }
-        return Ok((DeviceInfo { banner }, transport));
-    }
-
-    if resp_hdr.command == A_STLS {
-        let rsa_pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key())
-            .map_err(|e| format!("Failed to export RSA key: {e}"))?;
-        let (cert_der, key_der) = tls::generate_self_signed_cert(&rsa_pem)
-            .map_err(|e| format!("Failed to generate self-signed cert: {e}"))?;
-        let config = tls::create_tls_config(cert_der, key_der)
-            .map_err(|e| format!("Failed to create TLS config: {e}"))?;
-
-        let tls_transport = AdbTlsTransport::new(transport, config, "adb")
-            .map_err(|e| format!("TLS upgrade failed: {e}"))?;
-        let mut tls_box: Box<dyn Transport> = Box::new(tls_transport);
-        tls_box.send_message(&cnxn_hdr, cnxn_payload)?;
-        let (resp_hdr2, payload2) = tls_box.recv_message()?;
-        if resp_hdr2.command != A_CNXN {
-            return Err(format!("Unexpected handshake response after TLS upgrade: cmd={:#x}", resp_hdr2.command).into());
-        }
-        let banner = String::from_utf8_lossy(&payload2).to_string();
-        return Ok((DeviceInfo { banner }, tls_box));
-    }
-
-    Err(format!("Unexpected handshake response: cmd={:#x}", resp_hdr.command).into())
-}
-
-/// Non-TLS fallback with AUTH support.
-#[cfg(not(feature = "tls"))]
+/// Shared production CNXN/AUTH/STLS handshake for CLI and client callers.
+/// TLS failure consumes the transport: there is no plaintext fallback.
 pub fn connect_and_handshake_with_tls_upgrade<T: Transport + 'static>(
     transport: T,
     cnxn_payload: &[u8],
     auth: &adb_protocol::AdbAuth,
 ) -> Result<(DeviceInfo, Box<dyn Transport>), Box<dyn std::error::Error>> {
     let mut transport: Box<dyn Transport> = Box::new(transport);
+    let mut responder = adb_protocol::AuthResponder::single(auth.clone());
     let cnxn_hdr = AdbMessageHeader::new(A_CNXN, ADB_VERSION, MAX_PAYLOAD_V2, cnxn_payload);
     transport.send_message(&cnxn_hdr, cnxn_payload)?;
 
-    let (mut resp_hdr, mut payload) = transport.recv_message()?;
-    let mut sent_signature = false;
-    let mut sent_public_key = false;
-    while resp_hdr.command == A_AUTH {
-        if resp_hdr.arg0 != A_AUTH_TOKEN {
-            return Err(format!("Unsupported AUTH request type: {}", resp_hdr.arg0).into());
+    loop {
+        let (resp_hdr, payload) = transport.recv_message()?;
+        match resp_hdr.command {
+            A_CNXN => {
+                #[cfg(target_os = "android")]
+                if responder.pubkey_sent() {
+                    persist_adb_pubkey(auth)?;
+                }
+                return Ok((
+                    DeviceInfo {
+                        banner: String::from_utf8_lossy(&payload).into(),
+                    },
+                    transport,
+                ));
+            }
+            A_AUTH if resp_hdr.arg0 == A_AUTH_TOKEN => {
+                if payload.len() != 20 {
+                    return Err(format!("Invalid ADB AUTH token length: {}", payload.len()).into());
+                }
+                if let Some((header, response)) = responder.respond_to_token(&payload)? {
+                    transport.send_message(&header, &response)?;
+                }
+            }
+            A_STLS => {
+                #[cfg(feature = "tls")]
+                {
+                    // adb.cpp:447-453 sends the host STLS reply before TLS.
+                    adb_protocol::tls::send_tls_request(&mut *transport)?;
+                    let pem = adb_protocol::auth::export_private_key_to_pem(auth.private_key())
+                        .map_err(|error| format!("Failed to export RSA key: {error}"))?;
+                    let (banner, transport) =
+                        adb_protocol::tls::adb_auth_tls_handshake(transport, &pem)?;
+                    return Ok((
+                        DeviceInfo {
+                            banner: String::from_utf8_lossy(&banner).into(),
+                        },
+                        transport,
+                    ));
+                }
+                #[cfg(not(feature = "tls"))]
+                return Err(
+                    "Device requires TLS (A_STLS) but the `tls` feature is not enabled. \
+                            Rebuild with --features tls"
+                        .into(),
+                );
+            }
+            _ => {
+                return Err(
+                    format!("Unexpected handshake response: cmd={:#x}", resp_hdr.command).into(),
+                )
+            }
         }
-        let (auth_hdr, auth_payload) = if !sent_signature {
-            sent_signature = true;
-            auth.make_signature_message(&payload)?
-        } else if !sent_public_key {
-            sent_public_key = true;
-            auth.make_rsakey_message()?
-        } else {
-            return Err("adbd rejected the ADB RSA key after signature and public-key exchange".into());
-        };
-        transport.send_message(&auth_hdr, &auth_payload)?;
-        (resp_hdr, payload) = transport.recv_message()?;
     }
-    if resp_hdr.command == A_STLS {
-        return Err("Device requires TLS (A_STLS) but the `tls` feature is not enabled. \
-                    Rebuild with --features tls".into());
-    }
-    if resp_hdr.command != A_CNXN {
-        return Err(format!("Unexpected handshake response: cmd={:#x}", resp_hdr.command).into());
-    }
-    let banner = String::from_utf8_lossy(&payload).to_string();
-    #[cfg(target_os = "android")]
-    if sent_public_key {
-        persist_adb_pubkey(auth)?;
-    }
-    Ok((DeviceInfo { banner }, transport))
 }
