@@ -143,7 +143,7 @@ pub enum Commands {
         /// AOSP `adb shell` uses `getopt("+e:ntTx")`: option parsing stops at
         /// the first non-option, so remote-command flags such as `ls -l` are
         /// forwarded verbatim (client/commandline.cpp:714-715,777-792).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
     /// Run an abb command on the device (requires the device 'abb' feature).
@@ -950,17 +950,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Shell { command } => {
-            // AOSP parses `shell`'s own options with getopt("+e:ntTx"), but
-            // this CLI has no shell-option implementation. Do not silently
-            // treat a leading flag as a remote command: reject it. Once a
-            // non-option is seen, getopt stops and every later token (e.g.
-            // `ls -l`'s `-l`) belongs to the remote command.
-            if let Some(first) = command.first() {
-                if first != "-" && first.starts_with('-') {
-                    eprintln!("adb shell: option '{first}' is not supported");
-                    std::process::exit(1);
-                }
-            }
             let cmd_str = command.join(" ");
             let shell_service = if cmd_str.is_empty() {
                 "shell,v2,raw:".to_string()

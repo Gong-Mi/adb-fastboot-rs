@@ -207,6 +207,19 @@ fn shell_double_dash_separator_is_not_forwarded() {
 }
 
 #[test]
+fn shell_separator_allows_dash_prefixed_remote_command() {
+    let mut reply = shell_v2_frame(SHELL_ID_STDOUT, b"ok\n");
+    reply.extend_from_slice(&shell_v2_frame(SHELL_ID_EXIT, &[0]));
+    let output = assert_wire_case(
+        "shell -- -command -arg",
+        &["shell", "--", "-command", "-arg"],
+        &["host:transport-any", "shell,v2,raw:-command -arg"],
+        reply,
+    );
+    assert_eq!(output.stdout, b"ok\n");
+}
+
+#[test]
 fn shell_leading_option_still_fails_loudly() {
     // AOSP shell options are not implemented in this CLI. The first token
     // starting with '-' must be rejected, not silently forwarded as a remote
@@ -219,9 +232,9 @@ fn shell_leading_option_still_fails_loudly() {
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "stdout={stdout} stderr={stderr}");
+    assert!(!output.status.success(), "stdout={stdout} stderr={stderr}");
     assert!(
-        stderr.contains("adb shell: option '-l' is not supported"),
+        stderr.contains("unexpected argument '-l'"),
         "stderr={stderr}"
     );
 }
