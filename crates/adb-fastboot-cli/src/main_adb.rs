@@ -140,6 +140,10 @@ pub enum Commands {
     },
     /// Run remote shell command
     Shell {
+        /// AOSP `adb shell` uses `getopt("+e:ntTx")`: option parsing stops at
+        /// the first non-option, so remote-command flags such as `ls -l` are
+        /// forwarded verbatim (client/commandline.cpp:714-715,777-792).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// Run an abb command on the device (requires the device 'abb' feature).
@@ -154,11 +158,15 @@ pub enum Commands {
     /// ShellV2 packet headers or stderr multiplexing.
     #[command(name = "exec-out")]
     ExecOut {
+        /// AOSP exec-in/exec-out accept any argv[1] as the program name,
+        /// including a leading dash (client/commandline.cpp:1804-1813).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// Run remote command feeding local stdin to its raw stdin
     /// (AOSP `adb exec-in`)
     ExecIn {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// Push local file to device
@@ -942,6 +950,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Shell { command } => {
+            // AOSP parses `shell`'s own options with getopt("+e:ntTx"), but
+            // this CLI has no shell-option implementation. Do not silently
+            // treat a leading flag as a remote command: reject it. Once a
+            // non-option is seen, getopt stops and every later token (e.g.
+            // `ls -l`'s `-l`) belongs to the remote command.
+            if let Some(first) = command.first() {
+                if first != "-" && first.starts_with('-') {
+                    eprintln!("adb shell: option '{first}' is not supported");
+                    std::process::exit(1);
+                }
+            }
             let cmd_str = command.join(" ");
             let shell_service = if cmd_str.is_empty() {
                 "shell,v2,raw:".to_string()
@@ -1101,11 +1120,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // service — no shell-v2 framing, no PTY. ADB escape rules apply
             // to the command arguments (exec_service_string).
             let exec_in = matches!(cli.command, Commands::ExecIn { .. });
-            let exec_service = if exec_in {
-                adb_protocol::exec_service_string(command)
-            } else {
-                format!("exec:{}", command.join(" "))
-            };
+            // Both AOSP branches use the same construction: argv[1] is
+            // appended raw (it may itself start with '-'), and every later
+            // argument goes through escape_arg (commandline.cpp:1804-1813).
+            let exec_service = adb_protocol::exec_service_string(command);
 
             // Priority 1: ADB server (port 5037) — same pattern as shell.
             let server_addr = &server_addr;
