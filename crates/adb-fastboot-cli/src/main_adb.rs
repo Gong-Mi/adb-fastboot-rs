@@ -530,7 +530,12 @@ pub fn open_adb_transport(
     //    }
     //}
 
-    let addr = resolve_target_addr(serial, ADBD_PORT);
+    if let Some(serial) = serial {
+        return Err(format!(
+            "ADB device '{serial}' was not found; refusing fallback to a different device"
+        ).into());
+    }
+    let addr = resolve_target_addr(None, ADBD_PORT);
     let t = TcpTransport::connect_timeout(&addr, timeout)
         .map_err(|_| format!("Connection failed to {addr} (Connection refused). Specify target device with `-s <IP:PORT>` or start ADB server."))?;
     Ok(Box::new(t))
@@ -744,6 +749,20 @@ fn run_incremental_attempt(
         Err(_) if silent => Err(None),
         Err(error) => Err(Some(error)),
     }
+}
+
+/// Validate direct-TCP-only command paths before resolving the endpoint.
+/// A USB serial is not an alias for the default local TCP daemon.
+fn direct_tcp_only_target(serial: Option<&str>, use_usb: bool) -> Result<String, Box<dyn std::error::Error>> {
+    if use_usb {
+        return Err("this command does not support direct USB; refusing TCP fallback".into());
+    }
+    if let Some(value) = serial {
+        if !value.contains(':') {
+            return Err(format!("ADB device '{value}' is not a TCP endpoint; refusing fallback to a different device").into());
+        }
+    }
+    Ok(resolve_target_addr(serial, ADBD_PORT))
 }
 
 /// Open a fresh connection to the device. AOSP's fallback installs run their
@@ -1165,7 +1184,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 client::adb_install::CmdlineIncremental::None
             };
-            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+            let transport = TcpTransport::connect_timeout(
+                &direct_tcp_only_target(cli.serial.as_deref(), cli.d)?, Duration::from_secs(3))
                 .map_err(|error| format!("Cannot connect to adbd at {addr}: {error}"))?;
             let cnxn_payload = host_cnxn_payload();
             let (device_info, mut transport) = connect_and_handshake_with_tls_upgrade(
@@ -1281,7 +1301,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("APK(s) not found: {}", missing.join(", ")).into());
             }
 
-            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+            let transport = TcpTransport::connect_timeout(
+                &direct_tcp_only_target(cli.serial.as_deref(), cli.d)?, Duration::from_secs(3))
                 .map_err(|error| format!("Cannot connect to adbd at {addr}: {error}"))?;
             let cnxn_payload = host_cnxn_payload();
             let (device_info, mut transport) =
@@ -1362,7 +1383,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("No APK files specified".into());
             }
 
-            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+            let transport = TcpTransport::connect_timeout(
+                &direct_tcp_only_target(cli.serial.as_deref(), cli.d)?, Duration::from_secs(3))
                 .map_err(|error| format!("Cannot connect to adbd at {addr}: {error}"))?;
             let cnxn_payload = host_cnxn_payload();
             let (device_info, mut transport) = connect_and_handshake_with_tls_upgrade(
@@ -1381,7 +1403,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Uninstall { package } => {
-            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+            let transport = TcpTransport::connect_timeout(
+                &direct_tcp_only_target(cli.serial.as_deref(), cli.d)?, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
             let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
                 transport,
@@ -1404,7 +1427,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Logcat { args } => {
-            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+            let transport = TcpTransport::connect_timeout(
+                &direct_tcp_only_target(cli.serial.as_deref(), cli.d)?, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
             let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
                 transport,
@@ -1423,7 +1447,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Bugreport { path } => {
-            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+            let transport = TcpTransport::connect_timeout(
+                &direct_tcp_only_target(cli.serial.as_deref(), cli.d)?, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
             let (_info, mut transport) = connect_and_handshake_with_tls_upgrade(
                 transport,
@@ -2013,7 +2038,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Connect to adbd
-            let transport = TcpTransport::connect_timeout(&addr, Duration::from_secs(3))
+            let transport = TcpTransport::connect_timeout(
+                &direct_tcp_only_target(cli.serial.as_deref(), cli.d)?, Duration::from_secs(3))
                 .map_err(|e| format!("Cannot connect to adbd at {addr}: {e}"))?;
             let (_info, mut transport) =
                 connect_and_handshake_with_tls_upgrade(transport, b"host::", default_auth())?;
@@ -2242,6 +2268,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use crate::client::server_cmds::kill_server_at;
+
+    #[test]
+    fn explicit_missing_serial_never_falls_back_to_localhost_device() {
+        // Owning port 5555 ensures this test cannot contact a real local adbd.
+        // A missing explicit serial is not equivalent to the localhost device.
+        let listener = std::net::TcpListener::bind("127.0.0.1:5555")
+            .expect("test requires exclusive ownership of the default adbd endpoint");
+        listener.set_nonblocking(true).unwrap();
+        let serial = "hermes-test-nonexistent-usb-serial-957be6e4";
+        for open in [
+            open_adb_transport as fn(Option<&str>, bool, Duration) -> Result<Box<dyn Transport>, Box<dyn std::error::Error>>,
+            client::transport::open_adb_transport,
+        ] {
+            let result = open(Some(serial), false, Duration::from_millis(500));
+            assert!(result.is_err(), "explicit missing serial was routed to localhost:5555");
+            assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                    "fallback connected an unrelated localhost device");
+
+            // With USB disabled, preserve the previous no-selector TCP fallback.
+            #[cfg(not(feature = "usb"))]
+            {
+                let default = open(None, false, Duration::from_millis(500)).unwrap();
+                let (accepted, _) = listener.accept().unwrap();
+                drop((default, accepted));
+            }
+            // Explicit TCP remains directed to that exact endpoint.
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = tcp.local_addr().unwrap().to_string();
+            let explicit = open(Some(&endpoint), false, Duration::from_millis(500)).unwrap();
+            let (accepted, _) = tcp.accept().unwrap();
+            drop((explicit, accepted));
+        }
+    }
 
     #[test]
     fn sync_compression_accepts_explicit_no_compression() {

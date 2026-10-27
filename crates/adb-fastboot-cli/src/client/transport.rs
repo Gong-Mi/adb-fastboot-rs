@@ -79,7 +79,12 @@ pub fn open_adb_transport(
         }
     }
 
-    let addr = resolve_target_addr(serial, ADBD_PORT);
+    if let Some(serial) = serial {
+        return Err(format!(
+            "ADB device '{serial}' was not found; refusing fallback to a different device"
+        ).into());
+    }
+    let addr = resolve_target_addr(None, ADBD_PORT);
     let t = TcpTransport::connect_timeout(&addr, timeout)
         .map_err(|_| format!("Connection failed to {addr} (Connection refused). \
             Specify target device with `-s <IP:PORT>` or start ADB server."))?;

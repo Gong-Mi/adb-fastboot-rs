@@ -240,6 +240,65 @@ fn shell_leading_option_still_fails_loudly() {
 }
 
 #[test]
+fn shell_missing_explicit_serial_does_not_connect_default_adbd() {
+    let default_adbd = TcpListener::bind("127.0.0.1:5555")
+        .expect("test requires exclusive ownership of default adbd endpoint");
+    default_adbd.set_nonblocking(true).unwrap();
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    let port = server.local_addr().unwrap().port();
+    let peer = thread::spawn(move || {
+        let mut socket = accept_with_deadline(&server).unwrap();
+        assert_eq!(read_host_request(&mut socket).unwrap(),
+                   "host:transport:hermes-test-nonexistent-usb-serial-957be6e4");
+        let error = b"device not found";
+        socket.write_all(format!("FAIL{:04x}", error.len()).as_bytes()).unwrap();
+        socket.write_all(error).unwrap();
+    });
+    let output = run_cli(&[
+        "-P".into(), port.to_string(), "-s".into(),
+        "hermes-test-nonexistent-usb-serial-957be6e4".into(),
+        "shell".into(), "id".into(),
+    ]);
+    peer.join().unwrap();
+    assert!(!output.status.success(), "unexpected success");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("hermes-test-nonexistent-usb-serial-957be6e4"), "{error}");
+    assert!(matches!(default_adbd.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+            "CLI connected an unselected device at localhost:5555");
+
+    // These commands bypass the server and used to resolve an arbitrary USB
+    // serial to localhost:5555. Hold that port ourselves so no real device can
+    // be contacted, and check every direct-TCP-only family on the executable.
+    let apk = std::env::temp_dir().join(format!("adb-target-test-{}.apk", std::process::id()));
+    std::fs::write(&apk, b"fixture").unwrap();
+    let path = apk.to_str().unwrap();
+    let serial = "hermes-test-nonexistent-usb-serial-957be6e4";
+    for args in [
+        vec!["install", path],
+        vec!["install-multiple", path],
+        vec!["install-multi-package", path],
+        vec!["uninstall", "org.example.missing"],
+        vec!["logcat"],
+        vec!["bugreport"],
+        vec!["sideload", path],
+    ] {
+        let mut argv = vec!["-s".to_string(), serial.to_string()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        let result = run_cli(&argv);
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success() && error.contains(serial), "{args:?}: {error}");
+        assert!(matches!(default_adbd.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+                "{args:?} connected an unselected device");
+    }
+    let result = run_cli(&["-d".into(), "logcat".into()]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("refusing TCP fallback"));
+    assert!(matches!(default_adbd.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    std::fs::remove_file(apk).unwrap();
+}
+
+#[test]
 fn exec_out_escapes_arguments_after_the_program_name() {
     let output = assert_wire_case(
         "exec-out screencap -p",
