@@ -105,7 +105,7 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub serial: Option<String>,
 
-    /// Direct connection to USB device
+    /// Select a USB device
     #[arg(short = 'd', global = true)]
     pub d: bool,
 
@@ -846,7 +846,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             //   Client then reads WRTE/CLSE from the device via server.
             let server_addr = &server_addr;
             if let Ok(mut server) = AdbServerTransport::connect_timeout(server_addr, Duration::from_millis(300)) {
-                if server.switch_transport(cli.serial.as_deref()).is_ok() {
+                let selected = if cli.d && cli.serial.is_none() {
+                    // AOSP legacy smart-socket selector: rejects zero or multiple USB devices.
+                    // Once a server is reachable its failure is authoritative: never
+                    // fall back to open_first() and silently pick another device.
+                    server.switch_service("host:transport-usb")?;
+                    true
+                } else {
+                    server.switch_transport(cli.serial.as_deref()).is_ok()
+                };
+                if selected {
                     // Send shell service via host service protocol
                     server.send_host_request(&shell_service)?;
                     server.read_status()?; // OKAY -> server created A_OPEN, device OK'd
@@ -857,6 +866,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Without a server we cannot prove that open_first() is unique.
+            if cli.d && cli.serial.is_none() {
+                return Err("-d requires an ADB server that can select a unique USB device".into());
+            }
             // Priority 2: direct USB/TCP transport — full CNXN/AUTH handshake.
             let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
                 Ok(t) => t,
@@ -1001,7 +1014,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Priority 1: ADB server (port 5037) — same pattern as shell.
             let server_addr = &server_addr;
             if let Ok(mut server) = AdbServerTransport::connect_timeout(server_addr, Duration::from_millis(300)) {
-                if server.switch_transport(cli.serial.as_deref()).is_ok() {
+                let selected = if cli.d && cli.serial.is_none() {
+                    // AOSP legacy smart-socket selector: rejects zero or multiple USB devices.
+                    // Once a server is reachable its failure is authoritative: never
+                    // fall back to open_first() and silently pick another device.
+                    server.switch_service("host:transport-usb")?;
+                    true
+                } else {
+                    server.switch_transport(cli.serial.as_deref()).is_ok()
+                };
+                if selected {
                     // Send exec service via host service protocol
                     server.send_host_request(&exec_service)?;
                     server.read_status()?; // OKAY -> server created A_OPEN, device OK'd
@@ -1015,6 +1037,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Without a server we cannot prove that open_first() is unique.
+            if cli.d && cli.serial.is_none() {
+                return Err("-d requires an ADB server that can select a unique USB device".into());
+            }
             // Priority 2: direct USB/TCP transport — full CNXN/AUTH handshake.
             let transport = match open_adb_transport(cli.serial.as_deref(), cli.d, Duration::from_secs(3)) {
                 Ok(t) => t,

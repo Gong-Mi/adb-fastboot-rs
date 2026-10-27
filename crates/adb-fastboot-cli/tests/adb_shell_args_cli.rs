@@ -327,6 +327,62 @@ fn shell_missing_explicit_serial_does_not_connect_default_adbd() {
 }
 
 #[test]
+fn usb_selector_is_sent_for_shell_and_exec() {
+    let mut reply = shell_v2_frame(SHELL_ID_STDOUT, b"usb\n");
+    reply.extend_from_slice(&shell_v2_frame(SHELL_ID_EXIT, &[0]));
+    let result = assert_wire_case("usb shell", &["-d", "shell", "id"],
+        &["host:transport-usb", "shell,v2,raw:id"], reply);
+    assert_eq!(result.stdout, b"usb\n");
+    let result = assert_wire_case("usb exec-out", &["-d", "exec-out", "id"],
+        &["host:transport-usb", "exec:id"], b"out".to_vec());
+    assert_eq!(result.stdout, b"out");
+    let result = assert_wire_case("usb exec-in", &["-d", "exec-in", "id"],
+        &["host:transport-usb", "exec:id"], Vec::new());
+    assert!(result.status.success());
+}
+
+#[test]
+fn serial_overrides_usb_selector_for_shell() {
+    let reply = shell_v2_frame(SHELL_ID_EXIT, &[0]);
+    assert_wire_case("serial and usb", &["-d", "-s", "chosen-serial", "shell", "id"],
+        &["host:transport:chosen-serial", "shell,v2,raw:id"], reply);
+}
+
+#[test]
+fn usb_selection_without_server_fails_closed() {
+    // Port 1 is used as the unreachable server address by the existing test
+    // suite; the production path must not open the first USB device instead.
+    for command in ["shell", "exec-in", "exec-out"] {
+        let result = run_cli(&["-P".into(), "1".into(), "-d".into(), command.into(), "id".into()]);
+        assert!(!result.status.success(), "{command} unexpectedly succeeded");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("requires an ADB server"),
+            "{command}: {}", String::from_utf8_lossy(&result.stderr));
+    }
+}
+
+#[test]
+fn usb_selection_failure_does_not_fallback() {
+    for command in ["shell", "exec-in", "exec-out"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = thread::spawn(move || {
+            let mut socket = accept_with_deadline(&listener).unwrap();
+            let request = read_host_request(&mut socket).unwrap();
+            let error = b"more than one USB device";
+            socket.write_all(format!("FAIL{:04x}", error.len()).as_bytes()).unwrap();
+            socket.write_all(error).unwrap();
+            request
+        });
+        let result = run_cli(&["-P".into(), port.to_string(), "-d".into(), command.into(), "id".into()]);
+        assert_eq!(peer.join().unwrap(), "host:transport-usb", "{command}");
+        assert!(!result.status.success(), "{command}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("more than one USB device"),
+            "{command}: stderr={}", String::from_utf8_lossy(&result.stderr));
+    }
+}
+
+#[test]
 fn exec_out_escapes_arguments_after_the_program_name() {
     let output = assert_wire_case(
         "exec-out screencap -p",
