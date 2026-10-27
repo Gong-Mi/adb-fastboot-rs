@@ -239,6 +239,34 @@ fn shell_leading_option_still_fails_loudly() {
     );
 }
 
+fn shell_server_exit_case(reply: Vec<u8>, expected_code: i32, stdout: &[u8], stderr: &[u8]) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (peer, observed) = start_fake_server(listener,
+        vec!["host:transport-any".into(), "shell,v2,raw:echo hi".into()], reply);
+    let output = run_cli(&["-P".into(), port.to_string(), "shell".into(), "echo".into(), "hi".into()]);
+    let (result, requests) = observed.recv_timeout(Duration::from_secs(15)).unwrap();
+    peer.join().unwrap();
+    assert!(result.is_ok(), "wire error: {result:?}, requests: {requests:?}");
+    assert_eq!(output.status.code(), Some(expected_code), "stderr: {:?}", output.stderr);
+    assert_eq!(output.stdout, stdout);
+    assert_eq!(output.stderr, stderr);
+}
+
+#[test]
+fn shell_server_propagates_status_and_separates_stderr() {
+    let mut reply = shell_v2_frame(SHELL_ID_STDOUT, b"out\n");
+    reply.extend_from_slice(&shell_v2_frame(2, b"err\n"));
+    reply.extend_from_slice(&shell_v2_frame(SHELL_ID_EXIT, &[7]));
+    shell_server_exit_case(reply, 7, b"out\n", b"err\n");
+}
+
+#[test]
+fn shell_server_without_exit_frame_returns_255() {
+    shell_server_exit_case(shell_v2_frame(SHELL_ID_STDOUT, b"partial\n"), 255, b"partial\n", b"");
+}
+
 #[test]
 fn shell_missing_explicit_serial_does_not_connect_default_adbd() {
     let default_adbd = TcpListener::bind("127.0.0.1:5555")
