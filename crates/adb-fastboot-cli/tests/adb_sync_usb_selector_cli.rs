@@ -39,7 +39,13 @@ fn sync_message(socket: &mut TcpStream) -> ([u8; 4], Vec<u8>) {
     socket.read_exact(&mut data).unwrap();
     (id, data)
 }
-fn run(case: &'static str, denied: bool) {
+fn run(case: &'static str, denied: bool) { run_selected(case, denied, None); }
+
+fn run_selected(case: &'static str, denied: bool, serial: Option<&'static str>) {
+    run_selected_via(case, denied, serial, false, false);
+}
+
+fn run_selected_via(case: &'static str, denied: bool, serial: Option<&'static str>, listen: bool, also_usb: bool) {
     let tmp = Temp::new();
     let local = tmp.0.join("input.bin");
     let folder = tmp.0.join("folder");
@@ -64,7 +70,8 @@ fn run(case: &'static str, denied: bool) {
         socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
         let selector = host(&mut socket);
-        if selector != "host:transport-usb" { return Err(format!("wrong selector {selector}")); }
+        let expected = serial.map_or_else(|| "host:transport-usb".to_string(), |s| format!("host:transport:{s}"));
+        if selector != expected { return Err(format!("wrong selector {selector}, expected {expected}")); }
         if denied {
             socket.write_all(b"FAIL0018more than one USB device").unwrap();
             let mut extra = [0u8; 1];
@@ -109,7 +116,11 @@ fn run(case: &'static str, denied: bool) {
     });
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_adb-rs"));
     let subcommand = match case { "push-dir" => "push", "pull-a" => "pull", _ => case };
-    cmd.arg("-P").arg(port.to_string()).arg("-d").arg(subcommand);
+    if listen { cmd.arg("-L").arg(format!("tcp:localhost:{port}")); }
+    else { cmd.arg("-P").arg(port.to_string()); }
+    if also_usb { cmd.arg("-d"); }
+    if let Some(s) = serial { cmd.arg("-s").arg(s); } else if !also_usb { cmd.arg("-d"); }
+    cmd.arg(subcommand);
     if case == "pull-a" { cmd.arg("-a"); }
     if case == "push" { cmd.arg(&local).arg("/remote/file"); }
     else if case == "push-dir" { cmd.arg(&folder).arg("/remote/dir"); }
@@ -141,6 +152,12 @@ fn run(case: &'static str, denied: bool) {
         }
     }
 }
+#[test] fn serial_push_honors_explicit_server_port() { run_selected("push", false, Some("fixture-serial")); }
+#[test] fn serial_pull_honors_explicit_server_port() { run_selected("pull", false, Some("fixture-serial")); }
+#[test] fn serial_push_honors_local_listen_server() { run_selected_via("push", false, Some("fixture-serial"), true, false); }
+#[test] fn serial_pull_overrides_usb_flag() { run_selected_via("pull", false, Some("fixture-serial"), false, true); }
+#[test] fn serial_directory_push_honors_explicit_server_port() { run_selected("push-dir", false, Some("fixture-serial")); }
+#[test] fn serial_pull_selector_fail_stops_before_sync() { run_selected("pull", true, Some("fixture-serial")); }
 #[test] fn push_selects_usb_and_transfers_sync_bytes() { run("push", false); }
 #[test] fn pull_selects_usb_and_transfers_sync_bytes() { run("pull", false); }
 #[test] fn pull_preserves_metadata_on_selected_usb_server() { run("pull-a", false); }
@@ -148,6 +165,63 @@ fn run(case: &'static str, denied: bool) {
 #[test] fn pull_selector_fail_stops_before_sync() { run("pull", true); }
 #[test] fn directory_push_uses_same_selected_usb_connection() { run("push-dir", false); }
 #[test] fn directory_push_selector_fail_stops_before_sync() { run("push-dir", true); }
+
+#[test]
+fn explicit_server_unavailable_never_falls_back_to_direct_tcp_device() {
+    let tmp = Temp::new();
+    let input = tmp.0.join("input");
+    fs::write(&input, b"fixture").unwrap();
+    let device = TcpListener::bind("127.0.0.1:0").unwrap();
+    device.set_nonblocking(true).unwrap();
+    let serial = device.local_addr().unwrap().to_string();
+    for case in ["push", "pull"] {
+        let output = tmp.0.join("output");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_adb-rs"));
+        cmd.args(["-P", "1", "-s", &serial, case]);
+        if case == "push" { cmd.arg(&input).arg("/remote/file"); }
+        else { cmd.arg("/remote/file").arg(&output); }
+        let result = cmd.env("ANDROID_ADB_SERVER_PORT", "1").stdin(Stdio::null()).output().unwrap();
+        assert!(!result.status.success(), "{case}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("refusing direct device fallback"));
+        assert!(matches!(device.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock), "connected direct target");
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn nonlocal_server_spec_does_not_contact_local_server() {
+    let tmp = Temp::new();
+    let input = tmp.0.join("input");
+    fs::write(&input, b"fixture").unwrap();
+    let local_server = TcpListener::bind("127.0.0.1:0").unwrap();
+    local_server.set_nonblocking(true).unwrap();
+    let port = local_server.local_addr().unwrap().port();
+    for case in ["push", "pull"] {
+        let output = tmp.0.join("output");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_adb-rs"));
+        cmd.args(["-L", &format!("tcp:192.0.2.1:{port}"), "-s", "fixture-serial", case]);
+        if case == "push" { cmd.arg(&input).arg("/remote/file"); }
+        else { cmd.arg("/remote/file").arg(&output); }
+        let result = cmd.stdin(Stdio::null()).output().unwrap();
+        assert!(!result.status.success(), "{case}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("does not support this ADB server socket"));
+        assert!(matches!(local_server.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock), "contacted local server instead");
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn empty_directory_does_not_mask_missing_explicit_server() {
+    let tmp = Temp::new();
+    let empty = tmp.0.join("empty");
+    fs::create_dir(&empty).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_adb-rs"))
+        .args(["-P", "1", "-s", "fixture-serial", "push"])
+        .arg(empty).arg("/remote/dir")
+        .env("ANDROID_ADB_SERVER_PORT", "1").stdin(Stdio::null()).output().unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("refusing direct device fallback"));
+}
 
 #[test]
 fn missing_server_rejects_usb_without_creating_pull_output() {

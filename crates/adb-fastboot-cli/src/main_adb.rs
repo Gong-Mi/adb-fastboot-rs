@@ -60,6 +60,24 @@ fn resolve_server_port(port_flag: Option<u16>, listen_flag: Option<&str>) -> u16
     ADB_SERVER_PORT
 }
 
+/// This CLI currently resolves only local ADB server sockets. Reject a
+/// non-local explicit address for SYNC rather than silently using localhost.
+fn validate_sync_server_scope(port: Option<u16>, listen: Option<&str>) -> Result<(), String> {
+    let env_spec = std::env::var("ADB_SERVER_SOCKET").ok();
+    let spec = if port.is_some() { None } else { listen.or(env_spec.as_deref()) };
+    if let Some(spec) = spec {
+        let rest = spec.strip_prefix("tcp:").ok_or_else(|| format!("unsupported ADB server socket: {spec}"))?;
+        let (host, port_str) = match rest.rsplit_once(':') {
+            Some((host, port)) => (host, port),
+            None => ("", rest),
+        };
+        if !matches!(host, "" | "localhost" | "127.0.0.1") || port_str.parse::<u16>().is_err() {
+            return Err(format!("SYNC does not support this ADB server socket: {spec}"));
+        }
+    }
+    Ok(())
+}
+
 /// Map `adb reconnect [device|offline]` to the AOSP host-service request.
 fn reconnect_service(target: Option<&str>) -> Result<&'static str, String> {
     match target {
@@ -1078,12 +1096,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Push { local, remote, sync, algorithm, no_compress } => {
+            validate_sync_server_scope(cli.port, cli.transport.as_deref())?;
             let serial = cli.serial.as_deref();
             let _compression = sync_compression_option(algorithm.as_deref(), *no_compress)?;
             let result = if cli.d && serial.is_none() {
                 file_sync::push_usb_server(&server_addr, local, remote, *sync)
             } else {
-                file_sync::push(serial, local, remote, *sync)
+                file_sync::push_at(serial, local, remote, *sync, &server_addr, cli.port.is_some() || cli.transport.is_some())
             };
             match result {
                 Ok(()) => {}
@@ -1094,12 +1113,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Pull { remote, local, preserve, algorithm, no_compress } => {
+            validate_sync_server_scope(cli.port, cli.transport.as_deref())?;
             let serial = cli.serial.as_deref();
             let _compression = sync_compression_option(algorithm.as_deref(), *no_compress)?;
             let result = if cli.d && serial.is_none() {
                 file_sync::pull_usb_server(&server_addr, remote, local, *preserve)
             } else {
-                file_sync::pull(serial, remote, local, *preserve)
+                file_sync::pull_at(serial, remote, local, *preserve, &server_addr, cli.port.is_some() || cli.transport.is_some())
             };
             match result {
                 Ok(()) => {}

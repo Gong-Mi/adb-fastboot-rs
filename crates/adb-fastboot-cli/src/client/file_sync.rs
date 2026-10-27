@@ -189,24 +189,29 @@ pub fn pull_usb_server(server_addr: &str, remote: &str, local: &str, preserve: b
 ///    transport via the server bridge, avoiding repeated AUTH handshakes.
 /// 2. Direct USB/TCP — connects directly to adbd on the device.
 pub fn push(
-    serial: Option<&str>,
-    local: &str,
-    remote: &str,
-    sync: bool,
+    serial: Option<&str>, local: &str, remote: &str, sync: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let server_addr = format!("127.0.0.1:{}", adb_server_port());
+    push_at(serial, local, remote, sync, &server_addr, false)
+}
+
+/// CLI variant preserves the server selected by -P/-L.
+pub fn push_at(
+    serial: Option<&str>, local: &str, remote: &str, sync: bool,
+    server_addr: &str, require_server: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if Path::new(local).is_dir() {
-        return push_dir(serial, local, remote, sync);
+        return push_dir_at(serial, local, remote, sync, server_addr, require_server);
     }
-    // Priority 1: ADB server (port 5037)
-    let server_addr = format!("127.0.0.1:{}", adb_server_port());
-    if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
-        if server.switch_transport(serial).is_ok() {
-            // Open sync: service via server bridge
-            server.send_host_request("sync:")?;
-            server.read_status()?;
-            // Now in forwarding mode — raw sync protocol
-            return push_file_server(&mut server, local, remote, sync);
-        }
+    // Priority 1: selected ADB server
+    if let Ok(mut server) = AdbServerTransport::connect_timeout(server_addr, Duration::from_millis(300)) {
+        server.switch_transport(serial)?;
+        server.send_host_request("sync:")?;
+        server.read_status()?;
+        return push_file_server(&mut server, local, remote, sync);
+    }
+    if require_server {
+        return Err(format!("ADB server {server_addr} unavailable; refusing direct device fallback").into());
     }
 
     // Priority 2: direct USB/TCP
@@ -222,19 +227,25 @@ pub fn push(
 /// # Priority
 /// Same as `push()` — ADB server first, then direct USB/TCP.
 pub fn pull(
-    serial: Option<&str>,
-    remote: &str,
-    local: &str,
-    preserve: bool,
+    serial: Option<&str>, remote: &str, local: &str, preserve: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Priority 1: ADB server
     let server_addr = format!("127.0.0.1:{}", adb_server_port());
-    if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
-        if server.switch_transport(serial).is_ok() {
-            server.send_host_request("sync:")?;
-            server.read_status()?;
-            return pull_file_server(&mut server, remote, local, preserve);
-        }
+    pull_at(serial, remote, local, preserve, &server_addr, false)
+}
+
+/// CLI variant preserves the server selected by -P/-L.
+pub fn pull_at(
+    serial: Option<&str>, remote: &str, local: &str, preserve: bool,
+    server_addr: &str, require_server: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(mut server) = AdbServerTransport::connect_timeout(server_addr, Duration::from_millis(300)) {
+        server.switch_transport(serial)?;
+        server.send_host_request("sync:")?;
+        server.read_status()?;
+        return pull_file_server(&mut server, remote, local, preserve);
+    }
+    if require_server {
+        return Err(format!("ADB server {server_addr} unavailable; refusing direct device fallback").into());
     }
 
     // Priority 2: direct USB/TCP
@@ -304,14 +315,19 @@ pub fn stat(
 /// on the device via the sync service by sending each file with its full
 /// remote path (adbd creates parent dirs as needed for V1 SEND).
 pub fn push_dir(
-    serial: Option<&str>,
-    local_dir: &str,
-    remote_dir: &str,
-    sync: bool,
+    serial: Option<&str>, local_dir: &str, remote_dir: &str, sync: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let server_addr = format!("127.0.0.1:{}", adb_server_port());
+    push_dir_at(serial, local_dir, remote_dir, sync, &server_addr, false)
+}
+
+fn push_dir_at(
+    serial: Option<&str>, local_dir: &str, remote_dir: &str, sync: bool,
+    server_addr: &str, require_server: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Collect all files to push
     let files = build_local_file_list(local_dir, remote_dir)?;
-    if files.is_empty() {
+    if files.is_empty() && !require_server {
         println!("[adb-rs] No files to push in '{}'", local_dir);
         return Ok(());
     }
@@ -323,15 +339,15 @@ pub fn push_dir(
         remote_dir
     );
 
-    let server_addr = format!("127.0.0.1:{}", adb_server_port());
-
-    // Try ADB server first
-    if let Ok(mut server) = AdbServerTransport::connect_timeout(&server_addr, Duration::from_millis(300)) {
-        if server.switch_transport(serial).is_ok() {
-            server.send_host_request("sync:")?;
-            server.read_status()?;
-            return push_files_server(&mut server, &files, sync);
-        }
+    // Try the explicitly selected server first.
+    if let Ok(mut server) = AdbServerTransport::connect_timeout(server_addr, Duration::from_millis(300)) {
+        server.switch_transport(serial)?;
+        server.send_host_request("sync:")?;
+        server.read_status()?;
+        return push_files_server(&mut server, &files, sync);
+    }
+    if require_server {
+        return Err(format!("ADB server {server_addr} unavailable; refusing direct device fallback").into());
     }
 
     // Fallback: direct USB/TCP
