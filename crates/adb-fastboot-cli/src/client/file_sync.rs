@@ -144,6 +144,39 @@ fn resolve_remote_file_target(
 // Public API — existing single-file push/pull (unchanged)
 // ---------------------------------------------------------------------------
 
+/// Open SYNC on the uniquely selected USB transport through the specified
+/// server. A failed selector is authoritative: do not fall back to another
+/// device or to a direct `open_first()`.
+fn open_usb_sync_server(server_addr: &str) -> Result<AdbServerTransport, Box<dyn std::error::Error>> {
+    let mut server = AdbServerTransport::connect_timeout(server_addr, Duration::from_millis(300))
+        .map_err(|e| format!("-d requires an ADB server that can select a unique USB device: {e}"))?;
+    server.switch_service("host:transport-usb")?;
+    server.send_host_request("sync:")?;
+    server.read_status()?;
+    Ok(server)
+}
+
+/// CLI USB selector path, using raw SYNC over the selected server connection.
+pub fn push_usb_server(server_addr: &str, local: &str, remote: &str, sync: bool)
+    -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut server = open_usb_sync_server(server_addr)?;
+    if Path::new(local).is_dir() {
+        let files = build_local_file_list(local, remote)?;
+        push_files_server(&mut server, &files, sync)
+    } else {
+        push_file_server(&mut server, local, remote, sync)
+    }
+}
+
+/// CLI USB selector path for a single-file pull (same scope as `pull`).
+pub fn pull_usb_server(server_addr: &str, remote: &str, local: &str, preserve: bool)
+    -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut server = open_usb_sync_server(server_addr)?;
+    pull_file_server(&mut server, remote, local, preserve)
+}
+
 /// Push a local file or directory to a remote path on the device.
 ///
 /// `sync` mirrors AOSP `adb push --sync`: before sending, the remote path is

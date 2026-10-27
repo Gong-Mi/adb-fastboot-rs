@@ -1080,7 +1080,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Push { local, remote, sync, algorithm, no_compress } => {
             let serial = cli.serial.as_deref();
             let _compression = sync_compression_option(algorithm.as_deref(), *no_compress)?;
-            match file_sync::push(serial, local, remote, *sync) {
+            let result = if cli.d && serial.is_none() {
+                file_sync::push_usb_server(&server_addr, local, remote, *sync)
+            } else {
+                file_sync::push(serial, local, remote, *sync)
+            };
+            match result {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("Error: push failed: {e}");
@@ -1091,7 +1096,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Pull { remote, local, preserve, algorithm, no_compress } => {
             let serial = cli.serial.as_deref();
             let _compression = sync_compression_option(algorithm.as_deref(), *no_compress)?;
-            match file_sync::pull(serial, remote, local, *preserve) {
+            let result = if cli.d && serial.is_none() {
+                file_sync::pull_usb_server(&server_addr, remote, local, *preserve)
+            } else {
+                file_sync::pull(serial, remote, local, *preserve)
+            };
+            match result {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("Error: pull failed: {e}");
