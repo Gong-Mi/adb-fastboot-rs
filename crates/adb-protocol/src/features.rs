@@ -66,15 +66,14 @@ pub fn can_use_feature(device_features: &[String], feature: &str) -> bool {
 /// CNXN / report via `host-features`. Deliberately a subset of AOSP's list:
 ///
 /// - shell_v2 / cmd           — shell v2 framing + legacy `cmd:` service.
-/// - stat_v2 / ls_v2          — SYNC STAT_V2/LSTAT_V2/DENT_V2 codecs.
-/// - sendrecv_v2(+bro/ls4/zstd/dry_run)
-///                            — SYNC_SEND_V2/RECV_V2 + compressed DATA.
-/// - fixed_push_symlink_timestamp
-///                            — symlink push sends the target as DATA
-///                              (file_sync_client.cpp SendSmallFile parity).
 ///
-/// NOT advertised (unimplemented here, so we must not let a peer rely on
-/// them): remount_shell, track_app, devraw, app_info,
+/// NOT advertised: stat_v2, ls_v2, sendrecv_v2 and its compression/dry-run
+/// variants, and fixed_push_symlink_timestamp. Their codecs exist but the
+/// CLI SYNC path does not implement these operations end-to-end; regular
+/// recursive push also does not transfer symlinks. Do not advertise codec
+/// support as an operational capability.
+///
+/// Also not advertised: remount_shell, track_app, devraw, app_info,
 /// server_status, openscreen_mdns, devicetracker_proto_format, track_mdns,
 /// fixed_push_mkdir (no recursive push yet), libusb (no libusb backend),
 /// push_sync (server-service extra AOSP appends unconditionally; we only
@@ -83,14 +82,6 @@ pub fn host_supported_features() -> &'static [&'static str] {
     &[
         "shell_v2",
         "cmd",
-        "stat_v2",
-        "ls_v2",
-        "sendrecv_v2",
-        "sendrecv_v2_brotli",
-        "sendrecv_v2_lz4",
-        "sendrecv_v2_zstd",
-        "sendrecv_v2_dry_run_send",
-        "fixed_push_symlink_timestamp",
         // apex / abb_exec: implemented by the install domain —
         // - `apex`: streamed install appends `--apex` for .apex inputs
         //   (client/adb_install.cpp:68-70, 227-229)
@@ -161,14 +152,8 @@ mod tests {
         for name in [
             "shell_v2",
             "cmd",
-            "stat_v2",
-            "ls_v2",
-            "sendrecv_v2",
-            "sendrecv_v2_brotli",
-            "sendrecv_v2_lz4",
-            "sendrecv_v2_zstd",
-            "sendrecv_v2_dry_run_send",
-            "fixed_push_symlink_timestamp",
+            "apex",
+            "abb_exec",
         ] {
             assert!(f.contains(&name), "missing {name}");
         }
@@ -177,6 +162,23 @@ mod tests {
         for bad in ["abb", "remount_shell", "libusb", "push_sync"] {
             assert!(!f.contains(&bad), "must not advertise {bad}");
         }
+    }
+
+    #[test]
+    fn unimplemented_sync_features_cannot_be_advertised_or_negotiated() {
+        let unavailable = [
+            "stat_v2", "ls_v2", "sendrecv_v2", "sendrecv_v2_brotli",
+            "sendrecv_v2_lz4", "sendrecv_v2_zstd", "sendrecv_v2_dry_run_send",
+            "fixed_push_symlink_timestamp",
+        ];
+        let banner = String::from_utf8(host_cnxn_payload()).unwrap();
+        let advertised = parse_banner_features(&banner);
+        let device: Vec<String> = unavailable.iter().map(|s| s.to_string()).collect();
+        for feature in unavailable {
+            assert!(!advertised.iter().any(|f| f == feature), "CNXN must not advertise {feature}: {banner}");
+            assert!(!can_use_feature(&device, feature), "device must not unlock unsupported {feature}");
+        }
+        assert!(can_use_feature(&["cmd".to_string()], "cmd"));
     }
 
     #[test]
