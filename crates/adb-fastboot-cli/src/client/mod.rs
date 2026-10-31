@@ -39,4 +39,5 @@ pub mod transport_emulator;
 pub mod transport_mdns;
 pub mod transport_usb;
 pub mod file_sync;
+pub mod fastdeploy;
 pub mod usb_libusb;
