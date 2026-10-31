@@ -831,6 +831,25 @@ mod tests {
         (status, payload)
     }
 
+    #[test]
+    fn host_features_wire_omits_unimplemented_sync_and_keeps_supported_install() {
+        let registry = Arc::new(Mutex::new(TransportRegistry::new()));
+        let (status, payload) = run_host_service("host:host-features", registry);
+        assert_eq!(status, "OKAY");
+        let payload = std::str::from_utf8(&payload).unwrap();
+        let features: Vec<&str> = payload.split(',').collect();
+        for supported in ["shell_v2", "cmd", "apex", "abb_exec"] {
+            assert!(features.contains(&supported), "missing {supported}: {payload}");
+        }
+        for unsupported in [
+            "stat_v2", "ls_v2", "sendrecv_v2", "sendrecv_v2_brotli",
+            "sendrecv_v2_lz4", "sendrecv_v2_zstd", "sendrecv_v2_dry_run_send",
+            "fixed_push_symlink_timestamp",
+        ] {
+            assert!(!features.contains(&unsupported), "unexpected {unsupported}: {payload}");
+        }
+    }
+
     fn tcp_device(serial: &str, port: u16) -> DeviceEntry {
         DeviceEntry {
             serial: serial.to_string(),
