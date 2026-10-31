@@ -1,0 +1,76 @@
+warning: unused variable: `wire`
+  --> crates/adb-protocol/src/sysdeps/errno.rs:54:16
+   |
+54 |     for (host, wire) in ERRNO_TABLE {
+   |                ^^^^ help: if this is intentional, prefix it with an underscore: `_wire`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `adb-protocol` (lib) generated 1 warning (run `cargo fix --lib -p adb-protocol` to apply 1 suggestion)
+warning: unused import: `crate::client::transport::resolve_target_addr`
+ --> crates/adb-fastboot-cli/src/client/host_command.rs:8:5
+  |
+8 | use crate::client::transport::resolve_target_addr;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `escape_arg`
+  --> crates/adb-fastboot-cli/src/client/adb_install.rs:18:5
+   |
+18 |     escape_arg,
+   |     ^^^^^^^^^^
+
+warning: unused imports: `ensure_server_running` and `kill_server`
+  --> crates/adb-fastboot-cli/src/main_adb.rs:24:27
+   |
+24 | use client::server_cmds::{ensure_server_running, kill_server};
+   |                           ^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^
+
+warning: unused import: `client::host_command::host_command`
+  --> crates/adb-fastboot-cli/src/main_adb.rs:25:5
+   |
+25 | use client::host_command::host_command;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Write`
+   --> crates/adb-fastboot-cli/src/client/console.rs:432:25
+    |
+432 |     use std::io::{Read, Write};
+    |                         ^^^^^
+
+warning: unused import: `Read`
+   --> crates/adb-fastboot-cli/src/client/console.rs:432:19
+    |
+432 |     use std::io::{Read, Write};
+    |                   ^^^^
+
+   Compiling adb-fastboot-cli v0.1.0 (/data/data/com.termux/files/home/wt-usb-hotplug/crates/adb-fastboot-cli)
+warning: `adb-fastboot-cli` (bin "adb-rs") generated 6 warnings (run `cargo fix --bin "adb-rs" -p adb-fastboot-cli` to apply 4 suggestions)
+error: couldn't find file `crates/adb-fastboot-cli/tests/../src/client/usb_scan.rs`
+  --> crates/adb-fastboot-cli/tests/usb_hotplug.rs:19:1
+   |
+19 | mod usb_scan;
+   | ^^^^^^^^^^^^^
+
+error: could not compile `adb-fastboot-cli` (test "usb_hotplug") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+warning: fields `skip_reboot`, `skip_secondary`, and `force_flash` are never read
+  --> crates/adb-fastboot-cli/src/main_fastboot.rs:21:5
+   |
+19 | struct GlobalOptions {
+   |        ------------- fields in this struct
+20 |     /// `--skip-reboot`: don't reboot after flashing.
+21 |     skip_reboot: bool,
+   |     ^^^^^^^^^^^
+22 |     /// `--skip-secondary`: don't flash secondary slots in flashall/update.
+23 |     skip_secondary: bool,
+   |     ^^^^^^^^^^^^^^
+24 |     /// `--force`: force a flash operation that may be unsafe.
+25 |     force_flash: bool,
+   |     ^^^^^^^^^^^
+   |
+   = note: `GlobalOptions` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `adb-fastboot-cli` (bin "fastboot-rs") generated 1 warning

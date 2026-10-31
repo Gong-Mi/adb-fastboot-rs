@@ -18,6 +18,7 @@
 //! - transport_emulator.cpp → transport_emulator
 //! - transport_usb.cpp     → transport_usb
 //! - usb_libusb.cpp / usb_libusb10.cpp → usb_libusb
+//! - usb_linux.cpp        → usb_scan
 
 pub mod auth;
 pub mod transport;
@@ -40,3 +41,4 @@ pub mod transport_mdns;
 pub mod transport_usb;
 pub mod file_sync;
 pub mod usb_libusb;
+pub mod usb_scan;
