@@ -722,6 +722,82 @@ fn flash_raw_uses_aosp_bootimage_defaults() {
 }
 
 #[test]
+fn flash_raw_header_page_matches_aosp_mkbootimg_bytes() {
+    // Byte-exact oracle: AOSP `fastboot` 35.0.2 driven against the same fake
+    // device (4096-byte 0x4B kernel, no ramdisk) sends 6144 bytes with
+    // sha256 bb846a1b212333e0edfc0ab645a24ac5e5443ce96e0ef6b3a4c1f9f7bd3a2037.
+    // Fields come from mkbootimg() writing `g_boot_img_hdr`
+    // (fastboot.cpp:2223-2228) plus `g_base_addr` 0x10000000
+    // (bootimg_utils.cpp:111-121).
+    const KERNEL_BYTE: u8 = 0x4B;
+    let files = Files::new("raw-oracle");
+    let kernel = files.path("kernel.bin");
+    std::fs::write(&kernel, vec![KERNEL_BYTE; 4096]).unwrap();
+
+    let output = run_cli(&["flash:raw", "boot", &kernel], move |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"getvar:max-download-size");
+        peer.send(&[b"OKAY0x10000"]);
+        peer.expect(b"download:00001800");
+        peer.send(&[b"DATA00001800"]);
+
+        let mut frame = [0u8; 8];
+        peer.0.read_exact(&mut frame).unwrap();
+        let mut payload = vec![0u8; u64::from_be_bytes(frame) as usize];
+        peer.0.read_exact(&mut payload).unwrap();
+        assert_eq!(payload.len(), 6144, "payload length");
+
+        let word = |off: usize| u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+        // boot_img_hdr_v0 scalars, offsets per bootimg.h.
+        assert_eq!(word(8), 4096, "kernel_size");
+        assert_eq!(word(12), 0x1000_8000, "kernel_addr = 0x8000 + base");
+        assert_eq!(word(16), 0, "ramdisk_size");
+        assert_eq!(word(20), 0x1100_0000, "ramdisk_addr = 0x01000000 + base");
+        assert_eq!(word(24), 0, "second_size");
+        assert_eq!(word(28), 0x10F0_0000, "second_addr = 0x00f00000 + base");
+        assert_eq!(word(32), 0x1000_0100, "tags_addr = 0x00000100 + base");
+        assert_eq!(word(36), 2048, "page_size");
+        assert_eq!(word(40), 0, "header_version");
+        assert_eq!(word(44), 0, "os_version");
+        assert_eq!(&payload[48..64], &[0u8; 16], "name");
+        assert_eq!(&payload[64..576], &[0u8; 512], "cmdline");
+        assert_eq!(&payload[576..608], &[0u8; 32], "id is never re-signed");
+        assert_eq!(&payload[608..1632], &[0u8; 1024], "extra_cmdline");
+        assert_eq!(word(1632), 0, "recovery_dtbo_size (v1 field, zero for v0)");
+        assert_eq!(word(1648), 0, "dtb_size");
+        // mkbootimg() does `*hdr = src` over a whole boot_img_hdr_v2, so the
+        // v2 dtb_addr default survives past the 1632-byte v0 header.
+        assert_eq!(word(1652), 0x0110_0000, "v2 tail dtb_addr default");
+
+        // Whole-image equality: those fields, zeros elsewhere in the page,
+        // then the kernel occupying one padded page.
+        let mut expected = vec![0u8; 2048];
+        expected[..8].copy_from_slice(b"ANDROID!");
+        for (off, value) in [
+            (8usize, 4096u32),
+            (12, 0x1000_8000),
+            (20, 0x1100_0000),
+            (28, 0x10F0_0000),
+            (32, 0x1000_0100),
+            (36, 2048),
+            (1652, 0x0110_0000),
+        ] {
+            expected[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        expected.extend(std::iter::repeat(KERNEL_BYTE).take(4096));
+        assert_eq!(payload, expected, "boot image must match AOSP mkbootimg");
+
+        peer.send(&[b"OKAYdownloaded"]);
+        peer.expect(b"flash:boot_a");
+        peer.send(&[b"OKAYflashed"]);
+    });
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
 fn flash_raw_rejects_kernels_shorter_than_a_v3_header() {
     // AOSP LoadBootableImage: `size < sizeof(boot_img_hdr_v3)` -> "too short"
     // before any device command is sent.

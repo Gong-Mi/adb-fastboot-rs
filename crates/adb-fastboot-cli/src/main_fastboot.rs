@@ -2462,7 +2462,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 println!(
-                    "[fastboot-rs] 构建 boot image (kernel={}, ramdisk={}字节, second={}字节, header v4, page_size=4096)...",
+                    "[fastboot-rs] 构建 boot image (kernel={}, ramdisk={}字节, second={}字节, header v0, page_size=2048)...",
                     kernel,
                     ramdisk_data.len(),
                     second_data.len(),

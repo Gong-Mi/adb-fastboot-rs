@@ -17,12 +17,23 @@ pub const BOOT_IMAGE_HEADER_V2_SIZE: usize = 1664;
 pub const BOOT_IMAGE_HEADER_V3_SIZE: usize = 4096;
 pub const BOOT_IMAGE_HEADER_V4_SIZE: usize = 4096;
 
-/// Default addresses used by mkbootimg
+/// Per-section load addresses as AOSP fastboot keeps them in
+/// `g_boot_img_hdr` *before* `--base` is folded in (fastboot.cpp:2223-2228).
+/// `mkbootimg()` adds `DEFAULT_BASE_ADDR` to each of them, so the values that
+/// end up in the header are these plus the base.
 pub const DEFAULT_KERNEL_ADDR: u32 = 0x00008000;
 pub const DEFAULT_RAMDISK_ADDR: u32 = 0x01000000;
 pub const DEFAULT_SECOND_ADDR: u32 = 0x00F00000;
 pub const DEFAULT_TAGS_ADDR: u32 = 0x00000100;
 pub const DEFAULT_PAGE_SIZE: u32 = 2048;
+
+/// AOSP fastboot's default `--base` (`g_base_addr`, fastboot.cpp:105).
+/// Added to every v0–v2 load address by `mkbootimg()` (bootimg_utils.cpp:111-114).
+pub const DEFAULT_BASE_ADDR: u32 = 0x10000000;
+/// AOSP fastboot's default `dtb_addr` (fastboot.cpp:2228). It is only itself
+/// based for header_version 2 (bootimg_utils.cpp:121), but the whole
+/// `boot_img_hdr_v2` is copied into the header page for every v0–v2 image.
+pub const DEFAULT_DTB_ADDR: u64 = 0x01100000;
 
 /// v0 header size excluding page padding
 pub const BOOT_IMAGE_HEADER_V0_NATIVE_SIZE: usize = 1632;
@@ -30,6 +41,12 @@ pub const BOOT_IMAGE_HEADER_V0_NATIVE_SIZE: usize = 1632;
 pub const BOOT_IMAGE_HEADER_V1_EXTRA_SIZE: usize = 16;
 /// v2 header additional size after v1
 pub const BOOT_IMAGE_HEADER_V2_EXTRA_SIZE: usize = 12;
+/// `sizeof(boot_img_hdr_v2)` as AOSP sees it: the struct is `packed`, so the
+/// tail ends at 1652 + 8 = 1660 bytes (not 1664). `mkbootimg()` copies this
+/// many bytes into the header page for every v0–v2 image.
+pub const BOOT_IMAGE_HEADER_V2_STRUCT_SIZE: usize = BOOT_IMAGE_HEADER_V0_NATIVE_SIZE
+    + BOOT_IMAGE_HEADER_V1_EXTRA_SIZE
+    + BOOT_IMAGE_HEADER_V2_EXTRA_SIZE;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -184,6 +201,20 @@ impl BootImageVersion {
             Self::V1 => BOOT_IMAGE_HEADER_V1_SIZE,
             Self::V2 => BOOT_IMAGE_HEADER_V2_SIZE,
             Self::V3 | Self::V4 => BOOT_IMAGE_HEADER_V4_SIZE,
+        }
+    }
+
+    /// Value AOSP writes into the `header_size` field of a v1/v2 header.
+    ///
+    /// This is the `packed` `sizeof` — 1648 for v1 and 1660 for v2 — whereas
+    /// [`Self::header_size`] returns the 16-byte-aligned sizes used as buffer
+    /// bounds here. AOSP `mkbootimg()` writes `sizeof(boot_img_hdr_v1/v2)`
+    /// (bootimg_utils.cpp:116-119).
+    pub fn declared_header_size(&self) -> usize {
+        match self {
+            Self::V1 => BOOT_IMAGE_HEADER_V0_NATIVE_SIZE + BOOT_IMAGE_HEADER_V1_EXTRA_SIZE,
+            Self::V2 => BOOT_IMAGE_HEADER_V2_STRUCT_SIZE,
+            other => other.header_size(),
         }
     }
 }
@@ -680,6 +711,13 @@ impl BootImageBuilder {
 /// page. The returned vector contains the header (padded to a page boundary)
 /// followed by the kernel, ramdisk, second, recovery_dtbo, and dtb sections,
 /// each also padded to a page boundary.
+///
+/// For v0–v2 the header carries AOSP fastboot's defaults verbatim: load
+/// addresses are the `bootimg.h` offsets plus `DEFAULT_BASE_ADDR`
+/// (`mkbootimg()` in bootimg_utils.cpp:111-121), `name`/`cmdline` are empty,
+/// `os_version`/`id` stay zero, and the v2-only `dtb_size`/`dtb_addr` tail is
+/// written even for v0/v1 because `mkbootimg()` copies a whole
+/// `boot_img_hdr_v2` into the output buffer (`*hdr = src`, line 104).
 pub fn build_boot_image(
     kernel: &[u8],
     ramdisk: &[u8],
@@ -710,9 +748,19 @@ pub fn build_boot_image(
     hdr.second_size = second.len() as u32;
     hdr.page_size = ps as u32;
 
+    if header_version <= 2 {
+        // mkbootimg() folds `--base` into every load address. Our CLI exposes
+        // no --base, so this is AOSP's default base.
+        hdr.kernel_addr = DEFAULT_KERNEL_ADDR.wrapping_add(DEFAULT_BASE_ADDR);
+        hdr.ramdisk_addr = DEFAULT_RAMDISK_ADDR.wrapping_add(DEFAULT_BASE_ADDR);
+        hdr.second_addr = DEFAULT_SECOND_ADDR.wrapping_add(DEFAULT_BASE_ADDR);
+        hdr.tags_addr = DEFAULT_TAGS_ADDR.wrapping_add(DEFAULT_BASE_ADDR);
+        hdr.dtb_addr = DEFAULT_DTB_ADDR;
+    }
+
     if header_version >= 1 {
         hdr.boot_header_size = BootImageVersion::from_u32(header_version)
-            .map(|v| v.header_size() as u32)
+            .map(|v| v.declared_header_size() as u32)
             .unwrap_or(0);
 
         hdr.recovery_dtbo_size = 0;
@@ -721,11 +769,21 @@ pub fn build_boot_image(
 
     if header_version >= 2 {
         hdr.dtb_size = dtb.len() as u32;
-        hdr.dtb_addr = 0;
+        hdr.dtb_addr = DEFAULT_DTB_ADDR.wrapping_add(DEFAULT_BASE_ADDR as u64);
     }
 
     // Encode header and compute section offsets
     let mut raw_hdr = hdr.encode();
+    if header_version <= 1 {
+        // `*hdr = src` (bootimg_utils.cpp:104) writes a whole boot_img_hdr_v2,
+        // so the v2-only tail (dtb_size @1648, dtb_addr @1652) lands in the
+        // header page even though the declared v0/v1 header ends earlier.
+        // Bootloaders never read past the declared size; reproducing it keeps
+        // the page byte-identical with the C oracle.
+        raw_hdr.resize(BOOT_IMAGE_HEADER_V2_STRUCT_SIZE, 0);
+        LittleEndian::write_u32(&mut raw_hdr[1648..1652], hdr.dtb_size);
+        LittleEndian::write_u64(&mut raw_hdr[1652..1660], hdr.dtb_addr);
+    }
     let hdr_page = align_up(raw_hdr.len(), ps);
     raw_hdr.resize(hdr_page, 0);
 
@@ -1308,6 +1366,48 @@ mod tests {
         let expected = 2048 + 2048 + 2048;
         assert_eq!(image.len(), expected);
         assert_eq!(image.len() % ps, 0);
+    }
+
+    #[test]
+    fn test_v0_header_carries_aosp_fastboot_address_defaults() {
+        // AOSP fastboot mkbootimg(): g_boot_img_hdr offsets plus g_base_addr
+        // 0x10000000 (bootimg_utils.cpp:111-114), and the v2 dtb_addr default
+        // surviving in the copied boot_img_hdr_v2 tail (line 104).
+        let image = build_boot_image(&[0x4B; 16], &[], &[], &[], 2048, 0);
+        let hdr = BootImageHeader::decode(&image).unwrap();
+        assert_eq!(hdr.kernel_addr, 0x1000_8000);
+        assert_eq!(hdr.ramdisk_addr, 0x1100_0000);
+        assert_eq!(hdr.second_addr, 0x10F0_0000);
+        assert_eq!(hdr.tags_addr, 0x1000_0100);
+        assert_eq!(hdr.dtb_size, 0);
+        // Past the 1632-byte v0 header, still inside the 2048-byte page.
+        assert_eq!(
+            LittleEndian::read_u64(&image[1652..1660]),
+            DEFAULT_DTB_ADDR,
+            "v2 dtb_addr default is written past the v0 header"
+        );
+        // Nothing else in the page is non-zero apart from the known fields.
+        for (i, byte) in image[..2048].iter().enumerate() {
+            let known = (8..44).contains(&i) || (1652..1660).contains(&i) || i < 8;
+            assert!(known || *byte == 0, "unexpected non-zero header byte at {i}");
+        }
+    }
+
+    #[test]
+    fn test_v2_header_matches_aosp_dtb_fields() {
+        // AOSP `fastboot --header-version 2 --dtb board.dtb flash:raw boot k`
+        // (4096-byte kernel, 700-byte dtb) sends 8192 bytes: header_size 1660
+        // (packed sizeof), dtb_size 700, dtb_addr 0x01100000 + base.
+        let dtb = [0x44u8; 700];
+        let image = build_boot_image(&[0x4Bu8; 4096], &[], &[], &dtb, 2048, 2);
+        assert_eq!(image.len(), 8192);
+        let hdr = BootImageHeader::decode(&image).unwrap();
+        assert_eq!(hdr.boot_header_size, 1660);
+        assert_eq!(hdr.dtb_size, 700);
+        assert_eq!(hdr.dtb_addr, 0x1110_0000);
+        assert_eq!(hdr.kernel_addr, 0x1000_8000);
+        assert_eq!(&image[6144..6144 + 700], &dtb[..]);
+        assert!(image[6144 + 700..].iter().all(|b| *b == 0), "dtb page padding");
     }
 
     // ------------------------------------------------------------------
