@@ -2430,21 +2430,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ramdisk,
             second,
         } => {
-            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("[fastboot-rs] 错误: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            println!("[fastboot-rs] 已连接至 fastboot 目标 {}", addr);
-
-            // AOSP routes flash:raw through do_for_partitions() as well: the
-            // slot suffix must come from has-slot/current-slot, not the CLI.
-            let wire_partition = resolve_wire_partition(&mut transport, &partition, &slot_selection)?;
-
+            // AOSP builds/validates the boot image before any device command
+            // (LoadBootableImage runs first in fastboot.cpp:2511), so a bad
+            // kernel never opens a transport.
             // 读取 kernel
             let kernel_data = read_file_bytes(&kernel);
+
+            // AOSP LoadBootableImage() rejects anything shorter than a v3
+            // header before it even looks for BOOT_MAGIC (fastboot.cpp:656).
+            const BOOT_IMG_HDR_V3_SIZE: usize = 1580;
+            if kernel_data.len() < BOOT_IMG_HDR_V3_SIZE {
+                eprintln!("cannot load '{}': too short", kernel);
+                std::process::exit(1);
+            }
 
             let boot_payload: Vec<u8> = if kernel_data.starts_with(&fastboot_protocol::boot_image::BOOT_MAGIC) {
                 println!(
@@ -2470,13 +2468,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     second_data.len(),
                 );
 
+                // AOSP defaults: page size 2048 and header version 0 unless
+                // --page-size/--header-version say otherwise (fastboot.cpp
+                // `g_boot_img_hdr` is zero-initialised; mkbootimg applies the
+                // 2048-byte default page).
                 let built = fastboot_protocol::boot_image::build_boot_image(
                     &kernel_data,
                     &ramdisk_data,
                     &second_data,
                     &[], // dtb — 暂不提供
-                    4096,
-                    4,
+                    2048,
+                    0,
                 );
                 println!(
                     "[fastboot-rs] boot image 构建完成: {} 字节",
@@ -2484,6 +2486,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 built
             };
+
+
+            let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[fastboot-rs] 错误: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            println!("[fastboot-rs] 已连接至 fastboot 目标 {}", addr);
+
+            // AOSP routes flash:raw through do_for_partitions() as well: the
+            // slot suffix must come from has-slot/current-slot, not the CLI.
+            let wire_partition = resolve_wire_partition(&mut transport, &partition, &slot_selection)?;
 
             // download + flash 流程
             download_and_flash_payload(&mut transport, &boot_payload, &wire_partition)?;
