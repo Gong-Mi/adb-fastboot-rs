@@ -486,3 +486,61 @@ fn fetch_resolves_current_slot_before_sizing() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(std::fs::read(&destination).unwrap(), b"abcd");
 }
+
+#[test]
+fn flash_probes_is_logical_and_partition_size_before_download() {
+    // AOSP flash_buf -> copy_avb_footer asks is-logical + partition-size before
+    // any download, and warns (but still flashes) when the partition is
+    // smaller than the image.
+    let files = Files::new("flash-avb");
+    let image = files.path("image.bin");
+    std::fs::write(&image, vec![0x41u8; 1024]).unwrap();
+    let output = run_cli(&["flash", "boot", &image], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"getvar:is-logical:boot_a");
+        peer.send(&[b"OKAYno"]);
+        peer.expect(b"getvar:partition-size:boot_a");
+        peer.send(&[b"OKAY0x200"]);
+        peer.expect(b"getvar:max-download-size");
+        peer.send(&[b"OKAY0x1000"]);
+        peer.expect(b"download:00000400");
+        peer.send(&[b"DATA00000400"]);
+        peer.expect(&vec![0x41u8; 1024]);
+        peer.send(&[b"OKAYdownloaded"]);
+        peer.expect(b"flash:boot_a");
+        peer.send(&[b"OKAYflashed"]);
+    });
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skip copying boot_a image avb footer"),
+        "AOSP warns when the partition is smaller than the image: {output:?}"
+    );
+}
+
+#[test]
+fn flash_skips_avb_probe_for_tiny_images() {
+    // AOSP copy_avb_footer returns early when the image cannot hold a 64-byte
+    // AVB footer, so no is-logical/partition-size queries are sent.
+    let files = Files::new("flash-tiny");
+    let image = files.path("image.bin");
+    std::fs::write(&image, b"HELLO").unwrap();
+    let output = run_cli(&["flash", "boot", &image], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"getvar:max-download-size");
+        peer.send(&[b"OKAY0x1000"]);
+        peer.expect(b"download:00000005");
+        peer.send(&[b"DATA00000005"]);
+        peer.expect(b"HELLO");
+        peer.send(&[b"OKAYdownloaded"]);
+        peer.expect(b"flash:boot_a");
+        peer.send(&[b"OKAYflashed"]);
+    });
+    assert!(output.status.success(), "{output:?}");
+}
