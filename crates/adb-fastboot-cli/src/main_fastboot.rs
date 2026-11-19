@@ -2398,7 +2398,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ramdisk,
             second,
         } => {
-            let wire_partition = slot_selection.partition_name(&partition)?;
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2407,6 +2406,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             println!("[fastboot-rs] 已连接至 fastboot 目标 {}", addr);
+
+            // AOSP routes flash:raw through do_for_partitions() as well: the
+            // slot suffix must come from has-slot/current-slot, not the CLI.
+            let wire_partition = resolve_wire_partition(&mut transport, &partition, &slot_selection)?;
 
             // 读取 kernel
             let kernel_data = read_file_bytes(&kernel);
