@@ -70,11 +70,18 @@ impl Peer {
 }
 
 fn run_cli(args: &[&str], script: impl FnOnce(Peer) + Send + 'static) -> Output {
+    run_cli_serial("{addr}", args, script)
+}
+
+/// `serial` may contain `{addr}`; AOSP accepts both a bare `HOST:PORT` and the
+/// `tcp:HOST:PORT` network-serial form.
+fn run_cli_serial(serial: &str, args: &[&str], script: impl FnOnce(Peer) + Send + 'static) -> Output {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
+    let serial = serial.replace("{addr}", &address);
     let peer = thread::spawn(move || script(Peer::accept(listener)));
     let mut child = Command::new(env!("CARGO_BIN_EXE_fastboot-rs"))
-        .args(["-s", &address])
+        .args(["-s", &serial])
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -424,4 +431,28 @@ fn erase_fail_exits_nonzero_after_slot_resolution() {
     });
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr).contains("terminal rejection"), "{output:?}");
+}
+
+#[test]
+fn tcp_network_serial_form_reaches_the_peer() {
+    // AOSP ParseNetworkSerial: `-s tcp:HOST:PORT`. The prefix must be consumed
+    // by the CLI, not handed to the resolver.
+    let output = run_cli_serial("tcp:{addr}", &["getvar", "version"], |mut peer| {
+        peer.expect(b"getvar:version");
+        peer.send(&[b"OKAY0.4"]);
+    });
+    assert!(output.status.success(), "tcp: serial must connect: {output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0.4"), "{output:?}");
+}
+
+#[test]
+fn malformed_tcp_serial_fails_before_connecting() {
+    // No listening peer: a malformed network serial must be rejected by parsing.
+    let output = Command::new(env!("CARGO_BIN_EXE_fastboot-rs"))
+        .args(["-s", "tcp:127.0.0.1", "getvar", "version"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid network address"), "{output:?}");
 }

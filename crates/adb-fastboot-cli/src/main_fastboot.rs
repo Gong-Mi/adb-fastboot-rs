@@ -368,11 +368,22 @@ enum Commands {
     },
 }
 
-fn resolve_target_addr(serial: Option<&str>, default_port: u16) -> String {
+fn resolve_target_addr(serial: Option<&str>, default_port: u16) -> Result<String, Box<dyn std::error::Error>> {
     match serial {
-        Some(s) if s.contains(':') => s.to_string(),
-        Some(s) => format!("{}:{}", s, default_port),
-        None => format!("127.0.0.1:{}", default_port),
+        // AOSP `ParseNetworkSerial` splits `tcp:`/`udp:` off the serial before
+        // the address reaches the transport. Passing the raw serial to the
+        // resolver turns it into a DNS lookup of "tcp:127.0.0.1".
+        Some(serial) if serial.starts_with("tcp:") || serial.starts_with("udp:") => {
+            let (protocol, address) = parse_network_target(serial)?;
+            Ok(if protocol == "udp" {
+                format!("udp:{address}")
+            } else {
+                address
+            })
+        }
+        Some(serial) if serial.contains(':') => Ok(serial.to_string()),
+        Some(serial) => Ok(format!("{}:{}", serial, default_port)),
+        None => Ok(format!("127.0.0.1:{}", default_port)),
     }
 }
 
@@ -1920,7 +1931,7 @@ fn flash_image_file<T: FastbootTransport>(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let addr = resolve_target_addr(cli.serial.as_deref(), 5554);
+    let addr = resolve_target_addr(cli.serial.as_deref(), 5554)?;
     let use_usb = cli.usb;
     let slot_selection = fastboot_protocol::SlotSelection::parse(cli.slot.as_deref())?;
 
@@ -2779,6 +2790,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn network_serial_prefix_is_stripped_for_tcp_and_kept_for_udp() {
+        // AOSP `ParseNetworkSerial`: `tcp:HOST:PORT` selects the TCP transport
+        // and the prefix is not part of the address that gets dialed.
+        assert_eq!(resolve_target_addr(Some("tcp:127.0.0.1:5555"), 5554).unwrap(), "127.0.0.1:5555");
+        assert_eq!(resolve_target_addr(Some("udp:127.0.0.1:5555"), 5554).unwrap(), "udp:127.0.0.1:5555");
+        // Plain serial keeps the historical default-port behaviour.
+        assert_eq!(resolve_target_addr(Some("emulator-5554"), 5554).unwrap(), "emulator-5554:5554");
+        assert_eq!(resolve_target_addr(None, 5554).unwrap(), "127.0.0.1:5554");
+    }
+
+    #[test]
+    fn malformed_network_serial_is_rejected_instead_of_dialed() {
+        // Old symptom: the raw serial went to the resolver and produced
+        // "failed to lookup address information: tcp:127.0.0.1".
+        assert!(resolve_target_addr(Some("tcp:127.0.0.1"), 5554).is_err());
+        assert!(resolve_target_addr(Some("tcp:"), 5554).is_err());
+        assert!(resolve_target_addr(Some("udp:1.2.3.4"), 5554).is_err());
+    }
 
     #[test]
     fn help_exposes_global_usb_opt_in() {
