@@ -856,6 +856,163 @@ fn wait_for_service(serial: Option<&str>, usb: bool, spec: &str) -> String {
     format!("{host_prefix}wait-for-{spec}")
 }
 
+/// AOSP `ADB_SERVER_VERSION` (`adb/include/adb/adb.h`), taken from the server
+/// this crate ships so a matching client/server pair never trips the gate.
+const CLIENT_SERVER_VERSION: u32 = server::models::SERVER_VERSION;
+
+/// `kFeatureShell2` (`adb/include/adb/adb.h`).
+const FEATURE_SHELL_V2: &str = adb_protocol::FEATURE_SHELL_V2;
+
+fn server_addr_for_port(server_port: u16) -> String {
+    format!("127.0.0.1:{server_port}")
+}
+
+/// AOSP prints the mismatch with `%d` on both sides — decimal, while the wire
+/// carries hex (adb_client.cpp:333-334).
+fn server_version_mismatch_message(server: u32, client: u32) -> String {
+    format!("adb server version ({server}) doesn't match this client ({client}); killing...")
+}
+
+/// AOSP `sscanf(version_string, "%04x", &version)` (adb_client.cpp:297).
+///
+/// AOSP's width is 4 because its version constant fits in 16 bits
+/// (`ADB_SERVER_VERSION 41` ⇒ `"0029"`). This crate's constant is
+/// `0x01000001` and its server prints 8 digits, so the parser consumes the
+/// whole leading hex run; for every 4-digit server version the result is the
+/// same value AOSP reads.
+fn parse_server_version(payload: &str) -> Option<u32> {
+    let digits: String = payload
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    u32::from_str_radix(&digits, 16).ok()
+}
+
+/// AOSP `__adb_check_server_version()` (client/adb_client.cpp:254-341).
+///
+/// * No server on the socket ⇒ AOSP takes the `start_server` branch and never
+///   reads a version from a server it just launched, so the probe is skipped
+///   and the caller's existing start/pass-through path is left in charge.
+/// * `FAIL unknown host service` ⇒ a server too old to answer `host:version`;
+///   AOSP treats that as version 0 and replaces it.
+/// * Version mismatch ⇒ print the AOSP sentence, kill the server, start a new
+///   one, and accept it (AOSP does not re-read the version after `goto
+///   start_server`).
+fn check_server_version_once(server_port: u16) -> Result<(), String> {
+    let addr = server_addr_for_port(server_port);
+    let mut server = match AdbServerTransport::connect_timeout(&addr, Duration::from_millis(300)) {
+        Ok(server) => server,
+        Err(_) => return Ok(()),
+    };
+
+    let version = match server.execute_host_command("host:version") {
+        Ok(payload) => parse_server_version(&payload)
+            .ok_or_else(|| format!("cannot parse version string: {}", payload.trim()))?,
+        Err(adb_protocol::TransportError::ServerError(message))
+            if message.trim() == "unknown host service" =>
+        {
+            0
+        }
+        Err(error) => return Err(format!("host:version: {error}")),
+    };
+
+    if version == CLIENT_SERVER_VERSION {
+        return Ok(());
+    }
+
+    eprintln!(
+        "{}",
+        server_version_mismatch_message(version, CLIENT_SERVER_VERSION)
+    );
+    drop(server);
+    client::server_cmds::kill_server_at(server_port).map_err(|error| error.to_string())?;
+    client::server_cmds::ensure_server_running_at(server_port)
+        .map_err(|error| format!("cannot start the ADB server: {error}"))?;
+    Ok(())
+}
+
+/// AOSP `adb_check_server_version()` (adb_client.cpp:343-354): the probe runs
+/// at most once per process, and every later request reuses its verdict.
+fn ensure_server_version(server_port: u16) -> Result<(), String> {
+    static CHECKED: OnceLock<Result<(), String>> = OnceLock::new();
+    CHECKED
+        .get_or_init(|| check_server_version_once(server_port))
+        .clone()
+}
+
+/// AOSP `format_host_command("features")` (adb_client.cpp:415-430).
+fn features_service(serial: Option<&str>, usb: bool) -> String {
+    match (serial, usb) {
+        (Some(serial), _) => format!("host-serial:{serial}:features"),
+        (None, true) => "host-usb:features".to_string(),
+        (None, false) => "host:features".to_string(),
+    }
+}
+
+/// AOSP `adb_query(format_host_command("features"))` (adb_client.cpp:432-448).
+///
+/// The server answers a bare comma list, which `StringToFeatureSet` splits —
+/// never the `device::features=` shape of an adbd CNXN banner.
+///
+/// `Ok(None)` means no server is listening: AOSP only reaches
+/// `adb_get_feature_set()` through `adb_connect()`, which would launch a server
+/// first, and this client's server-less direct transport has its own feature
+/// source (the adbd banner).
+fn query_server_features_once(
+    server_port: u16,
+    serial: Option<&str>,
+    usb: bool,
+) -> Result<Option<Vec<String>>, String> {
+    let addr = server_addr_for_port(server_port);
+    let mut server = match AdbServerTransport::connect_timeout(&addr, Duration::from_millis(300)) {
+        Ok(server) => server,
+        Err(_) => return Ok(None),
+    };
+    let service = features_service(serial, usb);
+    let payload = server
+        .execute_host_command(&service)
+        .map_err(|error| format!("{service}: {error}"))?;
+    Ok(Some(abb::parse_feature_set(&payload)))
+}
+
+/// AOSP `adb_get_feature_set()` (adb_client.cpp:432-448): the feature set is
+/// fetched once and cached for the life of the process.
+fn server_features(
+    server_port: u16,
+    serial: Option<&str>,
+    usb: bool,
+) -> Result<Option<Vec<String>>, String> {
+    static FEATURES: OnceLock<Result<Option<Vec<String>>, String>> = OnceLock::new();
+    FEATURES
+        .get_or_init(|| query_server_features_once(server_port, serial, usb))
+        .clone()
+}
+
+/// AOSP `CanUseFeature(features, kFeatureShell2)`.
+fn has_shell_v2(features: &[String]) -> bool {
+    features.iter().any(|feature| feature == FEATURE_SHELL_V2)
+}
+
+/// AOSP `adb_shell()` + `ShellServiceString()` (commandline.cpp:696-792).
+///
+/// Without the shell protocol AOSP forces `kPtyDefinitely`, which empties the
+/// type argument (`commandline.cpp:774-784`, "the type argument must be
+/// empty"), so no `TERM=` and no `pty`/`raw` token reach the wire: the service
+/// is a bare `shell:<command>` and adbd allocates the pty by default.
+fn shell_service_from_features(features: &[String], cmd: &str) -> (String, bool) {
+    let use_shell_protocol = has_shell_v2(features);
+    let service = if use_shell_protocol {
+        shell::shell_service_string(shell::local_term().as_deref(), "raw", cmd)
+    } else {
+        format!("shell:{cmd}")
+    };
+    (service, use_shell_protocol)
+}
+
 /// Connect to the local ADB server, starting it on demand the way
 /// `_adb_connect()` does when the socket is missing.
 fn connect_adb_server(server_port: u16) -> Result<AdbServerTransport, Box<dyn std::error::Error>> {
@@ -972,6 +1129,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match &cli.command {
         Commands::Devices { long } => {
+            // AOSP `adb_connect()` runs `adb_check_server_version()` before any
+            // service (adb_client.cpp:356-363), so a stale server is replaced
+            // instead of being asked for the device list.
+            if let Err(error) = ensure_server_version(server_port) {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
             if *long {
                 println!("List of devices attached (adb-rs pure rust transport)");
                 match host_cmd("host:devices-l") {
@@ -1013,9 +1177,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Shell { command } => {
             let cmd_str = command.join(" ");
-            // AOSP ShellServiceString(): `shell,v2[,TERM=<local TERM>],raw:<cmd>`.
-            let shell_service =
-                shell::shell_service_string(shell::local_term().as_deref(), "raw", &cmd_str);
+
+            // AOSP `adb_connect()` → `adb_check_server_version()`
+            // (adb_client.cpp:356-363): the server version is validated once
+            // per process, before the shell service is requested.
+            if let Err(error) = ensure_server_version(server_port) {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
 
             // Priority 1: ADB server (port 5037) — borrow the system ADB's
             // already-authenticated transport.
@@ -1026,7 +1195,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             //   Server responds OKAY, then enters raw ADB forwarding mode.
             //   Client then reads WRTE/CLSE from the device via server.
             let server_addr = &server_addr;
-            if let Ok(mut server) = AdbServerTransport::connect_timeout(server_addr, Duration::from_millis(300)) {
+            // AOSP `adb_shell()` reads `use_shell_protocol` from the device
+            // feature set *before* it opens any service (commandline.cpp:701),
+            // so the query happens before the transport switch and before the
+            // service connection. On the server path only `host:features`
+            // exposes it — the CNXN banner belongs to the server, not the
+            // device.
+            let server_feature_set =
+                match server_features(server_port, cli.serial.as_deref(), cli.d) {
+                    Ok(features) => features,
+                    Err(error) => {
+                        // AOSP `adb_get_feature_set_or_die()`: refuse to guess a
+                        // protocol for a device whose capabilities are unknown.
+                        eprintln!("error: failed to get feature set: {error}");
+                        std::process::exit(1);
+                    }
+                };
+            let server = match (
+                server_feature_set,
+                AdbServerTransport::connect_timeout(server_addr, Duration::from_millis(300)),
+            ) {
+                (Some(features), Ok(server)) => Some((server, features)),
+                _ => None,
+            };
+            if let Some((mut server, features)) = server {
                 let selected = if cli.d && cli.serial.is_none() {
                     // AOSP legacy smart-socket selector: rejects zero or multiple USB devices.
                     // Once a server is reachable its failure is authoritative: never
@@ -1037,9 +1229,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     server.switch_transport(cli.serial.as_deref()).is_ok()
                 };
                 if selected {
+                    let (shell_service, use_shell_protocol) =
+                        shell_service_from_features(&features, &cmd_str);
+
                     // Send shell service via host service protocol
                     server.send_host_request(&shell_service)?;
                     server.read_status()?; // OKAY -> server created A_OPEN, device OK'd
+                    if !use_shell_protocol {
+                        // AOSP `read_and_dump(fd, use_shell_protocol=false)`:
+                        // no ShellV2 framing and no exit code, just the pty
+                        // byte stream, and a 0 status (commandline.cpp:1148).
+                        exec_out::stream_raw_server(&mut server, false)?;
+                        return Ok(());
+                    }
                     // Now in raw forwarding mode — stream shell output and
                     // relay the remote exit code as our own process status.
                     let (_captured, exit_code) = shell::stream_shell_v2_server(&mut server, false)?;
@@ -1059,7 +1261,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             };
-            let (_info, mut transport) = match connect_and_handshake_with_tls_upgrade(
+            let (info, mut transport) = match connect_and_handshake_with_tls_upgrade(
                 transport,
                 &host_cnxn_payload(),
                 default_auth(),
@@ -1081,7 +1283,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => return Err(e),
             };
 
+            // The same `shell_v2` gate, fed from the feature set adbd
+            // advertises in its CNXN banner (AOSP `adb_get_feature_set`, which
+            // a device answers on `host:features`).
+            let device_features = adb_protocol::parse_banner_features(&info.banner);
+            let (shell_service, use_shell_protocol) =
+                shell_service_from_features(&device_features, &cmd_str);
             let (local_id, remote_id) = protocol::open_service(&mut transport, &shell_service, 1)?;
+            if !use_shell_protocol {
+                exec_out::stream_exec_out_raw(&mut transport, local_id, remote_id)?;
+                return Ok(());
+            }
             // Relay the remote exit code (AOSP read_and_dump_protocol); 255 for
             // an unexpected disconnection without an ExitCode packet.
             let (_captured, exit_code) =
@@ -1786,8 +1998,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Serve => {
-            println!("[adb-rs] Starting ADB server on {server_addr} ...");
-            server::run_server();
+            // `-P`/`-L` must reach the listener: `run_server()` always bound
+            // 127.0.0.1:5037, so `adb-rs -P <port> serve` silently started the
+            // wrong port (and then the caller talked to whatever else lived
+            // there).
+            let default_spec = format!("tcp:127.0.0.1:{server_port}");
+            let spec = cli.transport.as_deref().unwrap_or(&default_spec);
+            println!("[adb-rs] Starting ADB server on {spec} ...");
+            server::run_server_fork(None, spec);
         }
 
         Commands::Server { args } => {
@@ -2420,6 +2638,161 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use crate::client::server_cmds::kill_server_at;
+
+    // ---- AOSP server handshake: `host:version` + `host:features` ----
+
+    /// Read one `<4 hex length><payload>` host-service request.
+    fn expect_host_request(stream: &mut std::net::TcpStream) -> String {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let len = usize::from_str_radix(std::str::from_utf8(&len_buf).unwrap(), 16).unwrap();
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// `OKAY` + `<4 hex length><payload>`, the shape every host query answers.
+    fn ok_payload(payload: &str) -> Vec<u8> {
+        let mut out = b"OKAY".to_vec();
+        out.extend_from_slice(format!("{:04x}", payload.len()).as_bytes());
+        out.extend_from_slice(payload.as_bytes());
+        out
+    }
+
+    /// Accept one connection, record its single request, answer it with `reply`.
+    fn serve_one_reply(
+        listener: std::net::TcpListener,
+        reply: Vec<u8>,
+    ) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let request = expect_host_request(&mut socket);
+            socket.write_all(&reply).unwrap();
+            request
+        })
+    }
+
+    fn ephemeral_port() -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    #[test]
+    fn version_payload_is_read_as_hex_like_aosp_sscanf_percent04x() {
+        // AOSP `sscanf(version_string, "%04x", &version)` (adb_client.cpp:297).
+        assert_eq!(parse_server_version("0029"), Some(41));
+        assert_eq!(parse_server_version("0029\n"), Some(41));
+        // This crate's own constant does not fit in 16 bits and prints 8 digits.
+        assert_eq!(parse_server_version("0029"), Some(CLIENT_SERVER_VERSION));
+        // A reply that is not hex is an error, never version 0.
+        assert_eq!(parse_server_version("unknown host service"), None);
+        assert_eq!(parse_server_version(""), None);
+    }
+
+    #[test]
+    fn version_mismatch_message_is_the_aosp_sentence() {
+        // AOSP adb_client.cpp:333-334 prints both sides with `%d`.
+        assert_eq!(
+            server_version_mismatch_message(41, CLIENT_SERVER_VERSION),
+            format!(
+                "adb server version (41) doesn't match this client ({CLIENT_SERVER_VERSION}); killing..."
+            )
+        );
+    }
+
+    #[test]
+    fn server_version_probe_is_the_first_request_a_client_sends() {
+        let (listener, port) = ephemeral_port();
+        let reply = ok_payload(&format!("{:04x}", CLIENT_SERVER_VERSION));
+        let server = serve_one_reply(listener, reply);
+
+        check_server_version_once(port).expect("a matching server version passes the probe");
+
+        assert_eq!(
+            server.join().unwrap(),
+            "host:version",
+            "the version probe must be the first request on its own connection"
+        );
+    }
+
+    #[test]
+    fn version_probe_is_skipped_when_no_server_is_listening() {
+        // AOSP `__adb_check_server_version()` takes the `start_server` branch
+        // when the socket is missing and never reads a version from it.
+        let (listener, port) = ephemeral_port();
+        drop(listener);
+        assert!(check_server_version_once(port).is_ok());
+    }
+
+    #[test]
+    fn feature_set_comes_from_host_features_not_the_cnxn_banner() {
+        let (listener, port) = ephemeral_port();
+        let server = serve_one_reply(listener, ok_payload("cmd,shell_v2,abb,apex\n"));
+
+        let features = query_server_features_once(port, None, false)
+            .unwrap()
+            .expect("a running server answers host:features");
+
+        assert_eq!(server.join().unwrap(), "host:features");
+        assert_eq!(features, vec!["cmd", "shell_v2", "abb", "apex"]);
+    }
+
+    #[test]
+    fn feature_query_without_a_server_reports_absence_not_a_failure() {
+        // The server-less direct transport reads adbd's banner instead, so a
+        // missing socket must not turn into "failed to get feature set".
+        let (listener, port) = ephemeral_port();
+        drop(listener);
+        assert_eq!(query_server_features_once(port, None, false), Ok(None));
+    }
+
+    #[test]
+    fn feature_set_follows_the_selected_transport() {
+        // AOSP `format_host_command("features")` (adb_client.cpp:415-430).
+        assert_eq!(
+            features_service(Some("emulator-5554"), false),
+            "host-serial:emulator-5554:features"
+        );
+        assert_eq!(features_service(None, true), "host-usb:features");
+        assert_eq!(features_service(None, false), "host:features");
+    }
+
+    #[test]
+    fn feature_parsing_rejects_the_cnxn_banner_shape() {
+        // `host:features` answers a bare comma list (AOSP StringToFeatureSet,
+        // adb_client.cpp:440); the banner form must never satisfy the gate.
+        assert!(!has_shell_v2(&abb::parse_feature_set("device::features=shell_v2")));
+        assert!(has_shell_v2(&abb::parse_feature_set("cmd,shell_v2\n")));
+        assert!(!has_shell_v2(&[]));
+    }
+
+    #[test]
+    fn shell_drops_the_protocol_when_the_device_lacks_shell_v2() {
+        let (listener, port) = ephemeral_port();
+        let server = serve_one_reply(listener, ok_payload("cmd,abb\n"));
+
+        let features = query_server_features_once(port, None, false)
+            .unwrap()
+            .expect("a running server answers host:features");
+        let (service, use_shell_protocol) = shell_service_from_features(&features, "ls -l");
+
+        assert_eq!(server.join().unwrap(), "host:features");
+        assert!(!use_shell_protocol, "a device without shell_v2 must not get shell,v2");
+        // AOSP commandline.cpp:774-784: no shell protocol ⇒ kPtyDefinitely, an
+        // empty type argument, and therefore a bare `shell:<cmd>`.
+        assert_eq!(service, "shell:ls -l");
+    }
+
+    #[test]
+    fn shell_keeps_the_protocol_when_the_device_advertises_shell_v2() {
+        let features = abb::parse_feature_set("cmd,shell_v2");
+        let (service, use_shell_protocol) = shell_service_from_features(&features, "ls -l");
+        assert!(use_shell_protocol);
+        assert!(service.starts_with("shell,v2"), "{service}");
+        assert!(service.ends_with(",raw:ls -l"), "{service}");
+    }
 
     #[test]
     fn explicit_missing_serial_never_falls_back_to_localhost_device() {

@@ -17,7 +17,13 @@ use adb_protocol::Transport;
 // ---------------------------------------------------------------------------
 
 pub(crate) const ADB_SERVER_PORT: u16 = 5037;
-pub(crate) const SERVER_VERSION: u32 = 0x01000001;
+/// AOSP `ADB_SERVER_VERSION` (`packages/modules/adb/include/adb/adb.h`): the
+/// version reported by `host:version` is plain `41` (0x29) in the 35.x/26Q2
+/// line, **not** the device protocol version (0x01000001, `ADB_VERSION`).
+///
+/// Announcing 0x01000001 here made the server answer `01000001`, which an AOSP
+/// client reads as the 4-digit value 0x0100 and then kills the server.
+pub(crate) const SERVER_VERSION: u32 = 41;
 pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
