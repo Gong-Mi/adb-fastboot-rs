@@ -271,6 +271,29 @@ s2c 24 00000000000000104f4b415966616b655f70726f6475...
 即"握手 4 字节 → 8 字节大端帧长 → 载荷"，与 `framing.py` 里的 codec 一致；
 `sha256` 用来跟别的语料做同构比对。
 
+### 4.5 CI 自检（独立 workflow、非阻塞）
+
+`.github/workflows/binary-oracle.yml` 在每次 push / PR 上跑一个只依赖 `python3`
+的冒烟作业，防止夹具本身腐化（改坏了接口、示例却没被发现）：
+
+```bash
+# 1) 语法
+python3 -m py_compile scripts/binary-oracle/*.py scripts/binary-oracle/examples/*.py
+# 2) README 4.2 的例子（假设备 + python 客户端，不需要 C/Rust 二进制）
+python3 scripts/binary-oracle/examples/fastboot_one_case.py
+# 3) 断言输出含 PASS: —— 例子只在设备侧字节校验通过后才打印这行
+```
+
+约束（有意为之）：
+
+- **独立 workflow，不进 required checks**。作业失败在 PR 的 check 列表里可见，
+  但不挡合并；`ci.yml` 一行没动，现有 required check 语义不变。
+- **不碰产品代码**，不编译任何 crate，不需要 Rust 工具链或系统依赖。
+- 时间上限：作业 `timeout-minutes: 5`，每个实际步骤 `timeout 60` 秒
+  （本地实测整条例子 ~0.2s）。
+- 只有"编译都能过但示例已经跑不通"这类夹具腐化会红；矩阵/录包路径仍然不在 CI
+  里（见 §6），因为它们需要外部输入。
+
 ---
 
 ## 5. 证据边界
@@ -299,7 +322,9 @@ s2c 24 00000000000000104f4b415966616b655f70726f6475...
 
 ## 6. 未做项
 
-- 没有接进 CI（不自带 workflow；矩阵需要一个可执行的客户端二进制作为输入）。
+- 只有**冒烟级** CI 覆盖（§4.5：`py_compile` + `fastboot_one_case.py`，独立 workflow、
+  非阻塞）。**矩阵与录包路径不在 CI 里**：它们需要一个可执行的客户端二进制或真实
+  录包作为输入，仓库内没有。
 - `variants.py` 里只有 `aosp-adb-35`、`aosp-fastboot-35` 两个可驱动变体；
   `huawei-hadb` 是空壳占位，等真实录包。
 - 没有 adb 的"半包/超时"故障注入（fastboot 侧已有一部分）。
