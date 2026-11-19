@@ -831,3 +831,133 @@ fn flash_raw_rejects_kernels_shorter_than_a_v3_header() {
         "{output:?}"
     );
 }
+
+/// AOSP `Status()` + `Epilog()` (fastboot.cpp:205-221): every action line is
+/// `%-50s ` in stderr, then `OKAY [%7.3fs]`.
+fn assert_aosp_okay_action_line(stderr: &str, action: &str) -> String {
+    let prefix = format!("{action:<50} OKAY [");
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with(action))
+        .unwrap_or_else(|| panic!("missing {action:?} action line in stderr: {stderr:?}"));
+    assert!(
+        line.starts_with(&prefix),
+        "{action:?} must be formatted as %-50s + \" OKAY [%7.3fs]\": {line:?}"
+    );
+    let timer = &line[prefix.len()..];
+    let seconds = timer
+        .strip_suffix("s]")
+        .unwrap_or_else(|| panic!("OKAY timer must end with \"s]\": {line:?}"));
+    assert_eq!(seconds.len(), 7, "OKAY timer must be %7.3f: {line:?}");
+    assert!(
+        seconds.trim().parse::<f64>().is_ok(),
+        "OKAY timer must be a number: {line:?}"
+    );
+    line.to_owned()
+}
+
+/// AOSP Epilog() on failure: `%-50s FAILED (%s)` where the driver error is
+/// `remote: '<device reason>'`, then `die("Command failed")`.
+fn assert_aosp_failed_action_line(stderr: &str, action: &str, reason: &str) {
+    let expected = format!("{action:<50} FAILED (remote: '{reason}')");
+    assert!(
+        stderr.lines().any(|line| line == expected),
+        "missing {expected:?} in stderr: {stderr:?}"
+    );
+}
+
+#[test]
+fn flash_action_lines_use_the_aosp_status_column() {
+    // AOSP fastboot_driver.cpp:222 + :98: flash downloads with
+    // `Sending '<partition>' (<size>/1024 KB)` and then writes with
+    // `Writing '<partition>'`; fastboot.cpp:2652 closes every command with
+    // `Finished. Total time: %.3fs`.
+    let files = Files::new("flash-status");
+    let image = files.path("image.bin");
+    std::fs::write(&image, vec![0x41u8; 1024]).unwrap();
+    let output = run_cli(&["flash", "boot", &image], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"getvar:is-logical:boot_a");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:max-download-size");
+        peer.send(&[b"OKAY0x1000"]);
+        peer.expect(b"download:00000400");
+        peer.send(&[b"DATA00000400"]);
+        peer.expect(&vec![0x41u8; 1024]);
+        peer.send(&[b"OKAYdownloaded"]);
+        peer.expect(b"flash:boot_a");
+        peer.send(&[b"OKAYflashed"]);
+    });
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_aosp_okay_action_line(&stderr, "Sending 'boot_a' (1 KB)");
+    assert_aosp_okay_action_line(&stderr, "Writing 'boot_a'");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("Finished. Total time: ") && line.ends_with('s')),
+        "missing AOSP \"Finished. Total time\" epilog: {output:?}"
+    );
+    assert!(
+        !stderr.contains("[fastboot-rs]"),
+        "action lines must stay AOSP-shaped, not debug-shaped: {output:?}"
+    );
+}
+
+#[test]
+fn flash_failure_prints_failed_remote_and_command_failed() {
+    // AOSP Epilog(1) -> `FAILED (remote: '<reason>')` + die("Command failed"),
+    // and no "Finished. Total time" line is reached.
+    let files = Files::new("flash-status-fail");
+    let image = files.path("image.bin");
+    std::fs::write(&image, b"HELLO").unwrap();
+    let output = run_cli(&["flash", "boot", &image], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYno"]);
+        peer.expect(b"getvar:max-download-size");
+        peer.send(&[b"OKAY0x1000"]);
+        peer.expect(b"download:00000005");
+        peer.send(&[b"DATA00000005"]);
+        peer.expect(b"HELLO");
+        peer.send(&[b"OKAYdownloaded"]);
+        peer.expect(b"flash:boot");
+        peer.send(&[b"FAILflash rejected"]);
+        peer.expect_closed();
+    });
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_aosp_failed_action_line(&stderr, "Writing 'boot'", "flash rejected");
+    assert!(
+        stderr.contains("fastboot: error: Command failed"),
+        "AOSP die() line missing: {output:?}"
+    );
+    assert!(
+        !stderr.contains("Finished. Total time:"),
+        "a failed command must not reach the epilog: {output:?}"
+    );
+}
+
+#[test]
+fn erase_action_line_uses_the_aosp_status_column() {
+    // AOSP fastboot_driver.cpp:93 -> `Erasing '<partition>'`.
+    let output = run_cli(&["erase", "boot"], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"erase:boot_a");
+        peer.send(&[b"OKAYerased"]);
+    });
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_aosp_okay_action_line(&stderr, "Erasing 'boot_a'");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("Finished. Total time: ") && line.ends_with('s')),
+        "erase must close with the AOSP epilog: {output:?}"
+    );
+}
