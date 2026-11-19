@@ -146,7 +146,6 @@ fn ordinary_terminal_failures_exit_nonzero() {
         (vec!["getvar", "version"], "getvar:version"),
         (vec!["getvar", "all"], "getvar:all"),
         (vec!["set-active", "b"], "set_active:b"),
-        (vec!["erase", "boot"], "erase:boot"),
         (vec!["oem", "diagnose"], "oem diagnose"),
         (vec!["create-logical-partition", "scratch", "1024"], "create-logical-partition:scratch:1024"),
         (vec!["delete-logical-partition", "scratch"], "delete-logical-partition:scratch"),
@@ -189,6 +188,9 @@ fn generic_flash_helper_uses_frame_parser_and_rejects_flash_fail() {
     let image = files.path("image.bin");
     std::fs::write(&image, b"HELLO").unwrap();
     let output = run_cli(&["flash", "boot", &image], |mut peer| {
+        // AOSP resolves has-slot before touching the download path.
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYno"]);
         peer.expect(b"getvar:max-download-size");
         peer.send(&[b"INFOFAIL DATA OKAY are not a status", b"OKAY0x1000"]);
         peer.expect(b"download:00000005");
@@ -213,6 +215,8 @@ fn generic_boot_and_flash_raw_helpers_do_not_bypass_the_frame_parser() {
         .kernel(b"dummy kernel".to_vec())
         .build();
     std::fs::write(&image, &payload).unwrap();
+    // NOTE: neither `boot` nor `flash:raw` resolves slots yet; that gap is
+    // tracked separately from the `flash`/`erase` slice this test covers.
     for (args, final_command) in [
         (vec!["boot", image.as_str()], "boot"),
         (vec!["flash:raw", "boot", image.as_str()], "flash:boot"),
@@ -240,6 +244,9 @@ fn post_download_fail_stops_the_generic_helper_before_flash() {
     let image = files.path("image.bin");
     std::fs::write(&image, b"HELLO").unwrap();
     let output = run_cli(&["flash", "boot", &image], |mut peer| {
+        // AOSP resolves has-slot before touching the download path.
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYno"]);
         peer.expect(b"getvar:max-download-size");
         peer.send(&[b"OKAY0x1000"]);
         peer.expect(b"download:00000005");
@@ -258,6 +265,9 @@ fn generic_download_failure_stops_before_payload_or_flash() {
     let image = files.path("image.bin");
     std::fs::write(&image, b"HELLO").unwrap();
     let output = run_cli(&["flash", "boot", &image], |mut peer| {
+        // AOSP resolves has-slot before touching the download path.
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYno"]);
         peer.expect(b"getvar:max-download-size");
         // An unsupported optional query still permits the existing fallback.
         peer.send(&[b"INFOOKAY is only text", b"FAILunknown variable"]);
@@ -319,4 +329,99 @@ fn offset_only_fetch_propagates_post_data_fail() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(std::fs::read(&destination).unwrap(), b"abc");
     assert!(String::from_utf8_lossy(&output.stderr).contains("fetch rejected"), "{output:?}");
+}
+
+// --- A/B slot resolution (AOSP `do_for_partition`) -------------------------
+// A real bootloader has no unsuffixed slot partition: `flash boot` must ask
+// has-slot + current-slot and target `boot_a`. Sending `flash:boot` fails on
+// device with "partition 'boot' not found".
+
+#[test]
+fn flash_resolves_current_slot_before_upload() {
+    let files = Files::new("flash-slot");
+    let image = files.path("image.bin");
+    std::fs::write(&image, b"HELLO").unwrap();
+    let output = run_cli(&["flash", "boot", &image], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"getvar:max-download-size");
+        peer.send(&[b"OKAY0x1000"]);
+        peer.expect(b"download:00000005");
+        peer.send(&[b"DATA00000005"]);
+        peer.expect(b"HELLO");
+        peer.send(&[b"OKAYdownloaded"]);
+        peer.expect(b"flash:boot_a");
+        peer.send(&[b"OKAYflash done"]);
+    });
+    assert!(output.status.success(), "slot-suffixed flash must succeed: {output:?}");
+}
+
+#[test]
+fn flash_keeps_plain_name_when_device_has_no_slots() {
+    let files = Files::new("flash-noslot");
+    let image = files.path("image.bin");
+    std::fs::write(&image, b"HELLO").unwrap();
+    let output = run_cli(&["flash", "boot", &image], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYno"]);
+        peer.expect(b"getvar:max-download-size");
+        peer.send(&[b"OKAY0x1000"]);
+        peer.expect(b"download:00000005");
+        peer.send(&[b"DATA00000005"]);
+        peer.expect(b"HELLO");
+        peer.send(&[b"OKAYdownloaded"]);
+        peer.expect(b"flash:boot");
+        peer.send(&[b"OKAYflash done"]);
+    });
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn explicit_slot_skips_current_slot_query() {
+    let files = Files::new("flash-explicit-slot");
+    let image = files.path("image.bin");
+    std::fs::write(&image, b"HELLO").unwrap();
+    let output = run_cli(&["--slot", "b", "flash", "boot", &image], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:max-download-size");
+        peer.send(&[b"OKAY0x1000"]);
+        peer.expect(b"download:00000005");
+        peer.send(&[b"DATA00000005"]);
+        peer.expect(b"HELLO");
+        peer.send(&[b"OKAYdownloaded"]);
+        peer.expect(b"flash:boot_b");
+        peer.send(&[b"OKAYflash done"]);
+    });
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn erase_resolves_current_slot() {
+    let output = run_cli(&["erase", "boot"], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"erase:boot_a");
+        peer.send(&[b"OKAYerased"]);
+    });
+    assert!(output.status.success(), "erase must target boot_a: {output:?}");
+}
+
+#[test]
+fn erase_fail_exits_nonzero_after_slot_resolution() {
+    let output = run_cli(&["erase", "boot"], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"erase:boot_a");
+        peer.send(&[b"INFOdiagnostic text", b"FAILterminal rejection"]);
+        peer.expect_closed();
+    });
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("terminal rejection"), "{output:?}");
 }

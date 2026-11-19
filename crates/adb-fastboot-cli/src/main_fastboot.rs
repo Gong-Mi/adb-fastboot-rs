@@ -834,6 +834,110 @@ fn getvar_value(
     }
 }
 
+/// Query a `getvar` and return `Ok(None)` for a terminal FAIL instead of an error.
+///
+/// AOSP `do_for_partition` (fastboot.cpp:1377) treats "has-slot is not
+/// supported" as `no`, not as a fatal error, so this keeps that distinction.
+fn try_getvar_value<T: FastbootTransport>(
+    transport: &mut T,
+    variable: &str,
+) -> Option<String> {
+    if transport.send_cmd(&fastboot_protocol::getvar(variable)).is_err() {
+        return None;
+    }
+    let mut info = Vec::new();
+    match transport.recv_response_with_info(&mut info) {
+        Ok(fastboot_protocol::FastbootResponse::Okay(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn require_getvar_value<T: FastbootTransport>(
+    transport: &mut T,
+    variable: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match try_getvar_value(transport, variable) {
+        Some(value) => Ok(value),
+        None => Err(format!("getvar:{variable} failed").into()),
+    }
+}
+
+/// Resolve the on-device partition name for a slot-aware partition.
+///
+/// Mirrors AOSP `do_for_partition()`:
+///   * `has-slot:<first token>` is queried for every partition; a device that
+///     does not answer (or does not support slots) yields `no`;
+///   * with slots and no explicit `--slot`, `current-slot` is queried and the
+///     suffix is appended (`boot` -> `boot_a`); a missing current slot is fatal;
+///   * `--slot X` appends `_X` without a second query;
+///   * partition modifiers (`vendor_boot:default`) keep the slot on the first
+///     token only.
+///
+/// Sending the unsuffixed name is not "harmless": a real bootloader has no
+/// `boot` partition and answers `FAIL partition 'boot' not found`.
+fn resolve_wire_partition<T: FastbootTransport>(
+    transport: &mut T,
+    partition: &str,
+    slot: &fastboot_protocol::SlotSelection,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use fastboot_protocol::SlotSelection;
+
+    let (base, modifier) = match partition.split_once(':') {
+        Some((base, rest)) => (base, Some(rest)),
+        None => (partition, None),
+    };
+
+    let has_slot = try_getvar_value(transport, &format!("has-slot:{base}"))
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|| "no".to_string());
+
+    let slot_name = match slot {
+        SlotSelection::Named(name) => name.clone(),
+        SlotSelection::All | SlotSelection::Other => {
+            return Err(format!(
+                "--slot {} needs multi-slot orchestration and is not supported for this command",
+                match slot {
+                    SlotSelection::All => "all",
+                    _ => "other",
+                }
+            )
+            .into())
+        }
+        SlotSelection::Current => {
+            if has_slot != "yes" {
+                return Ok(partition.to_string());
+            }
+            let current = require_getvar_value(transport, "current-slot")?;
+            let current = current.trim().trim_start_matches('_').to_string();
+            if current.is_empty() {
+                return Err("Failed to identify current slot".into());
+            }
+            current
+        }
+    };
+
+    let name = if has_slot == "yes" {
+        let suffix = format!("_{slot_name}");
+        if base.ends_with(&suffix) {
+            base.to_string()
+        } else {
+            format!("{base}{suffix}")
+        }
+    } else {
+        if matches!(slot, SlotSelection::Named(_)) {
+            eprintln!(
+                "Warning: {base} does not support slots, and slot {slot_name} was requested."
+            );
+        }
+        base.to_string()
+    };
+
+    Ok(match modifier {
+        Some(rest) => format!("{name}:{rest}"),
+        None => name,
+    })
+}
+
 fn fetch_to_file(
     transport: &mut FastbootConnection,
     partition: &str,
@@ -1973,7 +2077,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[fastboot-rs] Set active slot '{}' response: {:?}", slot, resp);
         }
         Commands::Flash { partition, file } => {
-            let wire_partition = slot_selection.partition_name(&partition)?;
             let image_path = match fastboot_protocol::resolve_image_path(
                 &partition,
                 file.as_deref(),
@@ -1995,6 +2098,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!("[fastboot-rs] Connected to fastboot target {}", addr);
 
+            let wire_partition = resolve_wire_partition(&mut transport, &partition, &slot_selection)?;
             flash_image_file(&mut transport, &partition, &wire_partition, &image_path, &gopts)?;
         }
         Commands::WipeSuper { image } => {
@@ -2023,7 +2127,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             flash_image_file(&mut transport, "super", &wire_partition, &image_path, &gopts)?;
         }
         Commands::Erase { partition } => {
-            let wire_partition = slot_selection.partition_name(&partition)?;
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2031,6 +2134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             };
+            let wire_partition = resolve_wire_partition(&mut transport, &partition, &slot_selection)?;
             let cmd = format!("erase:{}", wire_partition);
             transport.send_cmd(&cmd)?;
             let resp = transport.recv_response()?;
