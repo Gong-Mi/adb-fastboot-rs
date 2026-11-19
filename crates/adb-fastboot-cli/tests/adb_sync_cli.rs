@@ -367,6 +367,9 @@ fn run_push_sync(remote_mtime_matches: bool) {
     let bytes: Vec<u8> = (0..(SYNC_DATA_MAX + 31)).map(|i| (i % 249) as u8).collect();
     fs::write(&source, &bytes).unwrap();
     let local_mtime = fs::metadata(&source).unwrap().mtime() as u32;
+    // AOSP do_sync_push sends lstat()'s st_mode, so the wire word is this file's
+    // real mode (0o100644 here), not a hard-coded 0644.
+    let source_mode = fs::symlink_metadata(&source).unwrap().mode();
     let remote_mtime = if remote_mtime_matches { local_mtime } else { local_mtime.wrapping_add(10) };
     let remote_path = "/remote/payload.bin";
 
@@ -412,7 +415,7 @@ fn run_push_sync(remote_mtime_matches: bool) {
         let payload = receive(&mut peer, A_WRTE, local_id);
         let header = SyncMessageHeader::decode(&payload).unwrap();
         assert_eq!(header.id, SYNC_SEND);
-        assert_eq!(&payload[8..], format!("{remote_path},{}", 0o644).as_bytes());
+        assert_eq!(&payload[8..], format!("{remote_path},{source_mode}").as_bytes());
         send(&mut peer, A_OKAY, local_id, &[]);
 
         let mut received = Vec::new();
@@ -504,6 +507,8 @@ fn run_push_target_case(case: PushTargetCase) {
     let bytes: Vec<u8> = (0..4096).map(|index| (index % 253) as u8).collect();
     fs::write(&source, &bytes).unwrap();
     let local_mtime = fs::metadata(&source).unwrap().mtime() as u32;
+    // AOSP do_sync_push sends lstat()'s st_mode (0o100644 for this file).
+    let send_mode = fs::symlink_metadata(&source).unwrap().mode();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -553,7 +558,7 @@ fn run_push_target_case(case: PushTargetCase) {
         let header = SyncMessageHeader::decode(&payload).unwrap();
         assert_eq!(header.id, SYNC_SEND, "expected SEND, got {:#x}", header.id);
         assert_eq!(header.length as usize, payload.len() - 8);
-        assert_eq!(&payload[8..], format!("{send_path},{}", 0o644).as_bytes());
+        assert_eq!(&payload[8..], format!("{send_path},{send_mode}").as_bytes());
         send(&mut peer, A_OKAY, local_id, &[]);
 
         let mut received = Vec::new();

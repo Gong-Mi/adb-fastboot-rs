@@ -78,6 +78,29 @@ fn local_mtime_secs(path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
     Ok(u32::try_from(secs).unwrap_or(u32::MAX))
 }
 
+/// `S_ISREG` over a raw mode word.
+fn mode_is_reg(mode: u32) -> bool {
+    mode & 0o170000 == 0o100000
+}
+
+/// SEND `path,mode` word for a local path.
+///
+/// AOSP `do_sync_push()` (`client/file_sync_client.cpp`, `adb` 35.0.2) builds the
+/// SEND request from `lstat()`'s `st.st_mode`, so the file-type bits reach the
+/// wire: a 0640 regular file is sent as `,33184` (0o100640), not `,416` (0o640).
+/// This reads the same `lstat` (`symlink_metadata`, which does not follow the
+/// final component) and passes `st_mode` through unchanged for a regular file.
+///
+/// Directories and symlinks keep the previous hard-coded `0o644`: their push
+/// handling is out of scope here and must not change silently.
+fn local_send_mode(path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let st = fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to access '{}': {e}", path.display()))?;
+    let mode = st.mode();
+    Ok(if mode_is_reg(mode) { mode } else { 0o644 })
+}
+
 /// A SYNC STAT response of all zeros means "not found" (V1 cannot report errno).
 fn remote_exists(st: &FileStat) -> bool {
     st.mode != 0 || st.size != 0 || st.mtime != 0
@@ -657,9 +680,9 @@ fn push_file_direct(
 
     println!("[adb-rs] Pushing '{}' -> '{}' ({} bytes)", local, target, file_data.len());
 
-    // Build SEND request (sync header + path,mode)
+    // Build SEND request (sync header + path,mode). AOSP uses lstat()'s st_mode.
     let mut send_buf = Vec::new();
-    build_sync_send_req(&target, 0o644, &mut send_buf)
+    build_sync_send_req(&target, local_send_mode(local_path)?, &mut send_buf)
         .map_err(|e| format!("Build SEND req failed: {e}"))?;
     protocol::send_wrte(transport, local_id, remote_id, &send_buf)?;
 
@@ -984,9 +1007,9 @@ fn push_file_direct_with_ids(
         .map_err(|e| format!("Cannot read local file '{local}': {e}"))?;
     let mtime = local_mtime_secs(Path::new(local))?;
 
-    // Build SEND request
+    // Build SEND request (AOSP sends lstat()'s st_mode, not a fixed 0644).
     let mut send_buf = Vec::new();
-    build_sync_send_req(remote, 0o644, &mut send_buf)
+    build_sync_send_req(remote, local_send_mode(Path::new(local))?, &mut send_buf)
         .map_err(|e| format!("Build SEND req failed: {e}"))?;
     // SEND is acknowledged only at the ADB transport layer.
     protocol::send_wrte(transport, local_id, remote_id, &send_buf)?;
@@ -1183,9 +1206,9 @@ fn push_file_server(
 
     println!("[adb-rs] Pushing '{}' -> '{}' ({} bytes)", local, remote, file_data.len());
 
-    // Build and send SEND request
+    // Build and send SEND request (AOSP sends lstat()'s st_mode).
     let mut send_buf = Vec::new();
-    build_sync_send_req(remote, 0o644, &mut send_buf)
+    build_sync_send_req(remote, local_send_mode(local_path)?, &mut send_buf)
         .map_err(|e| format!("Build SEND req failed: {e}"))?;
     write_raw_sync(transport, &send_buf)?;
 
@@ -1302,9 +1325,9 @@ fn push_file_server_inner(
     let file_data = std::fs::read(local)
         .map_err(|e| format!("Cannot read local file '{local}': {e}"))?;
 
-    // Build and send SEND request
+    // Build and send SEND request (AOSP sends lstat()'s st_mode).
     let mut send_buf = Vec::new();
-    build_sync_send_req(remote, 0o644, &mut send_buf)
+    build_sync_send_req(remote, local_send_mode(Path::new(local))?, &mut send_buf)
         .map_err(|e| format!("Build SEND req failed: {e}"))?;
     write_raw_sync(transport, &send_buf)?;
 
@@ -1455,7 +1478,8 @@ mod tests {
     /// A strict adbd SYNC peer: SEND has no application reply. Only a complete
     /// DATA sequence followed by DONE produces the terminal status.
     struct SendPeer {
-        expected: std::collections::VecDeque<(String, Vec<u8>, u32)>,
+        /// `(remote path, body, mtime, lstat mode word expected on the wire)`
+        expected: std::collections::VecDeque<(String, Vec<u8>, u32, u32)>,
         active: Option<(Vec<u8>, Vec<u8>)>,
         pending_mtime: Option<u32>,
         incoming: std::collections::VecDeque<(AdbMessageHeader, Vec<u8>)>,
@@ -1477,7 +1501,7 @@ mod tests {
                     assert_eq!(header.length as usize, data.len());
                     self.stats += 1;
                     let requested = std::str::from_utf8(data).unwrap();
-                    let (pending_path, _, _) = self.expected.front().expect("STAT without pending SEND");
+                    let (pending_path, _, _, _) = self.expected.front().expect("STAT without pending SEND");
                     assert_eq!(requested, pending_path.as_str(), "STAT must target the requested path");
                     // A plain file keeps the SEND path unchanged (no basename append).
                     let stat = SyncStatResponse { mode: 0o100644, size: 0, mtime: 0 };
@@ -1491,8 +1515,9 @@ mod tests {
                 adb_protocol::SYNC_SEND => {
                     assert!(self.active.is_none(), "SEND before previous DONE");
                     assert_eq!(header.length as usize, data.len());
-                    let (path, bytes, mtime) = self.expected.pop_front().expect("unexpected SEND");
-                    assert_eq!(data, format!("{path},{}", 0o644).as_bytes());
+                    let (path, bytes, mtime, mode) = self.expected.pop_front().expect("unexpected SEND");
+                    // AOSP: `path,mode` with lstat()'s full st_mode (S_IFREG included).
+                    assert_eq!(data, format!("{path},{mode}").as_bytes());
                     self.active = Some((bytes, Vec::new()));
                     self.pending_mtime = Some(mtime);
                 }
@@ -1599,10 +1624,16 @@ mod tests {
                 use std::os::unix::fs::MetadataExt;
                 fs::metadata(path).unwrap().mtime() as u32
             };
+            // AOSP sends lstat()'s st_mode, so the peer must expect the full word
+            // (0o100644), not just the permission bits.
+            let lstat_mode = |path: &std::path::Path| -> u32 {
+                use std::os::unix::fs::MetadataExt;
+                fs::symlink_metadata(path).unwrap().mode()
+            };
             let mut peer = SendPeer {
                 expected: [
-                    (files[0].remote.clone(), bytes.clone(), mtime(std::path::Path::new(&files[0].local))),
-                    (files[1].remote.clone(), Vec::new(), mtime(std::path::Path::new(&files[1].local))),
+                    (files[0].remote.clone(), bytes.clone(), mtime(std::path::Path::new(&files[0].local)), lstat_mode(std::path::Path::new(&files[0].local))),
+                    (files[1].remote.clone(), Vec::new(), mtime(std::path::Path::new(&files[1].local)), lstat_mode(std::path::Path::new(&files[1].local))),
                 ].into(),
                 active: None,
                 pending_mtime: None,
@@ -1644,6 +1675,81 @@ mod tests {
 
     #[test]
     fn send_paths_reject_disconnect_instead_of_treating_adb_ack_as_success() { check_send_paths(SendOutcome::Disconnect); }
+
+    /// AOSP `do_sync_push()` builds the SEND `path,mode` field from `lstat()`'s
+    /// `st.st_mode`, so the file-type bits go on the wire: a 0640 **regular
+    /// file** must be sent as `,33184` (0o100640), never as `,416` (0o640).
+    #[test]
+    fn send_request_carries_the_lstat_mode_including_file_type_bits() {
+        let root = std::env::temp_dir().join(format!("adb-rs-send-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("payload");
+        fs::write(&file, b"payload").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+
+        // Reply 1: a well-formed V1 STAT that reports no entry ("not found") for
+        // destination resolution. Reply 2: the terminal SYNC_OKAY after DONE.
+        let mut reads = stat_wire(SyncStatResponse { mode: 0, size: 0, mtime: 0 });
+        let mut okay = [0u8; 8];
+        SyncMessageHeader::new(SYNC_OKAY, 0).encode(&mut okay);
+        reads.extend_from_slice(&okay);
+
+        let mut transport = ScriptedTransport { reads: Cursor::new(reads), writes: Vec::new() };
+        push_file_server(&mut transport, file.to_str().unwrap(), "/remote/payload", false).unwrap();
+
+        let header_len = SyncMessageHeader::SIZE;
+        let mut rest = transport.writes.as_slice();
+        let mut send_payload: Option<&[u8]> = None;
+        while rest.len() >= header_len {
+            let header = SyncMessageHeader::decode(&rest[..header_len]).unwrap();
+            let body = header.length as usize;
+            if header.id == adb_protocol::SYNC_SEND {
+                send_payload = Some(&rest[header_len..header_len + body]);
+                break;
+            }
+            rest = &rest[header_len + body..];
+        }
+        assert_eq!(
+            std::str::from_utf8(send_payload.expect("no SEND request on the wire")).unwrap(),
+            format!("/remote/payload,{}", 0o100640),
+            "SEND must carry lstat()'s full st_mode (S_IFREG included)"
+        );
+        // Pin the decimal wire form so a reviewer can compare with `adb` traces.
+        assert_eq!(0o100640, 33184);
+        assert_eq!(33184u32 & 0o170000, 0o100000, "S_IFREG must be set");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Boundary of the change: only a regular file takes its own st_mode.
+    /// Directory and symlink push behaviour must stay exactly as before (0o644),
+    /// so this fix cannot silently alter those paths.
+    #[test]
+    fn send_mode_keeps_the_previous_0644_for_non_regular_paths() {
+        let root = std::env::temp_dir().join(format!("adb-rs-send-mode-nonreg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let file = root.join("file");
+        fs::write(&file, b"x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let dir = root.join("dir");
+        fs::create_dir(&dir).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+
+        // Regular file: full lstat mode, S_IFREG included (0o100644 == 33188).
+        assert_eq!(local_send_mode(&file).unwrap(), 0o100644);
+        assert_eq!(local_send_mode(&file).unwrap(), 33188);
+        // Directory and symlink: unchanged hard-coded 0o644.
+        assert_eq!(local_send_mode(&dir).unwrap(), 0o644);
+        assert_eq!(local_send_mode(&link).unwrap(), 0o644);
+        // lstat failure is an error, never a silent mode.
+        assert!(local_send_mode(&root.join("missing")).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn adb_frame(command: u32, arg0: u32, arg1: u32, payload: &[u8]) -> Vec<u8> {
         let header = AdbMessageHeader::new(command, arg0, arg1, payload);
@@ -1897,5 +2003,14 @@ mod tests {
         assert!(mode_is_dir(0o040755));
         assert!(!mode_is_dir(0o100644));
         assert!(!mode_is_dir(0));
+    }
+
+    #[test]
+    fn mode_word_reg_detection_matches_s_isreg() {
+        assert!(mode_is_reg(0o100644));
+        assert!(mode_is_reg(0o100600));
+        assert!(!mode_is_reg(0o644), "bare permission bits are not a file type");
+        assert!(!mode_is_reg(0o040755));
+        assert!(!mode_is_reg(0o120777));
     }
 }
