@@ -2000,9 +2000,34 @@ fn apply_set_active<T: FastbootTransport>(
     Ok(())
 }
 
+
+/// AOSP device selection without `-s`: USB first, then the network devices
+/// recorded by `fastboot connect` ($HOME/.fastboot/devices), last reachable
+/// wins. This slice covers the unambiguous single-entry case; zero entries
+/// falls back to the historical local default, and multiple entries are left
+/// to an explicit `-s` until multi-device probing lands.
+fn stored_network_target() -> Option<String> {
+    let path = connected_devices_path().ok()?;
+    let devices = read_connected_devices(&path).ok()?;
+    if devices.len() != 1 {
+        return None;
+    }
+    let serial = devices.iter().next()?.clone();
+    let (protocol, address) = parse_network_target(&serial).ok()?;
+    Some(if protocol == "udp" {
+        format!("udp:{address}")
+    } else {
+        address
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let addr = resolve_target_addr(cli.serial.as_deref(), 5554)?;
+    let addr = if cli.serial.is_some() || cli.usb {
+        resolve_target_addr(cli.serial.as_deref(), 5554)?
+    } else {
+        stored_network_target().unwrap_or(resolve_target_addr(None, 5554)?)
+    };
     let use_usb = cli.usb;
     let slot_selection = fastboot_protocol::SlotSelection::parse(cli.slot.as_deref())?;
 

@@ -76,12 +76,29 @@ fn run_cli(args: &[&str], script: impl FnOnce(Peer) + Send + 'static) -> Output 
 /// `serial` may contain `{addr}`; AOSP accepts both a bare `HOST:PORT` and the
 /// `tcp:HOST:PORT` network-serial form.
 fn run_cli_serial(serial: &str, args: &[&str], script: impl FnOnce(Peer) + Send + 'static) -> Output {
+    run_cli_with(Some(serial), None, args, script)
+}
+
+/// `serial = None` means: no `-s` at all (device selection from storage/USB).
+/// `home` overrides `$HOME` so `.fastboot/devices` is isolated per test.
+fn run_cli_with(
+    serial: Option<&str>,
+    home: Option<&str>,
+    args: &[&str],
+    script: impl FnOnce(Peer) + Send + 'static,
+) -> Output {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    let serial = serial.replace("{addr}", &address);
+    let serial = serial.map(|s| s.replace("{addr}", &address));
     let peer = thread::spawn(move || script(Peer::accept(listener)));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_fastboot-rs"))
-        .args(["-s", &serial])
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fastboot-rs"));
+    if let Some(serial) = serial.as_deref() {
+        command.args(["-s", serial]);
+    }
+    if let Some(home) = home {
+        command.env("HOME", home);
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -556,4 +573,53 @@ fn standalone_set_active_flag_is_a_command() {
         peer.send(&[b"OKAY"]);
     });
     assert!(output.status.success(), "standalone --set-active must work: {output:?}");
+}
+
+/// Like `run_cli_with`, but pre-seeds `$HOME/.fastboot/devices` with the peer
+/// address before the CLI starts (that is the AOSP selection path under test).
+fn run_cli_stored(home: &str, args: &[&str], script: impl FnOnce(Peer) + Send + 'static) -> Output {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let storage = std::path::Path::new(home).join(".fastboot");
+    std::fs::create_dir_all(&storage).unwrap();
+    std::fs::write(storage.join("devices"), format!("tcp:{address}\n")).unwrap();
+    let peer = thread::spawn(move || script(Peer::accept(listener)));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fastboot-rs"))
+        .env("HOME", home)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            let _ = peer.join();
+            panic!("CLI timed out: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let output = child.wait_with_output().unwrap();
+    peer.join().unwrap();
+    output
+}
+
+#[test]
+fn command_without_serial_uses_the_stored_network_device() {
+    // AOSP `open_device()` with no `-s`: USB first, then the last reachable
+    // network device recorded by `fastboot connect`.
+    let files = Files::new("stored-device");
+    let home = files.path("home");
+    let output = run_cli_stored(&home, &["getvar", "version"], |mut peer| {
+        peer.expect(b"getvar:version");
+        peer.send(&[b"OKAY0.4"]);
+    });
+    assert!(output.status.success(), "stored device must be used: {output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0.4"), "{output:?}");
 }
