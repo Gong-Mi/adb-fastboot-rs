@@ -74,6 +74,29 @@ pub(crate) fn parse_adb_host_port(target: &str) -> Result<(String, u16), String>
     Ok((host.to_string(), port))
 }
 
+
+/// Parse a `wait-for-<transport>-<state>` service, returning the explicit
+/// serial / transport id (when the request carries one) and the spec.
+fn wait_for_request(cmd: &str) -> Option<(Option<String>, Option<u64>, String)> {
+    let (serial, transport_id, rest) = if let Some(rest) = cmd.strip_prefix("host-serial:") {
+        let (serial, rest) = rest.split_once(':')?;
+        (Some(serial.to_string()), None, rest)
+    } else if let Some(rest) = cmd.strip_prefix("host-transport-id:") {
+        let (id, rest) = rest.split_once(':')?;
+        (None, Some(id.parse::<u64>().ok()?), rest)
+    } else if let Some(rest) = cmd.strip_prefix("host-usb:") {
+        (None, None, rest)
+    } else if let Some(rest) = cmd.strip_prefix("host-local:") {
+        (None, None, rest)
+    } else if let Some(rest) = cmd.strip_prefix("host:") {
+        (None, None, rest)
+    } else {
+        return None;
+    };
+    let spec = rest.strip_prefix("wait-for-")?;
+    Some((serial, transport_id, spec.to_string()))
+}
+
 pub(crate) fn dispatch_host_service(
     client: &mut TcpStream,
     cmd: &str,
@@ -171,18 +194,50 @@ pub(crate) fn dispatch_host_service(
             Ok(())
         }
 
-        // -- host:wait-for-device ---------------------------------------------
-        // AOSP clients use this service to block until at least one transport
-        // reaches a usable registry state. Do not acknowledge before a device
-        // exists; otherwise callers race the transport watcher.
-        "host:wait-for-device" | "host:wait-for-any-device" => {
+        // -- wait-for-<transport>-<state> --------------------------------------
+        // AOSP implements these as socket services (services.cpp:159-258): the
+        // smart socket sends the connect OKAY, the service thread blocks until
+        // the requested transport state is reached and sends a second OKAY.
+        // The transport may be implied by the request prefix:
+        //   host:wait-for-any-device
+        //   host-serial:<serial>:wait-for-any-device
+        //   host-usb:wait-for-usb-device
+        //   host-transport-id:<id>:wait-for-any-disconnect
+        c if wait_for_request(c).is_some() => {
+            let (serial, transport_id, spec) = wait_for_request(c).expect("checked above");
+            let want_disconnect = spec.ends_with("disconnect");
+            let want_state = if want_disconnect { None } else { Some(spec.rsplit('-').next().unwrap_or("device").to_string()) };
             while running.load(Ordering::Relaxed) {
-                let available = {
+                let (present, state, registry_empty) = {
                     let reg = registry.lock().map_err(|e| format!("lock: {e}"))?;
-                    reg.find_any_device().is_some()
+                    let dev = match (&serial, transport_id) {
+                        (Some(serial), _) => reg.find_by_serial(serial),
+                        (None, Some(id)) => reg.find_by_transport_id(id),
+                        _ => reg.find_any_device(),
+                    };
+                    (dev.is_some(), dev.map(|d| d.state), reg.list_devices(false).is_empty())
                 };
-                if available {
-                    return ok_empty(client);
+                let done = if want_disconnect {
+                    // Without a serial/id, "disconnect" means the registry is empty.
+                    if serial.is_none() && transport_id.is_none() {
+                        registry_empty
+                    } else {
+                        !present
+                    }
+                } else {
+                    match want_state.as_deref() {
+                        Some("device") | Some("any") | None => {
+                            present && state.map(crate::server::models::is_usable_state).unwrap_or(false)
+                        }
+                        Some(wanted) => present && state.map(|s| s.as_str() == wanted).unwrap_or(false),
+                    }
+                };
+                if done {
+                    // connect OKAY + service OKAY, then the socket is torn down.
+                    return client
+                        .write_all(b"OKAYOKAY")
+                        .and_then(|_| client.flush())
+                        .map_err(|e| format!("write failed: {e}"));
                 }
                 thread::sleep(Duration::from_millis(250));
             }
