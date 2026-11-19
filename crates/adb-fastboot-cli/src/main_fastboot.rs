@@ -2209,6 +2209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Getvar { variable } => {
+            let started = std::time::Instant::now();
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2218,24 +2219,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let cmd = format!("getvar:{}", variable);
             transport.send_cmd(&cmd)?;
-            if variable == "all" {
-                // AOSP-compatible output for getvar all:
-                //   (bootloader) key: value
-                //   ...
-                //   Finished. Total time: X.XXXs
-                let start = std::time::Instant::now();
-                let mut info_logs = Vec::new();
-                let response = transport.recv_response_with_info(&mut info_logs)?;
-                for info in info_logs {
-                    println!("{}", format_getvar_all_info_line(&info));
-                }
-                require_terminal_okay(&response)?;
-                let elapsed = start.elapsed();
-                println!("Finished. Total time: {:.3}s", elapsed.as_secs_f64());
-            } else {
-                let resp = recv_and_print_info(&mut transport)?;
-                println!("{}", format_getvar_line(&variable, &resp));
+            let mut info_logs = Vec::new();
+            let response = transport.recv_response_with_info(&mut info_logs)?;
+            // AOSP InfoMessage(): "(bootloader) <text>" on stderr, for every entry.
+            for info in info_logs {
+                eprintln!("{}", format_getvar_all_info_line(&info));
             }
+            match response {
+                // AOSP DisplayVarOrError(): "<name>: <value>" on stderr, also for
+                // `getvar all` (the terminal OKAY body is empty -> "all: ").
+                fastboot_protocol::FastbootResponse::Okay(value) => {
+                    eprintln!("{variable}: {value}");
+                }
+                // AOSP Status()/DisplayVarOrError() on failure: the 50-column
+                // status line, then "FAILED (remote: '<reason>')"; exit stays 0.
+                fastboot_protocol::FastbootResponse::Fail(reason) => {
+                    eprintln!("{:<50} FAILED (remote: '{}')", format!("getvar:{variable}"), reason);
+                }
+                other => {
+                    eprintln!("{:<50} FAILED ({other:?})", format!("getvar:{variable}"));
+                }
+            }
+            // AOSP Epilog(): the total time line is printed for every command.
+            eprintln!("Finished. Total time: {:.3}s", started.elapsed().as_secs_f64());
         }
         Commands::SetActive { slot } => {
             if slot.is_empty() {
