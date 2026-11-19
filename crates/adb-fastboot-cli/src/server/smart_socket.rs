@@ -424,6 +424,16 @@ pub(crate) fn run_smart_socket_loop(
                 let serial = extract_serial_from_transport_cmd(&cmd, registry)?;
                 return bridge_to_device_with_smart(client, &serial, registry);
             }
+
+            // AOSP one-shot host services terminate their local socket after the
+            // reply: the client calls ReadOrderlyShutdown() and blocks until EOF.
+            // Keeping the connection open made the C client hang on
+            // `host:version` (and then time out with no output).
+            let keep_open = cmd.starts_with("host:track-devices") || cmd.contains("wait-for-");
+            if !keep_open {
+                let _ = smart.stream.shutdown(std::net::Shutdown::Write);
+                return Ok(());
+            }
         } else {
             // Non-host command (e.g. shell,v2,raw:...) with no transport selected
             smart.send_fail(&format!("device service requires transport selection first: {cmd}"))?;

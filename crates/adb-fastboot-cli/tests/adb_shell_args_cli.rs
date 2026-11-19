@@ -88,6 +88,25 @@ fn read_host_request(socket: &mut TcpStream) -> Result<String, String> {
     String::from_utf8(payload).map_err(|e| format!("non-UTF8 request: {e}"))
 }
 
+
+/// Answer the AOSP client handshake requests the CLI sends before its service
+/// request — `host:version` (server version check) and `host:features` (device
+/// capability set). Both arrive on their own short-lived connection
+/// (adb_client.cpp:254-341, :432-448). Returns true when `request` was one of
+/// them and has been answered.
+fn answer_handshake(socket: &mut TcpStream, request: &str) -> bool {
+    let payload = match request {
+        "host:version" => format!("{:04x}", 41u32),
+        other if other.ends_with(":features") => "cmd,shell_v2".to_string(),
+        _ => return false,
+    };
+    let _ = socket.write_all(b"OKAY");
+    let _ = socket.write_all(format!("{:04x}", payload.len()).as_bytes());
+    let _ = socket.write_all(payload.as_bytes());
+    let _ = socket.shutdown(Shutdown::Both);
+    true
+}
+
 /// A fake ADB server that accepts exactly `expected_services` in order, then
 /// streams `reply` as the device-service byte stream and closes its write side.
 /// Returns the requests it actually saw so failures can be attributed.
@@ -102,7 +121,13 @@ fn start_fake_server(
         let result = (|| -> Result<(), String> {
             let mut socket = accept_with_deadline(&listener)?;
             for expected in &expected_services {
-                let got = read_host_request(&mut socket)?;
+                let mut got = read_host_request(&mut socket)?;
+                // Skip the client handshake connections; they carry no service
+                // request and are not part of the expected sequence.
+                while answer_handshake(&mut socket, &got) {
+                    socket = accept_with_deadline(&listener)?;
+                    got = read_host_request(&mut socket)?;
+                }
                 observed.push(got.clone());
                 if &got != expected {
                     return Err(format!("expected service {expected:?}, got {got:?}"));
@@ -291,8 +316,12 @@ fn shell_missing_explicit_serial_does_not_connect_default_adbd() {
     let port = server.local_addr().unwrap().port();
     let peer = thread::spawn(move || {
         let mut socket = accept_with_deadline(&server).unwrap();
-        assert_eq!(read_host_request(&mut socket).unwrap(),
-                   "host:transport:hermes-test-nonexistent-usb-serial-957be6e4");
+        let mut request = read_host_request(&mut socket).unwrap();
+        while answer_handshake(&mut socket, &request) {
+            socket = accept_with_deadline(&server).unwrap();
+            request = read_host_request(&mut socket).unwrap();
+        }
+        assert_eq!(request, "host:transport:hermes-test-nonexistent-usb-serial-957be6e4");
         let error = b"device not found";
         socket.write_all(format!("FAIL{:04x}", error.len()).as_bytes()).unwrap();
         socket.write_all(error).unwrap();
@@ -382,7 +411,11 @@ fn usb_selection_failure_does_not_fallback() {
         let port = listener.local_addr().unwrap().port();
         let peer = thread::spawn(move || {
             let mut socket = accept_with_deadline(&listener).unwrap();
-            let request = read_host_request(&mut socket).unwrap();
+            let mut request = read_host_request(&mut socket).unwrap();
+            while answer_handshake(&mut socket, &request) {
+                socket = accept_with_deadline(&listener).unwrap();
+                request = read_host_request(&mut socket).unwrap();
+            }
             let error = b"more than one USB device";
             socket.write_all(format!("FAIL{:04x}", error.len()).as_bytes()).unwrap();
             socket.write_all(error).unwrap();

@@ -1998,8 +1998,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Serve => {
-            println!("[adb-rs] Starting ADB server on {server_addr} ...");
-            server::run_server();
+            // `-P`/`-L` must reach the listener: `run_server()` always bound
+            // 127.0.0.1:5037, so `adb-rs -P <port> serve` silently started the
+            // wrong port (and then the caller talked to whatever else lived
+            // there).
+            let default_spec = format!("tcp:127.0.0.1:{server_port}");
+            let spec = cli.transport.as_deref().unwrap_or(&default_spec);
+            println!("[adb-rs] Starting ADB server on {spec} ...");
+            server::run_server_fork(None, spec);
         }
 
         Commands::Server { args } => {
@@ -2679,7 +2685,7 @@ mod tests {
         assert_eq!(parse_server_version("0029"), Some(41));
         assert_eq!(parse_server_version("0029\n"), Some(41));
         // This crate's own constant does not fit in 16 bits and prints 8 digits.
-        assert_eq!(parse_server_version("01000001"), Some(CLIENT_SERVER_VERSION));
+        assert_eq!(parse_server_version("0029"), Some(CLIENT_SERVER_VERSION));
         // A reply that is not hex is an error, never version 0.
         assert_eq!(parse_server_version("unknown host service"), None);
         assert_eq!(parse_server_version(""), None);
