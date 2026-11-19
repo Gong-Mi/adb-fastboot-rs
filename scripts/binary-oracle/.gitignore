@@ -1,0 +1,4 @@
+# generated per-run state (transcripts, partition images, dumps)
+work/
+__pycache__/
+*.pyc
