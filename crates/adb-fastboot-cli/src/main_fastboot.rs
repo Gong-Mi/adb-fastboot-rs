@@ -156,7 +156,7 @@ struct Cli {
     unbuffered: bool,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 fn parse_slot_value(s: &str) -> Result<String, String> {
@@ -1972,6 +1972,34 @@ fn flash_image_file<T: FastbootTransport>(
     Ok(())
 }
 
+
+/// Apply `--set-active[=SLOT]` / `set_active SLOT`, gated on A/B support.
+///
+/// AOSP `set_active()` (fastboot.cpp:1531) is a no-op when the device does not
+/// report `slot-count`; an empty slot means "activate the current slot".
+fn apply_set_active<T: FastbootTransport>(
+    transport: &mut T,
+    slot: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if try_getvar_value(transport, "slot-count").is_none() {
+        return Ok(());
+    }
+    let target = if slot.is_empty() {
+        match try_getvar_value(transport, "current-slot") {
+            Some(current) if !current.trim().is_empty() => current.trim().to_string(),
+            _ => return Ok(()),
+        }
+    } else {
+        slot.to_string()
+    };
+    transport.send_cmd(&format!("set_active:{target}"))?;
+    let mut info = Vec::new();
+    let response = transport.recv_response_with_info(&mut info)?;
+    require_terminal_okay(&response)?;
+    println!("[fastboot-rs] Set active slot '{}' response: {:?}", target, response);
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let addr = resolve_target_addr(cli.serial.as_deref(), 5554)?;
@@ -2004,7 +2032,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        // AOSP accepts `fastboot --set-active=b` with no subcommand.
+        if let Some(value) = cli.set_active.as_deref() {
+            let mut transport = open_transport(use_usb, &addr, Duration::from_secs(3))?;
+            apply_set_active(&mut transport, value)?;
+            return Ok(());
+        }
+        return Err("no command".into());
+    };
+
+    match command {
         Commands::Connect { target } => {
             let (protocol, address) = parse_network_target(&target)?;
             let transport_address = if protocol == "udp" {
@@ -2881,7 +2919,7 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(args).expect("--usb should be a global option");
             assert!(cli.usb);
-            assert!(matches!(cli.command, Commands::Getvar { ref variable } if variable == "version"));
+            assert!(matches!(cli.command.as_ref(), Some(Commands::Getvar { variable }) if variable == "version"));
         }
     }
 
@@ -2939,7 +2977,7 @@ mod tests {
             "second.img",
         ])
         .expect("boot with all positional args should parse");
-        match cli.command {
+        match cli.command.as_ref().expect("command") {
             Commands::Boot {
                 ref kernel,
                 ref ramdisk,
@@ -2955,7 +2993,7 @@ mod tests {
         // kernel + ramdisk
         let cli = Cli::try_parse_from(["fastboot-rs", "boot", "kernel.img", "ramdisk.img"])
             .expect("boot with kernel and ramdisk should parse");
-        match cli.command {
+        match cli.command.as_ref().expect("command") {
             Commands::Boot {
                 ref kernel,
                 ref ramdisk,
@@ -2971,7 +3009,7 @@ mod tests {
         // 仅 kernel 参数
         let cli = Cli::try_parse_from(["fastboot-rs", "boot", "kernel.img"])
             .expect("boot with kernel only should parse");
-        match cli.command {
+        match cli.command.as_ref().expect("command") {
             Commands::Boot {
                 ref kernel,
                 ref ramdisk,
@@ -2998,7 +3036,7 @@ mod tests {
         let cli = Cli::try_parse_from(["fastboot-rs", "get-staged", "staged.bin"])
             .expect("AOSP get_staged takes an output file");
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Commands::GetStaged { ref out_file } if out_file == "staged.bin"
         ));
     }
@@ -3012,7 +3050,7 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(["fastboot-rs", name])
                 .expect("AOSP reboot variant should parse");
-            let actual = match cli.command {
+            let actual = match cli.command.as_ref().expect("command") {
                 Commands::RebootBootloader => "bootloader",
                 Commands::RebootRecovery => "recovery",
                 Commands::RebootFastboot => "fastboot",
@@ -3046,7 +3084,7 @@ mod tests {
         let cli = Cli::try_parse_from(["fastboot-rs", "gsi", "wipe", "vendor", "extra"])
             .expect("AOSP forwards every gsi argument as a colon-separated command");
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Commands::Gsi { ref action } if action == &["wipe", "vendor", "extra"]
         ));
     }
@@ -3128,7 +3166,7 @@ mod tests {
         .expect("global flags after subcommand should parse");
         assert!(cli.skip_reboot);
         assert!(cli.force);
-        assert!(matches!(cli.command, Commands::Flash { .. }));
+        assert!(matches!(cli.command.as_ref(), Some(Commands::Flash { .. })));
     }
 
     // ------------------------------------------------------------------

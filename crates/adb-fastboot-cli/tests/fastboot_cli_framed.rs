@@ -544,3 +544,16 @@ fn flash_skips_avb_probe_for_tiny_images() {
     });
     assert!(output.status.success(), "{output:?}");
 }
+
+#[test]
+fn standalone_set_active_flag_is_a_command() {
+    // AOSP: `fastboot --set-active=b` (no subcommand) still sets the slot:
+    // supports_AB() gate (getvar:slot-count) then set_active:<slot>.
+    let output = run_cli(&["--set-active=b"], |mut peer| {
+        peer.expect(b"getvar:slot-count");
+        peer.send(&[b"OKAY2"]);
+        peer.expect(b"set_active:b");
+        peer.send(&[b"OKAY"]);
+    });
+    assert!(output.status.success(), "standalone --set-active must work: {output:?}");
+}
