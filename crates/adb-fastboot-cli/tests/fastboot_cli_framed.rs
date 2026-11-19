@@ -239,14 +239,18 @@ fn generic_boot_and_flash_raw_helpers_do_not_bypass_the_frame_parser() {
         .kernel(b"dummy kernel".to_vec())
         .build();
     std::fs::write(&image, &payload).unwrap();
-    // NOTE: neither `boot` nor `flash:raw` resolves slots yet; that gap is
-    // tracked separately from the `flash`/`erase` slice this test covers.
-    for (args, final_command) in [
-        (vec!["boot", image.as_str()], "boot"),
-        (vec!["flash:raw", "boot", image.as_str()], "flash:boot"),
+    // `fastboot boot` addresses no partition (no slot probe); `flash:raw` goes
+    // through AOSP's do_for_partitions() and therefore probes has-slot first.
+    for (args, final_command, slot_aware) in [
+        (vec!["boot", image.as_str()], "boot", false),
+        (vec!["flash:raw", "boot", image.as_str()], "flash:boot", true),
     ] {
         let payload = payload.clone();
         let output = run_cli(&args, move |mut peer| {
+            if slot_aware {
+                peer.expect(b"getvar:has-slot:boot");
+                peer.send(&[b"OKAYno"]);
+            }
             peer.expect(b"getvar:max-download-size");
             peer.send(&[b"INFOOKAY FAIL DATA are text", b"OKAY0x10000"]);
             peer.expect(format!("download:{:08x}", payload.len()).as_bytes());
