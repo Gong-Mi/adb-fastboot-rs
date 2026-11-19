@@ -1656,6 +1656,37 @@ fn do_update<T: FastbootTransport>(
 }
 
 /// Helper to handle download and flashing of an image file to a specified partition over fastboot transport.
+
+/// AOSP `copy_avb_footer()` pre-flight.
+///
+/// The AVB footer is 64 bytes at the end of a boot image; a bootloader may
+/// place it at the end of the partition instead. AOSP therefore asks the
+/// device (a) whether the partition is logical -- logical partitions are not
+/// footer-relocated -- and (b) how big the partition is, then warns when the
+/// partition is smaller than the image (the flash still proceeds; the device
+/// decides). Images shorter than the footer cannot carry one, so no queries
+/// are sent at all.
+fn avb_partition_probe<T: FastbootTransport>(
+    transport: &mut T,
+    partition: &str,
+    image_size: usize,
+) -> Option<u64> {
+    if image_size < AVB_FOOTER_SIZE {
+        return None;
+    }
+    let logical = try_getvar_value(transport, &format!("is-logical:{partition}"))
+        .map(|value| value.trim() == "yes")
+        .unwrap_or(false);
+    if logical {
+        return None;
+    }
+    Some(
+        try_getvar_value(transport, &format!("partition-size:{partition}"))
+            .and_then(|value| parse_max_download_size(value.trim()))
+            .unwrap_or(0) as u64,
+    )
+}
+
 fn flash_image_file<T: FastbootTransport>(
     transport: &mut T,
     partition_label: &str,
@@ -1694,6 +1725,16 @@ fn flash_image_file<T: FastbootTransport>(
             u32::MAX
         );
         std::process::exit(1);
+    }
+
+    // AVB footer pre-flight (AOSP `copy_avb_footer`): probe logical/partition
+    // size before downloading; warn when the partition cannot hold the image.
+    if let Some(partition_size) = avb_partition_probe(transport, wire_partition, file_size) {
+        if partition_size < file_size as u64 {
+            eprintln!(
+                "Warning: skip copying {wire_partition} image avb footer ({wire_partition} partition size: {partition_size}, {wire_partition} image size: {file_size})."
+            );
+        }
     }
 
     let max_download_size = match transport.send_cmd("getvar:max-download-size") {
