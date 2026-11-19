@@ -796,6 +796,171 @@ fn fresh_transport(
     connect_and_handshake_with_tls_upgrade(transport, &cnxn_payload, default_auth())
 }
 
+// ==================== AOSP service-name routing ====================
+//
+// The commands below talk to the ADB server directly, so their service names
+// have to match AOSP byte for byte:
+//   client/commandline.cpp:1906-1955  forward/reverse host-prefix + command
+//   client/commandline.cpp:1020-1050  wait_for_device()
+//   client/commandline.cpp:1361-1375  adb_connect_command() (jdwp)
+//   client/adb_client.cpp:158-194     _adb_connect() (transport selection)
+//   services.cpp:159-258              wait_service (host:wait-for-*)
+//   adb.cpp:1133-1225                 list-forward / killforward(-all) framing
+
+/// AOSP client/commandline.cpp:1906-1955. Forwarding commands are
+/// `<host-prefix><cmd>`, where `<host-prefix>` is `host:` for `forward`
+/// (server-side listeners) and `reverse:` for `reverse` (adbd-side listeners,
+/// i.e. a *device* service that must follow transport selection).
+///
+/// `first`/`second` are the forwarding pair in wire order: `<local>;<remote>`
+/// for forward, `<remote>;<local>` for reverse.
+fn forward_service_name(
+    reverse: bool,
+    list: bool,
+    remove: Option<&str>,
+    remove_all: bool,
+    no_rebind: bool,
+    first: Option<&str>,
+    second: Option<&str>,
+) -> Option<String> {
+    let host_prefix = if reverse { "reverse:" } else { "host:" };
+    if list {
+        return Some(format!("{host_prefix}list-forward"));
+    }
+    if let Some(remove) = remove {
+        return Some(format!("{host_prefix}killforward:{remove}"));
+    }
+    if remove_all {
+        return Some(format!("{host_prefix}killforward-all"));
+    }
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!(
+            "{host_prefix}forward:{}{first};{second}",
+            if no_rebind { "norebind:" } else { "" }
+        )),
+        _ => None,
+    }
+}
+
+/// AOSP client/commandline.cpp:1020-1050: the wait service name is
+/// `format_host_command("wait-for-<transport>-<state>")`. The transport token
+/// lives *inside* the service name; the host prefix only reflects `-s`/`-d`/
+/// `-e`. The server's wait_service (services.cpp:159-258) blocks inside the
+/// request until the state is reached, so the client never polls.
+fn wait_for_service(serial: Option<&str>, usb: bool, spec: &str) -> String {
+    let host_prefix = match serial {
+        Some(serial) => format!("host-serial:{serial}:"),
+        None if usb => "host-usb:".to_string(),
+        None => "host:".to_string(),
+    };
+    format!("{host_prefix}wait-for-{spec}")
+}
+
+/// Connect to the local ADB server, starting it on demand the way
+/// `_adb_connect()` does when the socket is missing.
+fn connect_adb_server(server_port: u16) -> Result<AdbServerTransport, Box<dyn std::error::Error>> {
+    let addr = format!("127.0.0.1:{server_port}");
+    if let Ok(server) = AdbServerTransport::connect_timeout(&addr, Duration::from_millis(300)) {
+        return Ok(server);
+    }
+    client::server_cmds::ensure_server_running_at(server_port)?;
+    Ok(AdbServerTransport::connect_timeout(&addr, Duration::from_secs(2))?)
+}
+
+/// AOSP `adb_query()` (client/adb_client.cpp:398-414): `_adb_connect()` (which
+/// selects a transport for names that do not start with `host`) followed by a
+/// length-prefixed protocol string.
+fn query_service(
+    server_port: u16,
+    serial: Option<&str>,
+    service: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut server = connect_adb_server(server_port)?;
+    if !service.starts_with("host") {
+        server.switch_transport(serial)?;
+    }
+    server.send_host_request(service)?;
+    server.read_status()?;
+    let payload = server.read_payload()?;
+    Ok(String::from_utf8_lossy(&payload).to_string())
+}
+
+/// AOSP `adb_command()` (client/adb_client.cpp:381-397) for services that only
+/// acknowledge: "1st OKAY is connect, 2nd OKAY is status" (adb.cpp:1146-1155).
+/// A successful `forward:`/`reverse:` install may return a resolved TCP port as
+/// an extra protocol string (adb.cpp:1207-1213); `want_resolved_port` reads it,
+/// and no other service sends one.
+fn command_service(
+    server_port: u16,
+    serial: Option<&str>,
+    service: &str,
+    want_resolved_port: bool,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut server = connect_adb_server(server_port)?;
+    if !service.starts_with("host") {
+        server.switch_transport(serial)?;
+    }
+    server.send_host_request(service)?;
+    server.read_status()?;
+    server.read_status()?;
+
+    if !want_resolved_port {
+        return Ok(None);
+    }
+
+    // The server closes right after the status, so a short timeout is enough
+    // to tell "no resolved port" from a real payload.
+    let mut stream = server.into_inner();
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut len_buf = [0u8; 4];
+    if stream.read_exact(&mut len_buf).is_err() {
+        return Ok(None);
+    }
+    let length = std::str::from_utf8(&len_buf)
+        .ok()
+        .and_then(|text| usize::from_str_radix(text, 16).ok());
+    let Some(length) = length else {
+        return Ok(None);
+    };
+    let mut payload = vec![0u8; length];
+    if stream.read_exact(&mut payload).is_err() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&payload).to_string();
+    Ok(if text.is_empty() { None } else { Some(text) })
+}
+
+/// AOSP `adb_connect_command()` (client/commandline.cpp:1361-1375): a device
+/// service whose bytes go straight to stdout, with no client-side framing.
+fn stream_device_service(
+    server_port: u16,
+    serial: Option<&str>,
+    service: &str,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut server = connect_adb_server(server_port)?;
+    server.switch_transport(serial)?;
+    server.send_host_request(service)?;
+    server.read_status()?;
+    let mut stream = server.into_inner();
+    std::io::copy(&mut stream, out)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// AOSP `wait_for_device()`: one blocking request, no `host:get-state` polling.
+fn run_wait_for(
+    server_port: u16,
+    serial: Option<&str>,
+    usb: bool,
+    spec: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let service = wait_for_service(serial, usb, spec);
+    // Two OKAYs end the request; nothing else follows (services.cpp:224-233).
+    command_service(server_port, None, &service, false)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let addr = resolve_target_addr(cli.serial.as_deref(), ADBD_PORT);
@@ -1148,29 +1313,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ==================== Command Group 2 ====================
 
         Commands::Forward { list, remove, remove_all, no_rebind, local, remote } => {
-            let request = if *list {
-                "host:forward:list".to_string()
-            } else if let Some(rm) = remove {
-                format!("host:forward:killforward:{rm}")
-            } else if *remove_all {
-                "host:forward:killforward-all".to_string()
-            } else if let (Some(loc), Some(rem)) = (local, remote) {
-                if *no_rebind {
-                    format!("host:forward:norebind:{loc};{rem}")
-                } else {
-                    format!("host:forward:{loc};{rem}")
-                }
-            } else {
+            // AOSP client/commandline.cpp:1917-1955: `forward` targets the
+            // server's own listeners, so the prefix is "host:".
+            let Some(service) = forward_service_name(
+                false,
+                *list,
+                remove.as_deref(),
+                *remove_all,
+                *no_rebind,
+                local.as_deref(),
+                remote.as_deref(),
+            ) else {
                 eprintln!("error: specify --list, --remove, --remove-all, or LOCAL REMOTE");
                 std::process::exit(1);
             };
 
-            match host_cmd(&request) {
-                Ok(resp) => {
-                    if !resp.is_empty() {
-                        println!("{resp}");
-                    }
-                }
+            // `forward:` returns an optional resolved port for `tcp:0`; the
+            // listing/removal services return no payload.
+            let want_resolved_port = !*list && remove.is_none() && !*remove_all;
+            let result = if *list {
+                query_service(server_port, cli.serial.as_deref(), &service).map(Some)
+            } else {
+                command_service(
+                    server_port,
+                    cli.serial.as_deref(),
+                    &service,
+                    want_resolved_port,
+                )
+            };
+            match result {
+                Ok(Some(resp)) => println!("{resp}"),
+                Ok(None) => {}
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
@@ -1179,29 +1352,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Reverse { list, remove, remove_all, no_rebind, remote, local } => {
-            let request = if *list {
-                "host:reverse:list".to_string()
-            } else if let Some(rm) = remove {
-                format!("host:reverse:killreverse:{rm}")
-            } else if *remove_all {
-                "host:reverse:killreverse-all".to_string()
-            } else if let (Some(rem), Some(loc)) = (remote, local) {
-                if *no_rebind {
-                    format!("host:reverse:norebind:{rem};{loc}")
-                } else {
-                    format!("host:reverse:{rem};{loc}")
-                }
-            } else {
+            // AOSP client/commandline.cpp:1917-1927: `reverse` uses the
+            // "reverse:" prefix, which is an *adbd* service, so it is sent
+            // after transport selection (reverse --list == "reverse:list-forward").
+            let Some(service) = forward_service_name(
+                true,
+                *list,
+                remove.as_deref(),
+                *remove_all,
+                *no_rebind,
+                remote.as_deref(),
+                local.as_deref(),
+            ) else {
                 eprintln!("error: specify --list, --remove, --remove-all, or REMOTE LOCAL");
                 std::process::exit(1);
             };
 
-            match host_cmd(&request) {
-                Ok(resp) => {
-                    if !resp.is_empty() {
-                        println!("{resp}");
-                    }
-                }
+            let want_resolved_port = !*list && remove.is_none() && !*remove_all;
+            let result = if *list {
+                query_service(server_port, cli.serial.as_deref(), &service).map(Some)
+            } else {
+                command_service(
+                    server_port,
+                    cli.serial.as_deref(),
+                    &service,
+                    want_resolved_port,
+                )
+            };
+            match result {
+                Ok(Some(resp)) => println!("{resp}"),
+                Ok(None) => {}
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
@@ -1528,22 +1708,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Jdwp => {
-            match host_cmd("host:jdwp") {
-                Ok(resp) => {
-                    let trimmed = resp.trim();
-                    if trimmed.is_empty() {
-                        println!("[adb-rs] No JDWP processes found");
-                    } else {
-                        println!("[adb-rs] JDWP PIDs:");
-                        for line in trimmed.lines() {
-                            println!("  {line}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
+            // AOSP client/commandline.cpp:2121-2122: `jdwp` is a *device*
+            // service; adb_connect_command() streams it to stdout verbatim.
+            let mut out = std::io::stdout();
+            if let Err(e) = stream_device_service(server_port, cli.serial.as_deref(), "jdwp", &mut out) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
             }
         }
 
@@ -2172,147 +2342,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::WaitForDevice => {
-            let max_attempts = 60;
-            let mut attempts = 0;
-            loop {
-                let result = host_cmd("host:get-state");
-                if let Ok(resp) = &result {
-                    if resp.trim() == "device" {
-                        return Ok(());
-                    }
-                }
-                attempts += 1;
-                if attempts >= max_attempts {
-                    eprintln!("error: timeout waiting for device");
-                    std::process::exit(1);
-                }
-                std::thread::sleep(Duration::from_millis(500));
+            // AOSP client/commandline.cpp:1739-1745 + :1029-1041: the state is
+            // waited on inside the server (host:wait-for-<transport>-device).
+            let spec = if cli.d { "usb-device" } else { "any-device" };
+            if let Err(e) = run_wait_for(server_port, cli.serial.as_deref(), cli.d, spec) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
             }
         }
 
         Commands::WaitForRecovery => {
-            let max_attempts = 60;
-            let mut attempts = 0;
-            loop {
-                let result = host_cmd("host:get-state");
-                if let Ok(resp) = &result {
-                    if resp.trim() == "recovery" {
-                        return Ok(());
-                    }
-                }
-                attempts += 1;
-                if attempts >= max_attempts {
-                    eprintln!("error: timeout waiting for recovery");
-                    std::process::exit(1);
-                }
-                std::thread::sleep(Duration::from_millis(500));
+            let spec = if cli.d { "usb-recovery" } else { "any-recovery" };
+            if let Err(e) = run_wait_for(server_port, cli.serial.as_deref(), cli.d, spec) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
             }
         }
 
         Commands::WaitForBootloader => {
-            let max_attempts = 60;
-            let mut attempts = 0;
-            loop {
-                let result = host_cmd("host:get-state");
-                if let Ok(resp) = &result {
-                    if resp.trim() == "bootloader" {
-                        return Ok(());
-                    }
-                }
-                attempts += 1;
-                if attempts >= max_attempts {
-                    eprintln!("error: timeout waiting for bootloader");
-                    std::process::exit(1);
-                }
-                std::thread::sleep(Duration::from_millis(500));
+            let spec = if cli.d { "usb-bootloader" } else { "any-bootloader" };
+            if let Err(e) = run_wait_for(server_port, cli.serial.as_deref(), cli.d, spec) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
             }
         }
 
         Commands::WaitForDisconnect => {
-            let max_attempts = 60;
-            let mut attempts = 0;
-            loop {
-                let result = host_cmd("host:get-state");
-                if result.is_err() {
-                    return Ok(());
-                }
-                attempts += 1;
-                if attempts >= max_attempts {
-                    eprintln!("error: timeout waiting for disconnect");
-                    std::process::exit(1);
-                }
-                std::thread::sleep(Duration::from_millis(500));
+            // host:wait-for-any-disconnect unblocks when the transport is torn
+            // down (services.cpp:217-231).
+            let spec = if cli.d { "usb-disconnect" } else { "any-disconnect" };
+            if let Err(e) = run_wait_for(server_port, cli.serial.as_deref(), cli.d, spec) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
             }
         }
 
         Commands::WaitFor { spec } => {
             let spec_str = spec.join(" ");
-            let spec_str = spec_str.trim();
-
-            // Parse [TRANSPORT-]STATE
-            let (transport_prefix, state) = if let Some(idx) = spec_str.rfind('-') {
-                let prefix = &spec_str[..idx];
-                let st = &spec_str[idx + 1..];
-                (Some(prefix.to_string()), st.to_string())
-            } else {
-                (None, spec_str.to_string())
-            };
+            let spec_str = spec_str.trim().to_string();
 
             let valid_states = ["device", "recovery", "rescue", "sideload", "bootloader", "disconnect"];
+            let valid_transports = ["usb", "local", "any"];
+
+            // AOSP client/commandline.cpp:1029-1041: the transport token is
+            // inserted into the service name; without one the current
+            // transport applies ("any" unless -d).
+            let (transport, state) = match spec_str.rsplit_once('-') {
+                Some((transport, state)) if valid_transports.contains(&transport) => {
+                    (transport.to_string(), state.to_string())
+                }
+                _ => (
+                    if cli.d { "usb".to_string() } else { "any".to_string() },
+                    spec_str.clone(),
+                ),
+            };
+
             if !valid_states.contains(&state.as_str()) {
                 eprintln!("Error: unknown state '{}'. Valid states: device, recovery, rescue, sideload, bootloader, disconnect", state);
                 std::process::exit(1);
             }
 
-            if let Some(ref t) = transport_prefix {
-                let valid_prefixes = ["usb", "local", "any"];
-                if !valid_prefixes.contains(&t.as_str()) {
-                    eprintln!("Error: unknown transport '{}'. Valid transports: usb, local, any", t);
-                    std::process::exit(1);
-                }
-            }
-
-            let max_attempts = 60; // ~60 seconds
-            let mut attempts = 0;
-
-            println!("[adb-rs] Waiting for device state '{spec_str}' ...");
-
-            loop {
-                let result = host_cmd("host:get-state");
-                let current_state = match &result {
-                    Ok(resp) => resp.trim().to_string(),
-                    Err(_) if state == "disconnect" => "disconnect".to_string(),
-                    Err(e) => {
-                        if attempts >= max_attempts {
-                            eprintln!("Error: timeout waiting for device state '{spec_str}': {e}");
-                            std::process::exit(1);
-                        }
-                        format!("error: {e}")
-                    }
-                };
-
-                if current_state == state {
-                    println!("[adb-rs] Device reached state '{state}'");
-                    return Ok(());
-                }
-
-                if state == "disconnect" && current_state == "disconnect" {
-                    println!("[adb-rs] Device disconnected");
-                    return Ok(());
-                }
-
-                attempts += 1;
-                if attempts >= max_attempts {
-                    eprintln!("Error: timeout waiting for device state '{state}'. Last state: {current_state}");
-                    std::process::exit(1);
-                }
-
-                // Show progress
-                if attempts % 10 == 0 {
-                    println!("[adb-rs] Still waiting for '{state}' (current: {current_state}, attempt {attempts}/{max_attempts}) ...");
-                }
-
-                std::thread::sleep(Duration::from_secs(1));
+            let wire_spec = format!("{transport}-{state}");
+            if let Err(e) = run_wait_for(server_port, cli.serial.as_deref(), cli.d, &wire_spec) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
             }
         }
 
@@ -2379,6 +2472,70 @@ mod tests {
         assert_eq!(
             sync_compression_option(Some("snappy"), false).unwrap_err(),
             "unexpected compression type 'snappy'"
+        );
+    }
+
+    #[test]
+    fn forwarding_service_names_match_aosp() {
+        // AOSP client/commandline.cpp:1917-1955.
+        assert_eq!(
+            forward_service_name(false, true, None, false, false, None, None).unwrap(),
+            "host:list-forward"
+        );
+        assert_eq!(
+            forward_service_name(false, false, None, true, false, None, None).unwrap(),
+            "host:killforward-all"
+        );
+        assert_eq!(
+            forward_service_name(false, false, Some("tcp:8080"), false, false, None, None).unwrap(),
+            "host:killforward:tcp:8080"
+        );
+        assert_eq!(
+            forward_service_name(false, false, None, false, false, Some("tcp:8080"), Some("tcp:9000"))
+                .unwrap(),
+            "host:forward:tcp:8080;tcp:9000"
+        );
+        assert_eq!(
+            forward_service_name(false, false, None, false, true, Some("tcp:8080"), Some("tcp:9000"))
+                .unwrap(),
+            "host:forward:norebind:tcp:8080;tcp:9000"
+        );
+        assert_eq!(forward_service_name(false, false, None, false, false, Some("tcp:8080"), None), None);
+
+        // `reverse` shares the command names but keeps the "reverse:" device
+        // prefix, and its pair is <remote>;<local>.
+        assert_eq!(
+            forward_service_name(true, true, None, false, false, None, None).unwrap(),
+            "reverse:list-forward"
+        );
+        assert_eq!(
+            forward_service_name(true, false, None, true, false, None, None).unwrap(),
+            "reverse:killforward-all"
+        );
+        assert_eq!(
+            forward_service_name(true, false, Some("tcp:8080"), false, false, None, None).unwrap(),
+            "reverse:killforward:tcp:8080"
+        );
+        assert_eq!(
+            forward_service_name(true, false, None, false, false, Some("tcp:9000"), Some("tcp:8080"))
+                .unwrap(),
+            "reverse:forward:tcp:9000;tcp:8080"
+        );
+    }
+
+    #[test]
+    fn wait_for_service_names_match_aosp() {
+        // AOSP client/commandline.cpp:1020-1050 + services.cpp:156-260: the
+        // transport token lives inside the service name.
+        assert_eq!(wait_for_service(None, false, "any-device"), "host:wait-for-any-device");
+        assert_eq!(
+            wait_for_service(None, false, "any-disconnect"),
+            "host:wait-for-any-disconnect"
+        );
+        assert_eq!(wait_for_service(None, true, "usb-device"), "host-usb:wait-for-usb-device");
+        assert_eq!(
+            wait_for_service(Some("emulator-5554"), false, "any-device"),
+            "host-serial:emulator-5554:wait-for-any-device"
         );
     }
 
