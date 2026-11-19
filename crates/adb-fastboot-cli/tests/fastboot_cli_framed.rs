@@ -135,11 +135,14 @@ fn getvar_all_preserves_info_tokens_and_rejects_real_fail() {
     });
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "FAIL must exit nonzero: {output:?}");
+    // AOSP `getvar` reports a device FAIL on stderr and still exits 0; the INFO
+    // diagnostics go to stderr as `(bootloader) ...` too.
+    assert!(output.status.success(), "AOSP getvar FAIL exits 0: {output:?}");
     assert!(stderr.contains("terminal rejection"), "{output:?}");
-    assert!(stdout.contains("diagnostic contains OKAY/FAIL/DATA text"), "{output:?}");
-    assert!(stdout.contains("more OKAY/FAIL/DATA text"), "{output:?}");
-    assert!(!stdout.contains("Finished."), "failure must not print success: {output:?}");
+    assert!(stderr.contains("(bootloader) diagnostic contains OKAY/FAIL/DATA text"), "{output:?}");
+    assert!(stderr.contains("(bootloader) more OKAY/FAIL/DATA text"), "{output:?}");
+    assert!(stderr.contains("Finished. Total time:"), "{output:?}");
+    assert!(stdout.is_empty(), "stdout must stay empty: {output:?}");
 }
 
 #[test]
@@ -153,13 +156,13 @@ fn fragmented_info_text_and_terminal_bodies_are_not_scanned_for_tokens() {
         ]);
     });
     assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     for expected in [
-        "OKAY FAIL DATA are diagnostic text",
-        "DATA FAIL OKAY are still text",
-        "version with FAIL/DATA/OKAY inside",
+        "(bootloader) OKAY FAIL DATA are diagnostic text",
+        "(bootloader) DATA FAIL OKAY are still text",
+        "version: version with FAIL/DATA/OKAY inside",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?}: {output:?}");
+        assert!(stderr.contains(expected), "missing {expected:?}: {output:?}");
     }
 }
 
@@ -167,8 +170,6 @@ fn fragmented_info_text_and_terminal_bodies_are_not_scanned_for_tokens() {
 fn ordinary_terminal_failures_exit_nonzero() {
     // Cover the shared log helper, direct trait calls, and reboot's disconnect path.
     for (args, command) in [
-        (vec!["getvar", "version"], "getvar:version"),
-        (vec!["getvar", "all"], "getvar:all"),
         (vec!["set-active", "b"], "set_active:b"),
         (vec!["oem", "diagnose"], "oem diagnose"),
         (vec!["create-logical-partition", "scratch", "1024"], "create-logical-partition:scratch:1024"),
@@ -183,6 +184,21 @@ fn ordinary_terminal_failures_exit_nonzero() {
         });
         assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("terminal rejection"), "{output:?}");
+    }
+
+    // `getvar` is the AOSP exception: a device FAIL prints FAILED(...) but the
+    // process still exits 0 (DisplayVarOrError + Epilog).
+    for (args, command) in [
+        (vec!["getvar", "version"], "getvar:version"),
+        (vec!["getvar", "all"], "getvar:all"),
+    ] {
+        let output = run_cli(&args, move |mut peer| {
+            peer.expect(command.as_bytes());
+            peer.send(&[b"FAILterminal rejection"]);
+            peer.expect_closed();
+        });
+        assert!(output.status.success(), "{args:?} must exit 0: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("FAILED (remote: 'terminal rejection')"), "{output:?}");
     }
 }
 
@@ -468,7 +484,8 @@ fn tcp_network_serial_form_reaches_the_peer() {
         peer.send(&[b"OKAY0.4"]);
     });
     assert!(output.status.success(), "tcp: serial must connect: {output:?}");
-    assert!(String::from_utf8_lossy(&output.stdout).contains("0.4"), "{output:?}");
+    assert!(output.stdout.is_empty(), "getvar prints on stderr: {output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("version: 0.4"), "{output:?}");
 }
 
 #[test]
@@ -625,7 +642,7 @@ fn command_without_serial_uses_the_stored_network_device() {
         peer.send(&[b"OKAY0.4"]);
     });
     assert!(output.status.success(), "stored device must be used: {output:?}");
-    assert!(String::from_utf8_lossy(&output.stdout).contains("0.4"), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("version: 0.4"), "{output:?}");
 }
 
 #[test]

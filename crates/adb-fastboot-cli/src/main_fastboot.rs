@@ -1080,6 +1080,34 @@ fn recv_and_print_info(
     Ok(response)
 }
 
+/// Format the stdout line for `fastboot getvar <name>`.
+///
+/// AOSP anchor: `system/core/fastboot/fastboot.cpp`
+///   - command dispatch: `if (command == FB_CMD_GETVAR) { DisplayVarOrError(variable, variable); }`
+///   - the line itself: `fprintf(stderr, "%s: %s\n", label.c_str(), value.c_str());`
+/// so a single variable is printed as `<name>: <value>`, never as a debug rendering
+/// of the protocol response.
+fn format_getvar_line(
+    variable: &str,
+    response: &fastboot_protocol::FastbootResponse,
+) -> String {
+    match response {
+        fastboot_protocol::FastbootResponse::Okay(value) => format!("{}: {}", variable, value),
+        // Non-OKAY terminals never reach the stdout line (require_terminal_okay
+        // already turned them into an error); keep the raw form visible if one does.
+        other => format!("{}: {:?}", variable, other),
+    }
+}
+
+/// Format one `getvar all` INFO body.
+///
+/// AOSP anchor: `system/core/fastboot/fastboot.cpp` `InfoMessage()` →
+/// `fprintf(stderr, "(bootloader) %s\n", info.c_str());`. The bootloader already
+/// sends `name: value` bodies, so the prefix is all the CLI adds.
+fn format_getvar_all_info_line(info: &str) -> String {
+    format!("(bootloader) {}", info)
+}
+
 /// 发送 reboot 命令后，等待设备断开连接。
 ///
 /// 通过在线程中执行阻塞读取来检测连接断开：
@@ -2181,6 +2209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Getvar { variable } => {
+            let started = std::time::Instant::now();
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2190,24 +2219,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let cmd = format!("getvar:{}", variable);
             transport.send_cmd(&cmd)?;
-            if variable == "all" {
-                // AOSP-compatible output for getvar all:
-                //   (bootloader) key: value
-                //   ...
-                //   Finished. Total time: X.XXXs
-                let start = std::time::Instant::now();
-                let mut info_logs = Vec::new();
-                let response = transport.recv_response_with_info(&mut info_logs)?;
-                for info in info_logs {
-                    println!("(bootloader) {}", info);
-                }
-                require_terminal_okay(&response)?;
-                let elapsed = start.elapsed();
-                println!("Finished. Total time: {:.3}s", elapsed.as_secs_f64());
-            } else {
-                let resp = recv_and_print_info(&mut transport)?;
-                println!("[fastboot-rs] Response: {:?}", resp);
+            let mut info_logs = Vec::new();
+            let response = transport.recv_response_with_info(&mut info_logs)?;
+            // AOSP InfoMessage(): "(bootloader) <text>" on stderr, for every entry.
+            for info in info_logs {
+                eprintln!("{}", format_getvar_all_info_line(&info));
             }
+            match response {
+                // AOSP DisplayVarOrError(): "<name>: <value>" on stderr, also for
+                // `getvar all` (the terminal OKAY body is empty -> "all: ").
+                fastboot_protocol::FastbootResponse::Okay(value) => {
+                    eprintln!("{variable}: {value}");
+                }
+                // AOSP Status()/DisplayVarOrError() on failure: the 50-column
+                // status line, then "FAILED (remote: '<reason>')"; exit stays 0.
+                fastboot_protocol::FastbootResponse::Fail(reason) => {
+                    eprintln!("{:<50} FAILED (remote: '{}')", format!("getvar:{variable}"), reason);
+                }
+                other => {
+                    eprintln!("{:<50} FAILED ({other:?})", format!("getvar:{variable}"));
+                }
+            }
+            // AOSP Epilog(): the total time line is printed for every command.
+            eprintln!("Finished. Total time: {:.3}s", started.elapsed().as_secs_f64());
         }
         Commands::SetActive { slot } => {
             if slot.is_empty() {
@@ -2966,6 +3000,28 @@ mod tests {
         assert!(resolve_target_addr(Some("tcp:127.0.0.1"), 5554).is_err());
         assert!(resolve_target_addr(Some("tcp:"), 5554).is_err());
         assert!(resolve_target_addr(Some("udp:1.2.3.4"), 5554).is_err());
+    }
+
+    #[test]
+    fn getvar_single_variable_prints_aosp_name_colon_value() {
+        // Oracle: C fastboot 35.0.2 → `fastboot getvar version` prints
+        // `version: 0.4`; the Rust CLI used to print the debug rendering
+        // `[fastboot-rs] Response: Okay("0.4")` instead.
+        let response = fastboot_protocol::FastbootResponse::Okay("0.4".to_string());
+        assert_eq!(format_getvar_line("version", &response), "version: 0.4");
+        // Values are passed through verbatim, including spaces and colons.
+        let response = fastboot_protocol::FastbootResponse::Okay("a b:c".to_string());
+        assert_eq!(format_getvar_line("some-var", &response), "some-var: a b:c");
+    }
+
+    #[test]
+    fn getvar_all_info_lines_keep_the_aosp_bootloader_prefix() {
+        // AOSP `InfoMessage()` prints `(bootloader) <info body>` and the body
+        // already carries `name: value`.
+        assert_eq!(
+            format_getvar_all_info_line("version: 0.4"),
+            "(bootloader) version: 0.4"
+        );
     }
 
     #[test]
