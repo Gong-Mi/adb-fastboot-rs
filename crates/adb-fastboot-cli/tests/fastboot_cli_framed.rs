@@ -690,3 +690,51 @@ fn flash_keeps_image_when_no_avb_footer_is_present() {
     });
     assert!(output.status.success(), "{output:?}");
 }
+
+#[test]
+fn flash_raw_uses_aosp_bootimage_defaults() {
+    // AOSP mkbootimg defaults: page 2048, header v0 -> 2048 (header) + 4096
+    // (kernel page) = 6144 bytes for a 4096-byte kernel, no ramdisk.
+    let files = Files::new("raw-defaults");
+    let kernel = files.path("kernel.bin");
+    std::fs::write(&kernel, vec![0x4Bu8; 4096]).unwrap();
+    let output = run_cli(&["flash:raw", "boot", &kernel], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"getvar:max-download-size");
+        peer.send(&[b"OKAY0x10000"]);
+        peer.expect(b"download:00001800");
+        peer.send(&[b"DATA00001800"]);
+        // Read the framed payload (8-byte big-endian length + bytes).
+        let mut header = [0u8; 8];
+        peer.0.read_exact(&mut header).unwrap();
+        assert_eq!(u64::from_be_bytes(header), 6144, "payload frame length");
+        let mut payload = vec![0u8; 6144];
+        peer.0.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload[..8], b"ANDROID!", "built boot image must carry BOOT_MAGIC");
+        peer.send(&[b"OKAYdownloaded"]);
+        peer.expect(b"flash:boot_a");
+        peer.send(&[b"OKAYflashed"]);
+    });
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn flash_raw_rejects_kernels_shorter_than_a_v3_header() {
+    // AOSP LoadBootableImage: `size < sizeof(boot_img_hdr_v3)` -> "too short"
+    // before any device command is sent.
+    let files = Files::new("raw-short");
+    let kernel = files.path("kernel.bin");
+    std::fs::write(&kernel, vec![0x4Bu8; 512]).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fastboot-rs"))
+        .args(["-s", "127.0.0.1:1", "flash:raw", "boot", &kernel])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("too short"),
+        "{output:?}"
+    );
+}
