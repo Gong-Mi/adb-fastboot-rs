@@ -1,0 +1,56 @@
+name: binary-oracle
+
+# Self-check for the in-repo differential fixtures under scripts/binary-oracle.
+# Deliberately a separate workflow from ci.yml: it is *not* a required check,
+# so a fixture regression is visible in the PR's check list without blocking
+# merge of unrelated Rust work. Do not add "binary-oracle" to branch protection.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: binary-oracle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fixtures:
+    name: oracle fixtures (python only)
+    runs-on: ubuntu-latest
+    # Hard ceiling: this job is meant to finish in seconds, never wedge a queue.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report interpreter
+        run: python3 --version
+
+      # 4.1 in scripts/binary-oracle/README.md
+      - name: Byte-compile harness
+        timeout-minutes: 1
+        run: |
+          timeout 60 python3 -m py_compile \
+            scripts/binary-oracle/*.py \
+            scripts/binary-oracle/examples/*.py
+          echo "py_compile OK"
+
+      # 4.2 in the README: fake device + python client, no C/Rust binary needed.
+      - name: Run README example and assert PASS
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          timeout 60 python3 scripts/binary-oracle/examples/fastboot_one_case.py \
+            | tee "$RUNNER_TEMP/oracle-example.log"
+          # The example prints "PASS: ..." only after verifying device-side bytes.
+          grep -q '^PASS:' "$RUNNER_TEMP/oracle-example.log"
+          echo "example asserted PASS"
+          {
+            echo '### binary-oracle example'
+            echo '```'
+            grep -E '^(PASS:|device flash event:|boot_a head:)' "$RUNNER_TEMP/oracle-example.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
