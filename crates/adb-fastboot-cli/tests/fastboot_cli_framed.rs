@@ -627,3 +627,66 @@ fn command_without_serial_uses_the_stored_network_device() {
     assert!(output.status.success(), "stored device must be used: {output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("0.4"), "{output:?}");
 }
+
+#[test]
+fn flash_relocates_avb_footer_to_the_end_of_the_partition() {
+    // AOSP copy_avb_footer: partition 0x800 > image 0x400 with an "AVBf" footer
+    // at image_size-64 -> payload becomes image ++ zeros ++ footer, size 0x800.
+    let files = Files::new("avb-relocate");
+    let image = files.path("boot.img");
+    let mut data = vec![0x5Au8; 1024];
+    data[960..964].copy_from_slice(b"AVBf");
+    data[964..1024].copy_from_slice(&[0xA5u8; 60]);
+    std::fs::write(&image, &data).unwrap();
+
+    let mut expected = vec![0u8; 2048];
+    expected[..1024].copy_from_slice(&data);
+    expected[1984..2048].copy_from_slice(&data[960..1024]);
+
+    let output = run_cli(&["flash", "boot", &image], move |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"getvar:is-logical:boot_a");
+        peer.send(&[b"OKAYno"]);
+        peer.expect(b"getvar:partition-size:boot_a");
+        peer.send(&[b"OKAY0x800"]);
+        peer.expect(b"getvar:max-download-size");
+        peer.send(&[b"OKAY0x10000"]);
+        peer.expect(b"download:00000800");
+        peer.send(&[b"DATA00000800"]);
+        peer.expect(&expected);
+        peer.send(&[b"OKAYdownloaded"]);
+        peer.expect(b"flash:boot_a");
+        peer.send(&[b"OKAYflashed"]);
+    });
+    assert!(output.status.success(), "relocated flash must succeed: {output:?}");
+}
+
+#[test]
+fn flash_keeps_image_when_no_avb_footer_is_present() {
+    let files = Files::new("avb-nofooter");
+    let image = files.path("boot.img");
+    let data = vec![0x5Au8; 1024];          // no "AVBf" magic
+    std::fs::write(&image, &data).unwrap();
+    let output = run_cli(&["flash", "boot", &image], move |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"getvar:is-logical:boot_a");
+        peer.send(&[b"OKAYno"]);
+        peer.expect(b"getvar:partition-size:boot_a");
+        peer.send(&[b"OKAY0x800"]);
+        peer.expect(b"getvar:max-download-size");
+        peer.send(&[b"OKAY0x10000"]);
+        peer.expect(b"download:00000400");   // unchanged size
+        peer.send(&[b"DATA00000400"]);
+        peer.expect(&data);
+        peer.send(&[b"OKAYdownloaded"]);
+        peer.expect(b"flash:boot_a");
+        peer.send(&[b"OKAYflashed"]);
+    });
+    assert!(output.status.success(), "{output:?}");
+}
