@@ -1687,6 +1687,36 @@ fn avb_partition_probe<T: FastbootTransport>(
     )
 }
 
+/// AOSP `copy_avb_footer()` buffer rewrite.
+///
+/// When the partition is larger than the image and the image really carries an
+/// AVB footer at `size - 64`, the bootloader expects that footer at the end of
+/// the *partition*. AOSP builds `image ++ zeros ++ footer` (the gap is a hole in
+/// the temporary fd) and flashes `partition_size` bytes; this mirrors that.
+fn relocate_avb_footer(
+    image_path: &std::path::Path,
+    image_size: usize,
+    partition_size: u64,
+) -> Option<Vec<u8>> {
+    let partition_size = usize::try_from(partition_size).ok()?;
+    if partition_size <= image_size || image_size < AVB_FOOTER_SIZE {
+        return None;
+    }
+    let data = std::fs::read(image_path).ok()?;
+    if data.len() != image_size {
+        return None;
+    }
+    let footer_offset = image_size - AVB_FOOTER_SIZE;
+    if &data[footer_offset..footer_offset + 4] != AVB_FOOTER_MAGIC {
+        return None;
+    }
+    let mut relocated = data[..image_size].to_vec();
+    relocated.resize(partition_size, 0);
+    relocated[partition_size - AVB_FOOTER_SIZE..partition_size]
+        .copy_from_slice(&data[footer_offset..image_size]);
+    Some(relocated)
+}
+
 fn flash_image_file<T: FastbootTransport>(
     transport: &mut T,
     partition_label: &str,
@@ -1729,11 +1759,14 @@ fn flash_image_file<T: FastbootTransport>(
 
     // AVB footer pre-flight (AOSP `copy_avb_footer`): probe logical/partition
     // size before downloading; warn when the partition cannot hold the image.
+    let mut avb_payload: Option<Vec<u8>> = None;
     if let Some(partition_size) = avb_partition_probe(transport, wire_partition, file_size) {
         if partition_size < file_size as u64 {
             eprintln!(
                 "Warning: skip copying {wire_partition} image avb footer ({wire_partition} partition size: {partition_size}, {wire_partition} image size: {file_size})."
             );
+        } else if partition_size > file_size as u64 {
+            avb_payload = relocate_avb_footer(image_path, file_size, partition_size);
         }
     }
 
@@ -1865,28 +1898,27 @@ fn flash_image_file<T: FastbootTransport>(
     } else {
         let chunk_size = max_download_size.unwrap_or(16 * 1024 * 1024);
 
-        // AOSP SetVbmetaFlags: for vbmeta partitions, read the whole image
-        // into memory so we can patch the flags byte before sending.
-        let vbmeta_patched: Option<Vec<u8>> = if is_vbmeta_partition(partition_label) && gopts.needs_vbmeta_patch() {
-            let data = match std::fs::read(image_path) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("Error reading image file '{}': {}", image_path.display(), e);
-                    std::process::exit(1);
-                }
+        // In-memory payload: AVB footer relocation (AOSP copy_avb_footer) first,
+        // then the AOSP SetVbmetaFlags patch for vbmeta partitions.
+        let mut memory_payload: Option<Vec<u8>> = avb_payload.take();
+        if is_vbmeta_partition(partition_label) && gopts.needs_vbmeta_patch() {
+            let data = match memory_payload.take() {
+                Some(data) => data,
+                None => match std::fs::read(image_path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("Error reading image file '{}': {}", image_path.display(), e);
+                        std::process::exit(1);
+                    }
+                },
             };
-            match patch_vbmeta_flags(&data, gopts) {
-                Some(patched) => {
-                    vlog!(gopts, "[fastboot-rs] vbmeta flags patched ({} bytes)", patched.len());
-                    Some(patched)
-                }
-                None => None,
+            memory_payload = patch_vbmeta_flags(&data, gopts);
+            if let Some(ref patched) = memory_payload {
+                vlog!(gopts, "[fastboot-rs] vbmeta flags patched ({} bytes)", patched.len());
             }
-        } else {
-            None
-        };
+        }
 
-        let effective_size = vbmeta_patched.as_ref().map_or(file_size, |p| p.len());
+        let effective_size = memory_payload.as_ref().map_or(file_size, |p| p.len());
 
         println!(
             "[fastboot-rs] Flashing partition '{}' with image '{}' ({} bytes, chunk size: {} bytes)",
@@ -1918,13 +1950,13 @@ fn flash_image_file<T: FastbootTransport>(
 
         println!("[fastboot-rs] Sending image payload in chunks ({} bytes total)...", effective_size);
 
-        if let Some(ref patched_data) = vbmeta_patched {
-            // Send patched vbmeta data from memory.
+        if let Some(ref patched_data) = memory_payload {
+            // Send the in-memory payload (relocated AVB footer and/or patched vbmeta).
             let mut offset = 0usize;
             while offset < patched_data.len() {
                 let to_send = (patched_data.len() - offset).min(chunk_size);
                 if let Err(e) = transport.write_all(&patched_data[offset..offset + to_send]) {
-                    eprintln!("Error writing patched vbmeta to transport at offset {offset}: {e}");
+                    eprintln!("Error writing payload to transport at offset {offset}: {e}");
                     std::process::exit(1);
                 }
                 offset += to_send;
