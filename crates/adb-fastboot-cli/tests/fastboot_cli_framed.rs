@@ -308,6 +308,9 @@ fn fetch_consumes_each_post_data_status_before_the_next_command() {
     let files = Files::new("fetch");
     let destination = files.path("fetch.bin");
     let output = run_cli(&["fetch", "boot", &destination], |mut peer| {
+        // Device without slots: resolution keeps the plain partition name.
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYno"]);
         peer.expect(b"getvar:max-fetch-size");
         peer.send(&[b"INFOOKAY FAIL DATA query", b"OKAY0x3"]);
         peer.expect(b"getvar:partition-size:boot");
@@ -327,6 +330,8 @@ fn offset_only_fetch_propagates_post_data_fail() {
     let files = Files::new("fetch-fail");
     let destination = files.path("fetch.bin");
     let output = run_cli(&["fetch", "boot", &destination, "--offset", "0"], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYno"]);
         peer.expect(b"getvar:max-fetch-size");
         peer.send(&[b"OKAY0x3"]);
         peer.expect(b"fetch:boot:0x00000000");
@@ -455,4 +460,29 @@ fn malformed_tcp_serial_fails_before_connecting() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid network address"), "{output:?}");
+}
+
+#[test]
+fn fetch_resolves_current_slot_before_sizing() {
+    // AOSP resolves the partition (has-slot + current-slot) before asking for
+    // max-fetch-size / partition-size. `partition-size:boot` FAILs on a real
+    // bootloader and used to abort the whole fetch.
+    let files = Files::new("fetch-slot");
+    let destination = files.path("fetch.bin");
+    let output = run_cli(&["fetch", "boot", &destination], |mut peer| {
+        peer.expect(b"getvar:has-slot:boot");
+        peer.send(&[b"OKAYyes"]);
+        peer.expect(b"getvar:current-slot");
+        peer.send(&[b"OKAYa"]);
+        peer.expect(b"getvar:max-fetch-size");
+        peer.send(&[b"OKAY0x2"]);
+        peer.expect(b"getvar:partition-size:boot_a");
+        peer.send(&[b"OKAY0x4"]);
+        peer.expect(b"fetch:boot_a:0x00000000:0x00000002");
+        peer.send(&[b"DATA00000002", b"ab", b"OKAY"]);
+        peer.expect(b"fetch:boot_a:0x00000002:0x00000002");
+        peer.send(&[b"DATA00000002", b"cd", b"OKAY"]);
+    });
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"abcd");
 }
