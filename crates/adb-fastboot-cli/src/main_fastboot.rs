@@ -960,7 +960,9 @@ fn fetch_to_file(
     if size.is_some() && offset.is_none() {
         return Err("fetch size requires an offset".into());
     }
-    let partition = slot.partition_name(partition)?;
+    // AOSP `do_for_partitions()` resolves has-slot/current-slot before any
+    // sizing query: `partition-size:boot` does not exist on a slotted device.
+    let partition = resolve_wire_partition(transport, partition, slot)?;
     let max_fetch_size = parse_max_download_size(&getvar_value(transport, "max-fetch-size")?)
         .ok_or("device returned an invalid max-fetch-size")? as u64;
     if max_fetch_size == 0 {
