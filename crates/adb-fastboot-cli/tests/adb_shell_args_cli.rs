@@ -24,6 +24,20 @@ use std::time::{Duration, Instant};
 const SHELL_ID_STDOUT: u8 = 1;
 const SHELL_ID_EXIT: u8 = 3;
 
+
+/// Expected shell service string for the current environment.
+///
+/// AOSP `ShellServiceString()` appends `TERM=<getenv("TERM")>` when the shell
+/// protocol is used, so the expectation must follow the environment instead of
+/// pinning the old TERM-less form.
+fn shell_service(cmd: &str) -> &'static str {
+    let service = match std::env::var("TERM") {
+        Ok(term) => format!("shell,v2,TERM={term},raw:{cmd}"),
+        Err(_) => format!("shell,v2,raw:{cmd}"),
+    };
+    Box::leak(service.into_boxed_str())
+}
+
 fn shell_v2_frame(id: u8, payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(5 + payload.len());
     frame.push(id);
@@ -187,7 +201,7 @@ fn shell_forwards_trailing_flag_arguments() {
     let output = assert_wire_case(
         "shell ls -l",
         &["shell", "ls", "-l"],
-        &["host:transport-any", "shell,v2,raw:ls -l"],
+        &["host:transport-any", shell_service("ls -l")],
         reply,
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "total 0\n");
@@ -200,7 +214,7 @@ fn shell_double_dash_separator_is_not_forwarded() {
     let output = assert_wire_case(
         "shell -- ls -l",
         &["shell", "--", "ls", "-l"],
-        &["host:transport-any", "shell,v2,raw:ls -l"],
+        &["host:transport-any", shell_service("ls -l")],
         reply,
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
@@ -213,7 +227,7 @@ fn shell_separator_allows_dash_prefixed_remote_command() {
     let output = assert_wire_case(
         "shell -- -command -arg",
         &["shell", "--", "-command", "-arg"],
-        &["host:transport-any", "shell,v2,raw:-command -arg"],
+        &["host:transport-any", shell_service("-command -arg")],
         reply,
     );
     assert_eq!(output.stdout, b"ok\n");
@@ -244,7 +258,7 @@ fn shell_server_exit_case(reply: Vec<u8>, expected_code: i32, stdout: &[u8], std
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let (peer, observed) = start_fake_server(listener,
-        vec!["host:transport-any".into(), "shell,v2,raw:echo hi".into()], reply);
+        vec!["host:transport-any".into(), shell_service("echo hi").into()], reply);
     let output = run_cli(&["-P".into(), port.to_string(), "shell".into(), "echo".into(), "hi".into()]);
     let (result, requests) = observed.recv_timeout(Duration::from_secs(15)).unwrap();
     peer.join().unwrap();
@@ -331,7 +345,7 @@ fn usb_selector_is_sent_for_shell_and_exec() {
     let mut reply = shell_v2_frame(SHELL_ID_STDOUT, b"usb\n");
     reply.extend_from_slice(&shell_v2_frame(SHELL_ID_EXIT, &[0]));
     let result = assert_wire_case("usb shell", &["-d", "shell", "id"],
-        &["host:transport-usb", "shell,v2,raw:id"], reply);
+        &["host:transport-usb", shell_service("id")], reply);
     assert_eq!(result.stdout, b"usb\n");
     let result = assert_wire_case("usb exec-out", &["-d", "exec-out", "id"],
         &["host:transport-usb", "exec:id"], b"out".to_vec());
@@ -345,7 +359,7 @@ fn usb_selector_is_sent_for_shell_and_exec() {
 fn serial_overrides_usb_selector_for_shell() {
     let reply = shell_v2_frame(SHELL_ID_EXIT, &[0]);
     assert_wire_case("serial and usb", &["-d", "-s", "chosen-serial", "shell", "id"],
-        &["host:transport:chosen-serial", "shell,v2,raw:id"], reply);
+        &["host:transport:chosen-serial", shell_service("id")], reply);
 }
 
 #[test]

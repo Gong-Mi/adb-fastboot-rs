@@ -848,11 +848,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Shell { command } => {
             let cmd_str = command.join(" ");
-            let shell_service = if cmd_str.is_empty() {
-                "shell,v2,raw:".to_string()
-            } else {
-                format!("shell,v2,raw:{}", cmd_str)
-            };
+            // AOSP ShellServiceString(): `shell,v2[,TERM=<local TERM>],raw:<cmd>`.
+            let shell_service =
+                shell::shell_service_string(shell::local_term().as_deref(), "raw", &cmd_str);
 
             // Priority 1: ADB server (port 5037) — borrow the system ADB's
             // already-authenticated transport.
@@ -1502,7 +1500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 format!("logcat {}", args.join(" "))
             };
-            let dest = format!("shell,v2,raw:{logcat_cmd}");
+            let dest = shell::shell_service_string(shell::local_term().as_deref(), "raw", &logcat_cmd);
             let (local_id, remote_id) = protocol::open_service(&mut transport, &dest, 1)?;
             shell::stream_shell_v2(&mut transport, local_id, remote_id, false)?;
         }
@@ -1517,7 +1515,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 default_auth(),
             )?;
 
-            let dest = "shell,v2,raw:bugreport".to_string();
+            let dest = shell::shell_service_string(shell::local_term().as_deref(), "raw", "bugreport");
             println!("[adb-rs] Capturing bugreport from {addr} ...");
             let (local_id, remote_id) = protocol::open_service(&mut transport, &dest, 1)?;
             let captured = shell::stream_shell_v2(&mut transport, local_id, remote_id, true)?;

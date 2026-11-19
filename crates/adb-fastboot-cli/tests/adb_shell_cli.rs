@@ -60,10 +60,15 @@ fn spawn_fake_adbd(frames: Vec<Vec<u8>>) -> (u16, thread::JoinHandle<()>) {
         let open = AdbMessageHeader::decode(&hdr_buf).unwrap();
         let mut open_payload = vec![0u8; open.data_length as usize];
         socket.read_exact(&mut open_payload).unwrap();
+        // AOSP ShellServiceString(): `shell,v2[,TERM=<t>],raw:<cmd>`.
+        let text = String::from_utf8_lossy(&open_payload);
+        let expected_prefix = match std::env::var("TERM") {
+            Ok(term) => format!("shell,v2,TERM={term},raw:"),
+            Err(_) => "shell,v2,raw:".to_string(),
+        };
         assert!(
-            open_payload.starts_with(b"shell,v2,raw:"),
-            "expected shell,v2,raw service, got {:?}",
-            String::from_utf8_lossy(&open_payload)
+            text.starts_with(&expected_prefix),
+            "expected {expected_prefix:?} service, got {text:?}"
         );
 
         AdbMessageHeader::new(A_OKAY, 2, open.arg0, &[]).encode(&mut resp_buf);

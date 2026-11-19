@@ -276,13 +276,49 @@ pub fn stream_shell_v2_server_with_stdin(
     stream_shell_v2_server(transport, capture).map(|(captured, _exit_code)| captured)
 }
 
+/// Build the shell service string `shell[,v2][,TERM=<t>][,<mode>]:<command>`.
+///
+/// AOSP `ShellServiceString()` (packages/modules/adb/client/commandline.cpp):
+/// whenever the shell protocol is in use, a set local `TERM` is appended right
+/// after `v2` and *before* the terminal-mode argument (`raw`/`pty`). The
+/// command is appended verbatim — the caller's argument list is never re-split
+/// or re-quoted here.
+///
+/// Callers that format their own service string must route through this helper
+/// to get the `TERM` argument; `main_adb.rs`'s `shell` arm still does not.
+pub(crate) fn shell_service_string(term: Option<&str>, mode: &str, cmd: &str) -> String {
+    match term {
+        Some(term) => format!("shell,v2,TERM={term},{mode}:{cmd}"),
+        None => format!("shell,v2,{mode}:{cmd}"),
+    }
+}
+
+/// Local `TERM`, mirroring AOSP's `getenv("TERM") != nullptr` gate.
+///
+/// Service strings are UTF-8 in this client, so a non-UTF-8 `TERM` is dropped
+/// rather than lossily rewritten into a different terminal name.
+pub(crate) fn local_term() -> Option<String> {
+    std::env::var_os("TERM").and_then(|value| value.into_string().ok())
+}
+
 /// Open shell connection and stream output to stdout.
 pub fn run_shell(
     transport: &mut dyn Transport,
     cmd: &str,
     capture: bool,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    let dest = format!("shell,v2,raw:{cmd}");
+    run_shell_with_term(transport, local_term().as_deref(), cmd, capture)
+}
+
+/// [`run_shell`] with the terminal type injected, so the service string can be
+/// exercised deterministically without touching the process environment.
+fn run_shell_with_term(
+    transport: &mut dyn Transport,
+    term: Option<&str>,
+    cmd: &str,
+    capture: bool,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let dest = shell_service_string(term, "raw", cmd);
     let (local_id, remote_id) = open_service(transport, &dest, 1)?;
     stream_shell_v2(transport, local_id, remote_id, capture)
 }
@@ -303,6 +339,7 @@ pub fn shell_over_adbd(cmd: &str, addr: &str) -> Result<Vec<u8>, Box<dyn std::er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adb_protocol::A_OPEN;
 
     fn run(bytes: &[u8]) -> (Vec<u8>, bool) {
         let mut state = StdinEscape::StartOfLine;
@@ -350,5 +387,127 @@ mod tests {
         // A tilde mid-line is a normal character; only the leading one is eaten.
         let (out, _) = run(b"a~.");
         assert_eq!(out, b"a~.");
+    }
+
+    // --- service string (AOSP `ShellServiceString`) ---
+
+    #[test]
+    fn service_string_puts_term_between_v2_and_raw() {
+        assert_eq!(
+            shell_service_string(Some("xterm-256color"), "raw", "echo hi"),
+            "shell,v2,TERM=xterm-256color,raw:echo hi"
+        );
+    }
+
+    #[test]
+    fn service_string_without_term_is_unchanged() {
+        assert_eq!(
+            shell_service_string(None, "raw", "echo hi"),
+            "shell,v2,raw:echo hi"
+        );
+    }
+
+    #[test]
+    fn service_string_term_precedes_pty_mode() {
+        assert_eq!(
+            shell_service_string(Some("screen-256color"), "pty", "sh -l"),
+            "shell,v2,TERM=screen-256color,pty:sh -l"
+        );
+    }
+
+    #[test]
+    fn service_string_keeps_remote_command_verbatim() {
+        let cmd = "sh -c 'a b' --flag=\"x y\"";
+        assert_eq!(
+            shell_service_string(Some("xterm"), "raw", cmd),
+            format!("shell,v2,TERM=xterm,raw:{cmd}")
+        );
+    }
+
+    #[test]
+    fn empty_but_set_term_is_forwarded_like_aosp() {
+        // AOSP gates on `getenv("TERM") != nullptr`, so TERM= is sent as-is.
+        assert_eq!(
+            shell_service_string(Some(""), "raw", "echo hi"),
+            "shell,v2,TERM=,raw:echo hi"
+        );
+    }
+
+    /// Minimal transport that records A_OPEN destinations and replays frames.
+    struct RecordingTransport {
+        opened: Vec<String>,
+        frames: std::collections::VecDeque<(AdbMessageHeader, Vec<u8>)>,
+    }
+
+    impl RecordingTransport {
+        fn with_frames(frames: Vec<(AdbMessageHeader, Vec<u8>)>) -> Self {
+            Self {
+                opened: Vec::new(),
+                frames: frames.into(),
+            }
+        }
+    }
+
+    impl std::io::Read for RecordingTransport {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl std::io::Write for RecordingTransport {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Transport for RecordingTransport {
+        fn send_message(
+            &mut self,
+            header: &AdbMessageHeader,
+            payload: &[u8],
+        ) -> Result<(), TransportError> {
+            if header.command == A_OPEN {
+                self.opened.push(String::from_utf8_lossy(payload).into_owned());
+            }
+            Ok(())
+        }
+
+        fn recv_message(&mut self) -> Result<(AdbMessageHeader, Vec<u8>), TransportError> {
+            self.frames.pop_front().ok_or_else(|| {
+                TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "no more frames",
+                ))
+            })
+        }
+    }
+
+    #[test]
+    fn run_shell_opens_the_service_with_the_local_term() {
+        let mut transport = RecordingTransport::with_frames(vec![
+            (AdbMessageHeader::new(A_OKAY, 2, 0, &[]), Vec::new()),
+            (AdbMessageHeader::new(A_CLSE, 2, 1, &[]), Vec::new()),
+        ]);
+        run_shell_with_term(&mut transport, Some("xterm-256color"), "echo hi", true).unwrap();
+        assert_eq!(
+            transport.opened,
+            vec!["shell,v2,TERM=xterm-256color,raw:echo hi".to_string()]
+        );
+    }
+
+    #[test]
+    fn run_shell_without_term_opens_the_legacy_service() {
+        let mut transport = RecordingTransport::with_frames(vec![
+            (AdbMessageHeader::new(A_OKAY, 2, 0, &[]), Vec::new()),
+            (AdbMessageHeader::new(A_CLSE, 2, 1, &[]), Vec::new()),
+        ]);
+        run_shell_with_term(&mut transport, None, "echo hi", true).unwrap();
+        assert_eq!(
+            transport.opened,
+            vec!["shell,v2,raw:echo hi".to_string()]
+        );
     }
 }
