@@ -1108,6 +1108,88 @@ fn format_getvar_all_info_line(info: &str) -> String {
     format!("(bootloader) {}", info)
 }
 
+/// AOSP `Status()` column: `kStatusFormat[] = "%-50s "`.
+/// Anchor: `system/core/fastboot/fastboot.cpp:205-211`.
+const STATUS_COLUMN_WIDTH: usize = 50;
+
+/// Print the AOSP `Status()` prefix for an action and start its timer.
+///
+/// `Status()` writes `fprintf(stderr, "%-50s ", message)` *without* a newline;
+/// the matching `Epilog()` supplies `OKAY [...]` / `FAILED (...)` and the line
+/// break. Anchors: `fastboot.cpp:205-211` (Status), `:213-221` (Epilog).
+fn status_prolog(action: &str) -> std::time::Instant {
+    eprint!("{:<width$} ", action, width = STATUS_COLUMN_WIDTH);
+    std::time::Instant::now()
+}
+
+/// `Epilog(0)`: `fprintf(stderr, "OKAY [%7.3fs]\n", split - last_start_time);`
+/// (fastboot.cpp:218-219). The timer is `%7.3f`, so short durations are padded
+/// to `  0.000`.
+fn status_epilog_okay(started: std::time::Instant) {
+    eprintln!("OKAY [{:7.3}s]", started.elapsed().as_secs_f64());
+}
+
+/// The driver-side error string for a `FAIL` packet:
+/// `fastboot_driver.cpp:500` `error_ = StringPrintf("remote: '%s'", status + 4)`.
+fn remote_error(reason: &str) -> String {
+    format!("remote: '{reason}'")
+}
+
+/// `Epilog(1)`: `fprintf(stderr, "FAILED (%s)\n", fb->Error().c_str())` followed
+/// by `die("Command failed")` (fastboot.cpp:213-216, util.cpp:51-58), which
+/// prints `fastboot: error: ` and exits 1. The AOSP epilog line is closed here
+/// because the `Status()` prefix is already on stderr.
+fn status_epilog_failed(detail: &str) -> ! {
+    eprintln!("FAILED ({detail})");
+    die("Command failed")
+}
+
+/// `util.cpp:51-58` `die()`: `fastboot: error: <message>` on stderr, exit 1.
+fn die(message: &str) -> ! {
+    eprintln!("fastboot: error: {message}");
+    std::process::exit(1);
+}
+
+/// AOSP closes every command with this line (fastboot.cpp:2652).
+fn print_finished(started: std::time::Instant) {
+    eprintln!("Finished. Total time: {:.3}s", started.elapsed().as_secs_f64());
+}
+
+/// `Sending '<name>' (<size>/1024 KB)` — `fastboot_driver.cpp:191/222`.
+/// AOSP reports whole kilobytes (integer division), so a 1024-byte image is
+/// `(1 KB)` and a 5-byte one is `(0 KB)`.
+fn format_sending_action(name: &str, size: usize) -> String {
+    format!("Sending '{}' ({} KB)", name, size / 1024)
+}
+
+/// `Sending sparse '<partition>' <current>/<total> (<size>/1024 KB)` —
+/// `fastboot_driver.cpp:253`, used when the image is split on
+/// max-download-size.
+fn format_sending_sparse_action(
+    partition: &str,
+    current: usize,
+    total: usize,
+    size: usize,
+) -> String {
+    format!(
+        "Sending sparse '{}' {}/{} ({} KB)",
+        partition,
+        current,
+        total,
+        size / 1024
+    )
+}
+
+/// `Writing '<partition>'` — `fastboot_driver.cpp:98`.
+fn format_writing_action(partition: &str) -> String {
+    format!("Writing '{}'", partition)
+}
+
+/// `Erasing '<partition>'` — `fastboot_driver.cpp:93`.
+fn format_erasing_action(partition: &str) -> String {
+    format!("Erasing '{}'", partition)
+}
+
 /// 发送 reboot 命令后，等待设备断开连接。
 ///
 /// 通过在线程中执行阻塞读取来检测连接断开：
@@ -1872,56 +1954,76 @@ fn flash_image_file<T: FastbootTransport>(
 
         for (idx, split_file) in splits.iter().enumerate() {
             let payload = split_file.encode();
-            println!(
-                "[fastboot-rs] Sending split chunk {}/{} ({} bytes)...",
+
+            // AOSP `Download(partition, sparse_file, size, current, total)`:
+            // `Sending sparse '<partition>' <current>/<total> (<KB> KB)`.
+            let sending = status_prolog(&format_sending_sparse_action(
+                wire_partition,
                 idx + 1,
                 splits.len(),
-                payload.len()
-            );
+                payload.len(),
+            ));
 
             let download_cmd = fastboot_protocol::download(payload.len() as u32);
-            transport.send_cmd(&download_cmd)?;
-            let dl_resp = transport.recv_response()?;
+            if let Err(e) = transport.send_cmd(&download_cmd) {
+                status_epilog_failed(&format!("write to device failed: {e}"));
+            }
+            let dl_resp = match transport.recv_response() {
+                Ok(resp) => resp,
+                Err(e) => status_epilog_failed(&format!("status read failed: {e}")),
+            };
             match dl_resp {
                 fastboot_protocol::FastbootResponse::Data(expected_len) => {
                     if expected_len != payload.len() as u32 {
-                        eprintln!(
-                            "Error: Device requested {} bytes, but chunk payload is {} bytes",
-                            expected_len,
+                        status_epilog_failed(&format!(
+                            "device requested {expected_len} bytes, but sparse chunk {} is {} bytes",
+                            idx + 1,
                             payload.len()
-                        );
-                        std::process::exit(1);
+                        ));
                     }
                 }
                 fastboot_protocol::FastbootResponse::Fail(reason) => {
-                    eprintln!("Error download failed for chunk {}: {}", idx + 1, reason);
-                    std::process::exit(1);
+                    status_epilog_failed(&remote_error(&reason))
                 }
-                other => {
-                    eprintln!("Unexpected download response for chunk {}: {:?}", idx + 1, other);
-                    std::process::exit(1);
-                }
+                other => status_epilog_failed(&format!("{other:?}")),
             }
 
-            transport.write_all(&payload)?;
-            transport.flush()?;
-
-            let post_dl_resp = transport.recv_response()?;
-            if let fastboot_protocol::FastbootResponse::Fail(reason) = post_dl_resp {
-                eprintln!("Error after payload send for chunk {}: {}", idx + 1, reason);
-                std::process::exit(1);
+            if let Err(e) = transport.write_all(&payload) {
+                status_epilog_failed(&format!("write to device failed: {e}"));
+            }
+            if let Err(e) = transport.flush() {
+                status_epilog_failed(&format!("write to device failed: {e}"));
             }
 
+            let post_dl_resp = match transport.recv_response() {
+                Ok(resp) => resp,
+                Err(e) => status_epilog_failed(&format!("status read failed: {e}")),
+            };
+            match post_dl_resp {
+                fastboot_protocol::FastbootResponse::Okay(_) => status_epilog_okay(sending),
+                fastboot_protocol::FastbootResponse::Fail(reason) => {
+                    status_epilog_failed(&remote_error(&reason))
+                }
+                other => status_epilog_failed(&format!("{other:?}")),
+            }
+
+            // AOSP `Flash()`: `Writing '<partition>'` around `flash:<partition>`.
+            let writing = status_prolog(&format_writing_action(wire_partition));
             let flash_cmd = fastboot_protocol::flash(wire_partition);
-            transport.send_cmd(&flash_cmd)?;
-            let flash_resp = transport.recv_response()?;
-            require_terminal_okay(&flash_resp)?;
-            println!(
-                "[fastboot-rs] Flash response for split chunk {}/{}: {:?}",
-                idx + 1,
-                splits.len(),
-                flash_resp
-            );
+            if let Err(e) = transport.send_cmd(&flash_cmd) {
+                status_epilog_failed(&format!("write to device failed: {e}"));
+            }
+            let flash_resp = match transport.recv_response() {
+                Ok(resp) => resp,
+                Err(e) => status_epilog_failed(&format!("status read failed: {e}")),
+            };
+            match flash_resp {
+                fastboot_protocol::FastbootResponse::Okay(_) => status_epilog_okay(writing),
+                fastboot_protocol::FastbootResponse::Fail(reason) => {
+                    status_epilog_failed(&remote_error(&reason))
+                }
+                other => status_epilog_failed(&format!("{other:?}")),
+            }
         }
     } else {
         let chunk_size = max_download_size.unwrap_or(16 * 1024 * 1024);
@@ -1948,35 +2050,31 @@ fn flash_image_file<T: FastbootTransport>(
 
         let effective_size = memory_payload.as_ref().map_or(file_size, |p| p.len());
 
-        println!(
-            "[fastboot-rs] Flashing partition '{}' with image '{}' ({} bytes, chunk size: {} bytes)",
-            partition_label,
-            image_path.display(),
-            effective_size,
-            chunk_size
-        );
+        // AOSP `Download(name, buf)`: `Sending '<name>' (<KB> KB)`, where the
+        // name is the (slot-resolved) partition being flashed.
+        let sending = status_prolog(&format_sending_action(wire_partition, effective_size));
 
         let download_cmd = fastboot_protocol::download(effective_size as u32);
-        transport.send_cmd(&download_cmd)?;
-        let dl_resp = transport.recv_response()?;
+        if let Err(e) = transport.send_cmd(&download_cmd) {
+            status_epilog_failed(&format!("write to device failed: {e}"));
+        }
+        let dl_resp = match transport.recv_response() {
+            Ok(resp) => resp,
+            Err(e) => status_epilog_failed(&format!("status read failed: {e}")),
+        };
         match dl_resp {
             fastboot_protocol::FastbootResponse::Data(expected_len) => {
                 if expected_len != effective_size as u32 {
-                    eprintln!("Error: Device requested {} bytes, but local file is {} bytes", expected_len, effective_size);
-                    std::process::exit(1);
+                    status_epilog_failed(&format!(
+                        "device requested {expected_len} bytes, but the payload is {effective_size} bytes"
+                    ));
                 }
             }
             fastboot_protocol::FastbootResponse::Fail(reason) => {
-                eprintln!("Error download failed: {}", reason);
-                std::process::exit(1);
+                status_epilog_failed(&remote_error(&reason))
             }
-            other => {
-                eprintln!("Unexpected download response: {:?}", other);
-                std::process::exit(1);
-            }
+            other => status_epilog_failed(&format!("{other:?}")),
         }
-
-        println!("[fastboot-rs] Sending image payload in chunks ({} bytes total)...", effective_size);
 
         if let Some(ref patched_data) = memory_payload {
             // Send the in-memory payload (relocated AVB footer and/or patched vbmeta).
@@ -1984,8 +2082,7 @@ fn flash_image_file<T: FastbootTransport>(
             while offset < patched_data.len() {
                 let to_send = (patched_data.len() - offset).min(chunk_size);
                 if let Err(e) = transport.write_all(&patched_data[offset..offset + to_send]) {
-                    eprintln!("Error writing payload to transport at offset {offset}: {e}");
-                    std::process::exit(1);
+                    status_epilog_failed(&format!("write to device failed: {e}"));
                 }
                 offset += to_send;
             }
@@ -1998,35 +2095,55 @@ fn flash_image_file<T: FastbootTransport>(
             while remaining > 0 {
                 let to_read = remaining.min(chunk_size);
                 if let Err(e) = image_file.read_exact(&mut buffer[..to_read]) {
-                    eprintln!("Error reading from '{}' at offset {}: {}", image_path.display(), file_size - remaining, e);
-                    std::process::exit(1);
+                    status_epilog_failed(&format!(
+                        "read from '{}' at offset {} failed: {e}",
+                        image_path.display(),
+                        file_size - remaining
+                    ));
                 }
                 if let Err(e) = transport.write_all(&buffer[..to_read]) {
-                    eprintln!(
-                        "Error writing to transport at chunk {} (offset {}): {}",
-                        chunk_index,
-                        file_size - remaining,
-                        e
-                    );
-                    std::process::exit(1);
+                    status_epilog_failed(&format!(
+                        "write to device failed at chunk {chunk_index} (offset {}): {e}",
+                        file_size - remaining
+                    ));
                 }
                 remaining -= to_read;
                 chunk_index += 1;
             }
         }
-        transport.flush()?;
-
-        let post_dl_resp = transport.recv_response()?;
-        if let fastboot_protocol::FastbootResponse::Fail(reason) = post_dl_resp {
-            eprintln!("Error after payload send: {}", reason);
-            std::process::exit(1);
+        if let Err(e) = transport.flush() {
+            status_epilog_failed(&format!("write to device failed: {e}"));
         }
 
+        let post_dl_resp = match transport.recv_response() {
+            Ok(resp) => resp,
+            Err(e) => status_epilog_failed(&format!("status read failed: {e}")),
+        };
+        match post_dl_resp {
+            fastboot_protocol::FastbootResponse::Okay(_) => status_epilog_okay(sending),
+            fastboot_protocol::FastbootResponse::Fail(reason) => {
+                status_epilog_failed(&remote_error(&reason))
+            }
+            other => status_epilog_failed(&format!("{other:?}")),
+        }
+
+        // AOSP `Flash()`: `Writing '<partition>'` around `flash:<partition>`.
+        let writing = status_prolog(&format_writing_action(wire_partition));
         let flash_cmd = fastboot_protocol::flash(wire_partition);
-        transport.send_cmd(&flash_cmd)?;
-        let flash_resp = transport.recv_response()?;
-        require_terminal_okay(&flash_resp)?;
-        println!("[fastboot-rs] Flash response for partition '{}': {:?}", partition_label, flash_resp);
+        if let Err(e) = transport.send_cmd(&flash_cmd) {
+            status_epilog_failed(&format!("write to device failed: {e}"));
+        }
+        let flash_resp = match transport.recv_response() {
+            Ok(resp) => resp,
+            Err(e) => status_epilog_failed(&format!("status read failed: {e}")),
+        };
+        match flash_resp {
+            fastboot_protocol::FastbootResponse::Okay(_) => status_epilog_okay(writing),
+            fastboot_protocol::FastbootResponse::Fail(reason) => {
+                status_epilog_failed(&remote_error(&reason))
+            }
+            other => status_epilog_failed(&format!("{other:?}")),
+        }
     }
 
     Ok(())
@@ -2260,6 +2377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[fastboot-rs] Set active slot '{}' response: {:?}", slot, resp);
         }
         Commands::Flash { partition, file } => {
+            let started = std::time::Instant::now();
             let image_path = match fastboot_protocol::resolve_image_path(
                 &partition,
                 file.as_deref(),
@@ -2283,8 +2401,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let wire_partition = resolve_wire_partition(&mut transport, &partition, &slot_selection)?;
             flash_image_file(&mut transport, &partition, &wire_partition, &image_path, &gopts)?;
+            // AOSP Epilog(): every successful command ends with the total time.
+            print_finished(started);
         }
         Commands::WipeSuper { image } => {
+            let started = std::time::Instant::now();
             let wire_partition = slot_selection.partition_name("super")?;
             let image_path = match fastboot_protocol::resolve_super_empty_path(
                 image.as_deref(),
@@ -2308,8 +2429,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("[fastboot-rs] Wiping super partition using image '{}'", image_path.display());
             flash_image_file(&mut transport, "super", &wire_partition, &image_path, &gopts)?;
+            print_finished(started);
         }
         Commands::Erase { partition } => {
+            let started = std::time::Instant::now();
             let mut transport = match open_transport(use_usb, &addr, Duration::from_secs(3)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2319,10 +2442,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let wire_partition = resolve_wire_partition(&mut transport, &partition, &slot_selection)?;
             let cmd = format!("erase:{}", wire_partition);
-            transport.send_cmd(&cmd)?;
-            let resp = transport.recv_response()?;
-            require_terminal_okay(&resp)?;
-            println!("[fastboot-rs] Erase response: {:?}", resp);
+            // AOSP `Erase()`: `Erasing '<partition>'` around `erase:<partition>`.
+            let erasing = status_prolog(&format_erasing_action(&wire_partition));
+            if let Err(e) = transport.send_cmd(&cmd) {
+                status_epilog_failed(&format!("write to device failed: {e}"));
+            }
+            let resp = match transport.recv_response() {
+                Ok(resp) => resp,
+                Err(e) => status_epilog_failed(&format!("status read failed: {e}")),
+            };
+            match resp {
+                fastboot_protocol::FastbootResponse::Okay(_) => status_epilog_okay(erasing),
+                fastboot_protocol::FastbootResponse::Fail(reason) => {
+                    status_epilog_failed(&remote_error(&reason))
+                }
+                other => status_epilog_failed(&format!("{other:?}")),
+            }
+            print_finished(started);
         }
         Commands::Reboot { target } => run_reboot(use_usb, &addr, target.as_deref())?,
         Commands::RebootBootloader => run_reboot(use_usb, &addr, Some("bootloader"))?,
@@ -2981,6 +3117,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// The AOSP action strings must stay byte-identical to the C formats:
+    /// `Sending '%s' (%zu KB)`, `Sending sparse '%s' %zu/%zu (%u KB)`,
+    /// `Writing '%s'`, `Erasing '%s'` (fastboot_driver.cpp:93/98/191/222/253).
+    #[test]
+    fn aosp_action_messages_match_the_driver_formats() {
+        assert_eq!(format_sending_action("boot_a", 1024), "Sending 'boot_a' (1 KB)");
+        // AOSP divides by 1024 with integer truncation.
+        assert_eq!(format_sending_action("boot", 5), "Sending 'boot' (0 KB)");
+        assert_eq!(
+            format_sending_sparse_action("super", 2, 3, 4 * 1024 * 1024),
+            "Sending sparse 'super' 2/3 (4096 KB)"
+        );
+        assert_eq!(format_writing_action("boot_a"), "Writing 'boot_a'");
+        assert_eq!(format_erasing_action("boot_a"), "Erasing 'boot_a'");
+    }
+
+    /// `Status()` pads the action to `%-50s ` and `Epilog()` appends
+    /// `OKAY [%7.3fs]`, so the whole line is fixed-column up to the timer.
+    #[test]
+    fn aosp_status_line_uses_50_columns_then_a_seven_wide_timer() {
+        let action = format_sending_action("boot_a", 1024);
+        assert_eq!(action.len(), 23);
+        let prefix = format!("{action:<50} ");
+        assert_eq!(prefix.len(), 51);
+        assert!(prefix.starts_with("Sending 'boot_a' (1 KB) "));
+        // The remaining 27 columns are padding spaces.
+        assert_eq!(prefix[23..].chars().filter(|c| *c != ' ').count(), 0);
+        let timer = format!("OKAY [{:7.3}s]", 0.0f64);
+        assert_eq!(timer, "OKAY [  0.000s]");
+        assert_eq!(timer.len(), 15);
+        assert_eq!(format!("{prefix}{timer}").len(), 51 + 15);
+    }
+
+    /// A `FAIL` packet becomes `FAILED (remote: '<reason>')`:
+    /// `remote: '%s'` is the driver error (fastboot_driver.cpp:500) and
+    /// `Epilog(1)` wraps it in `FAILED (%s)`.
+    #[test]
+    fn aosp_failure_line_wraps_the_device_reason_as_a_remote_error() {
+        assert_eq!(remote_error("flash rejected"), "remote: 'flash rejected'");
+        let line = format!("{:<50} FAILED ({})", "Writing 'boot_a'", remote_error("flash rejected"));
+        assert_eq!(
+            line,
+            "Writing 'boot_a'                                   FAILED (remote: 'flash rejected')"
+        );
+    }
 
     #[test]
     fn network_serial_prefix_is_stripped_for_tcp_and_kept_for_udp() {
